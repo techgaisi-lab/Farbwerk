@@ -123,6 +123,9 @@ fun EditorScreen(state: EditorState) {
             CopyPasteMenu(state, Modifier.align(Alignment.Center))
         }
 
+        // Tastenkürzel-Übersicht (Strg gedrückt halten)
+        at.techgaisi.farbwerk.input.ShortcutOverlay(Modifier.align(Alignment.Center))
+
         // Hinweis (z. B. "Rückgängig: Pinselstrich")
         state.flashMessage?.let { msg ->
             Box(

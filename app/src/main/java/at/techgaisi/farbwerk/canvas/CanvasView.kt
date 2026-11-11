@@ -74,7 +74,16 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
 
     // ===================================================================== Ansicht
 
-    fun docToViewMatrix(): Matrix = Matrix(viewMatrix)
+    fun docToViewMatrix(): Matrix = displayMatrix()
+
+    /** Fenster-Koordinaten → Dokument-Koordinaten (berücksichtigt Zoom, Drehung und Spiegelung). */
+    fun windowToDoc(windowX: Float, windowY: Float): android.graphics.PointF {
+        val loc = IntArray(2); getLocationInWindow(loc)
+        val pts = floatArrayOf(windowX - loc[0], windowY - loc[1])
+        val inv = Matrix(); displayMatrix().invert(inv)
+        inv.mapPoints(pts)
+        return android.graphics.PointF(pts[0], pts[1])
+    }
 
     private fun updateInverse() { viewMatrix.invert(inverse) }
 

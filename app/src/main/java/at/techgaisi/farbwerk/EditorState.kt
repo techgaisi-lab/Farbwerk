@@ -138,6 +138,13 @@ class EditorState(val context: Context) {
         return PixelEdit(this, layer, copy)
     }
 
+    /**
+     * Rechnet eine Position in Fenster-Koordinaten (z. B. aus einem Compose-Drag, positionInWindow)
+     * in Dokument-Koordinaten um. null, wenn keine Leinwand vorhanden ist.
+     */
+    fun windowToDoc(windowX: Float, windowY: Float): android.graphics.PointF? =
+        canvasView?.windowToDoc(windowX, windowY)
+
     fun fitCanvasToScreen() = canvasView?.fitToScreen(animate = true)
     fun zoomBy(factor: Float) = canvasView?.zoomBy(factor)
     fun actualSize() = canvasView?.actualSize()
@@ -158,6 +165,7 @@ class EditorState(val context: Context) {
         if (tool == Tool.TRANSFORM) transformTool.commit()
         if (tool == Tool.ADJUST) adjustmentTool.apply()
         document?.let { store.save(it) }
+        brushEngine.release()
         document = null
         undo.clear()
         openPanel = Panel.NONE
