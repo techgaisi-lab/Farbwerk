@@ -53,6 +53,27 @@ object CanvasOps {
         doc.created = old.created
         doc.modified = System.currentTimeMillis()
         copyGuides(old, doc, if (scaleContent) null else m, if (scaleContent) sx else 1f, if (scaleContent) sy else 1f)
+        if (newW <= 0 || newH <= 0) return
+        try {
+            buildResizedLayers(old, doc, newW, newH, m, paint)
+        } catch (oom: OutOfMemoryError) {
+            // Alte und neue Ebenen gleichzeitig passen nicht in den Speicher → Dokument unverändert lassen
+            doc.layers.forEach { it.bitmap.recycle(); it.mask?.recycle() }
+            state.flash("Zu wenig Speicher für diese Leinwandgröße")
+            return
+        }
+        // Gruppen-Metadaten übernehmen (gleiche IDs)
+        old.layers.mapNotNull { it.groupId }.distinct().forEach { gid ->
+            at.techgaisi.farbwerk.render.LayerGroups.find(old, gid)?.let { at.techgaisi.farbwerk.render.LayerGroups.put(doc, it) }
+        }
+        doc.activeIndex = old.activeIndex.coerceIn(0, doc.layers.lastIndex)
+        doc.secondarySelection.addAll(old.secondarySelection)
+        doc.dirty = true
+        state.openDocument(doc)
+        state.flash("Leinwand: $newW × $newH px")
+    }
+
+    private fun buildResizedLayers(old: ArtDocument, doc: ArtDocument, newW: Int, newH: Int, m: Matrix, paint: Paint) {
         for (l in old.layers) {
             val nb = Bitmap.createBitmap(newW, newH, Bitmap.Config.ARGB_8888)
             Canvas(nb).drawBitmap(l.bitmap, m, paint)
@@ -70,15 +91,6 @@ object CanvasOps {
             }
             doc.layers.add(nl)
         }
-        // Gruppen-Metadaten übernehmen (gleiche IDs)
-        old.layers.mapNotNull { it.groupId }.distinct().forEach { gid ->
-            at.techgaisi.farbwerk.render.LayerGroups.find(old, gid)?.let { at.techgaisi.farbwerk.render.LayerGroups.put(doc, it) }
-        }
-        doc.activeIndex = old.activeIndex.coerceIn(0, doc.layers.lastIndex)
-        doc.secondarySelection.addAll(old.secondarySelection)
-        doc.dirty = true
-        state.openDocument(doc)
-        state.flash("Leinwand: $newW × $newH px")
     }
 
     private fun copyGuides(old: ArtDocument, doc: ArtDocument, translate: Matrix?, sx: Float, sy: Float) {

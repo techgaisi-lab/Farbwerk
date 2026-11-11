@@ -2,6 +2,7 @@ package at.techgaisi.farbwerk
 
 import android.os.Bundle
 import android.view.KeyEvent
+import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
@@ -36,7 +37,7 @@ class MainActivity : ComponentActivity() {
     private fun lastCustomNonConfigurationInstanceCompat(): Any? = null
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (!state.showGallery && state.document != null) {
+        if (!state.showGallery && state.document != null && !isTextInputActive()) {
             val handled = when (event.action) {
                 KeyEvent.ACTION_DOWN -> KeyboardShortcuts.onKeyDown(state, event)
                 KeyEvent.ACTION_UP -> KeyboardShortcuts.onKeyUp(state, event)
@@ -45,6 +46,15 @@ class MainActivity : ComponentActivity() {
             if (handled) return true
         }
         return super.dispatchKeyEvent(event)
+    }
+
+    /**
+     * true, solange ein Texteingabefeld (z. B. Hex-Feld im Farben-Panel) den Fokus hat. Dann gehen
+     * Tasten an das Feld statt an die Kürzel – sonst würde z. B. Rücktaste die Ebene leeren.
+     */
+    private fun isTextInputActive(): Boolean {
+        val imm = getSystemService(INPUT_METHOD_SERVICE) as? InputMethodManager ?: return false
+        return try { imm.isAcceptingText } catch (_: Throwable) { false }
     }
 
     override fun onPause() {

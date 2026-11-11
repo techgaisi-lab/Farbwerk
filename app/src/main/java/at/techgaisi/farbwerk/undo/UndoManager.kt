@@ -73,6 +73,10 @@ class UndoManager(private val state: EditorState) {
     }
 
     fun undo(): Boolean {
+        if (undoStack.isEmpty()) return false
+        // Laufenden Strich (Tastenkürzel/Schaltfläche während des Malens) zuerst verwerfen,
+        // sonst würde sein PixelEdit den Zustand vor dem Rückgängigmachen festschreiben.
+        state.canvasView?.abortStroke()
         val a = undoStack.removeLastOrNull() ?: return false
         a.undo()
         redoStack.addLast(a)
@@ -84,6 +88,8 @@ class UndoManager(private val state: EditorState) {
     }
 
     fun redo(): Boolean {
+        if (redoStack.isEmpty()) return false
+        state.canvasView?.abortStroke()
         val a = redoStack.removeLastOrNull() ?: return false
         a.redo()
         undoStack.addLast(a)

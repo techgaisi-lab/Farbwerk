@@ -103,7 +103,18 @@ class EditorState(val context: Context) {
      * Werkzeug wechseln. Wechsel aus Auswahl/Transform/Anpassen schließt diese Modi sauber ab.
      */
     fun selectTool(t: Tool) {
-        if (tool == t) return
+        if (tool == t) {
+            // Bereits im Transformieren, aber ohne Sitzung (z. B. nach "Bild/Text einfügen", das die
+            // laufende Transformation abgeschlossen hat): neue Sitzung auf der aktiven Ebene starten.
+            if (t == Tool.TRANSFORM && !transformTool.active) {
+                transformTool.begin()
+                invalidate()
+            }
+            return
+        }
+        // Ein laufender Strich gehört zum alten Werkzeug – sonst überschreiben sich z. B. die
+        // drawOverrides von Pinsel und Transformieren gegenseitig.
+        canvasView?.abortStroke()
         val old = tool
         when (old) {
             Tool.TRANSFORM -> transformTool.commit()
@@ -151,20 +162,41 @@ class EditorState(val context: Context) {
 
     // ---------------- Dokument öffnen/schließen ----------------
     fun openDocument(doc: ArtDocument) {
+        // Sitzungen des bisherigen Dokuments (z. B. bei "Leinwandgröße ändern") verwerfen,
+        // bevor das neue Dokument gesetzt wird – sie verweisen noch auf alte Ebenen.
+        canvasView?.abortStroke()
+        when (tool) {
+            Tool.TRANSFORM -> transformTool.cancel()
+            Tool.ADJUST -> adjustmentTool.cancel()
+            Tool.SELECT -> selectionTool.onDeactivate()
+            else -> {}
+        }
+        eyedropperArmed = false
+        copyPasteMenuVisible = false
         document = doc
         undo.clear()
         showGallery = false
         openPanel = Panel.NONE
         tool = Tool.PAINT
+        // Existiert die Leinwand noch nicht (erstes Öffnen aus der Galerie), passt sie sich in
+        // onSizeChanged selbst ein.
         canvasView?.fitToScreen(animate = false)
         invalidate()
     }
 
     /** Speichert und kehrt zur Galerie zurück. Verlauf wird (wie im Original) gelöscht. */
     fun closeToGallery() {
-        if (tool == Tool.TRANSFORM) transformTool.commit()
-        if (tool == Tool.ADJUST) adjustmentTool.apply()
-        document?.let { store.save(it) }
+        canvasView?.abortStroke()
+        when (tool) {
+            Tool.TRANSFORM -> transformTool.commit()
+            Tool.ADJUST -> adjustmentTool.apply()
+            Tool.SELECT -> selectionTool.onDeactivate()
+            else -> {}
+        }
+        tool = Tool.PAINT
+        eyedropperArmed = false
+        copyPasteMenuVisible = false
+        saveNow()
         brushEngine.release()
         document = null
         undo.clear()
@@ -172,7 +204,17 @@ class EditorState(val context: Context) {
         showGallery = true
     }
 
-    fun saveNow() { document?.let { store.save(it) } }
+    fun saveNow() {
+        val d = document ?: return
+        try {
+            store.save(d)
+        } catch (t: Throwable) {
+            // Speichern darf die App nie beenden (z. B. Speicher voll / zu wenig RAM)
+            android.util.Log.e("Farbwerk", "Speichern fehlgeschlagen", t)
+            d.dirty = true
+            flash("Speichern fehlgeschlagen")
+        }
+    }
 
     // ---------------- Hinweise ----------------
     private val handler = Handler(Looper.getMainLooper())

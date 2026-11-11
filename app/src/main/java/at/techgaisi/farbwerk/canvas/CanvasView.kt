@@ -427,11 +427,25 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private fun finishStroke(p: InputPoint) {
         handler.removeCallbacks(quickShapeRunnable); quickShapeScheduled = false
         handler.removeCallbacks(holdEyedropperRunnable)
-        try { strokeHandler?.onStrokeEnd(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "end", t) }
-        state.brushEngine.temporaryTool = null
+        // Handler vor dem Aufruf lösen: falls onStrokeEnd z. B. einen Werkzeugwechsel auslöst,
+        // darf abortStroke() diesen bereits beendeten Strich nicht zusätzlich abbrechen.
+        val h = strokeHandler
         strokeHandler = null
         strokePointerId = -1
+        try { h?.onStrokeEnd(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "end", t) }
+        state.brushEngine.temporaryTool = null
         invalidate()
+    }
+
+    /**
+     * Bricht einen laufenden Strich ab (Werkzeugwechsel, Rückgängig per Taste/Schaltfläche, Galerie).
+     * Die restlichen Bewegungen dieses Kontakts werden ignoriert, bis alle Finger/Stift abgehoben sind.
+     */
+    fun abortStroke() {
+        if (mode == Mode.STROKE && strokeHandler != null) {
+            cancelStroke()
+            mode = Mode.BLOCKED
+        }
     }
 
     private fun cancelStroke() {
@@ -639,9 +653,21 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         quickShapeScheduled = false
     }
 
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        state.canvasView = this
+    }
+
     override fun onDetachedFromWindow() {
         super.onDetachedFromWindow()
+        // Laufenden Strich sauber beenden (sonst bleibt z. B. drawOverride/PixelEdit offen)
+        if (mode == Mode.STROKE) cancelStroke()
+        if (mode == Mode.EYEDROPPER) { state.eyedropper.cancel(); eyedropperActive = false }
+        mode = Mode.IDLE
         cancelTimers()
         animator?.cancel()
+        holdEvent?.recycle(); holdEvent = null
+        // Keine Referenz auf eine abgelöste Ansicht behalten (Galerie → neues Dokument erzeugt eine neue View)
+        if (state.canvasView === this) state.canvasView = null
     }
 }
