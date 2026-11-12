@@ -20,6 +20,8 @@ Native Android-Zeichen-App für Tablets mit Stift. Funktionsumfang, Gesten, Tast
 | **Transformieren** | Freiform · Gleichmäßig · Verzerren · Verkrümmen · Einrasten · Spiegeln · Interpolation |
 | **Anpassungen** | Farbton/Sättigung/Helligkeit · Farbbalance · Kurven · Verlaufsumsetzung · Gauß-, Bewegungs- und perspektivische Unschärfe · Rauschen · Scharfzeichnen · Bloom · Glitch · Halbton · Chromatische Aberration · Verflüssigen · Klonen (Ebenen- und Stift-Modus) |
 | **Zeichenhilfen** | 2D-Raster · Isometrisch · Symmetrie (vertikal, horizontal, Quadrant, radial, rotierend) |
+| **Text** | Bearbeitbare Textebenen, Stil-Panel, Schriften-Import (TTF/OTF) |
+| **Animation** | Zeitleiste, Zwiebelschicht, Export GIF/MP4 |
 | **Dateien** | Galerie mit Stapeln · eigenes Projektformat `.farbwerk` · Export PNG, JPEG, PSD (mit Ebenen), TIFF, PDF, Ebenen als PNG · PSD-Import |
 
 ## Gesten
@@ -92,13 +94,26 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 
 Voraussetzungen: JDK 17+, Android SDK (Platform 35). Pfad zum SDK in `local.properties` (`sdk.dir=...`).
 
+## S Pen
+
+- Druck, Neigung und Ausrichtung je Messpunkt, Druckkurve und -glättung
+- Bewegungsvorhersage und ungepufferte Eingabe für geringe Latenz
+- Handballenerkennung; nach Stifterkennung malt nur noch der Stift
+- Schwebevorschau des Pinsels
+- Seitentaste: beim Berühren Pipette (einstellbar), in der Luft Radierer an/aus (einstellbar)
+
+## Dokumentation
+
+- [`docs/FUNKTIONSANLEITUNG.md`](docs/FUNKTIONSANLEITUNG.md) – Funktions- und Verhaltensbeschreibung aller Bereiche
+- [`docs/LUECKEN.md`](docs/LUECKEN.md) – Abgleich mit dem Umsetzungsstand und Arbeitspakete
+
 ## Bekannte Einschränkungen
 
-- Malen direkt auf Ebenenmasken ist noch nicht möglich
 - Gruppen sind nicht verschachtelbar
-- Pinsel-Umriss erscheint nur während des Strichs (kein Hover)
+- Nasse/verbrannte Pinselkanten erscheinen erst beim Absetzen
 - Maximale Leinwandgröße 8192 px pro Seite bzw. 25 Megapixel
-- Kein Animations-/Zeitraffer-Video
+- Kein Zeitraffer-Video, kein PDF-Import
+- Doppelpinsel und ABR-Import fehlen
 
 ## Lizenz
 

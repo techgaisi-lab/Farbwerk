@@ -87,11 +87,14 @@ object Compositor {
                     cur.reconfigure(w, h, Bitmap.Config.ARGB_8888)
                     return cur
                 }
-                cur.recycle()
+                // Auf dem UI-Thread kann der RenderThread die alte Bitmap noch zeichnen → nicht recyceln (GC)
+                if (Looper.myLooper() != Looper.getMainLooper()) cur.recycle()
             }
             return Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888).also { bmp = it }
         }
         fun release() { bmp?.recycle(); bmp = null }
+        /** Verweis aufgeben, ohne zu recyceln (Bitmap evtl. noch in einer Anzeigeliste). */
+        fun drop() { bmp = null }
     }
 
     private val LUMA_TO_ALPHA = ColorMatrixColorFilter(ColorMatrix(floatArrayOf(
@@ -159,11 +162,18 @@ object Compositor {
             return
         }
         val main = Looper.myLooper() == Looper.getMainLooper()
-        if (Build.VERSION.SDK_INT >= 33 && main && canvas.isHardwareAccelerated &&
+        if (Build.VERSION.SDK_INT >= 33 && main && !gpuFailed && canvas.isHardwareAccelerated &&
             maxOf(doc.width, doc.height) <= GPU_MAX_SIZE
         ) {
-            gpu().draw(canvas, doc, filter, c)
-            return
+            try {
+                gpu().draw(canvas, doc, filter, c)
+                return
+            } catch (t: Throwable) {
+                // z. B. AGSL lässt sich auf dem Gerät nicht übersetzen → dauerhaft Software-Pfad
+                android.util.Log.e("Farbwerk", "GPU-Mischmodus fehlgeschlagen, Software-Pfad", t)
+                gpuFailed = true
+                gpuInstance = null
+            }
         }
         // Software: nur der sichtbare Ausschnitt (Dokument-Koordinaten) wird berechnet
         val clip = c.clip
@@ -455,6 +465,7 @@ object Compositor {
     // ------------------------------------------------------------------------------------------
 
     private var gpuInstance: Any? = null
+    @Volatile private var gpuFailed = false
 
     @RequiresApi(33)
     private fun gpu(): Gpu = (gpuInstance as? Gpu) ?: Gpu().also { gpuInstance = it }
@@ -550,7 +561,7 @@ object Compositor {
             canvas.drawRenderNode(last)
             drawRange(canvas, doc, layers, start, layers.size, filter, false, c)
             // Nicht mehr benötigte Stufen freigeben (Speicher der Arbeitsbitmaps)
-            for (k in used until slots.size) { slots[k].src.release(); slots[k].clip.release() }
+            for (k in used until slots.size) { slots[k].src.drop(); slots[k].clip.drop() }
             while (slots.size > used + 2) slots.removeAt(slots.lastIndex).node.discardDisplayList()
         }
     }

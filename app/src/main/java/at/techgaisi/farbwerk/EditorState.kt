@@ -197,6 +197,8 @@ class EditorState(val context: Context) {
         // Sitzungen des bisherigen Dokuments (z. B. bei "Leinwandgröße ändern") verwerfen,
         // bevor das neue Dokument gesetzt wird – sie verweisen noch auf alte Ebenen.
         canvasView?.abortStroke()
+        brushEngine.release()
+        resetTransientModes()
         when (tool) {
             Tool.TRANSFORM -> transformTool.cancel()
             Tool.ADJUST -> adjustmentTool.cancel()
@@ -219,6 +221,8 @@ class EditorState(val context: Context) {
     /** Speichert und kehrt zur Galerie zurück. Verlauf wird (wie im Original) gelöscht. */
     fun closeToGallery() {
         canvasView?.abortStroke()
+        at.techgaisi.farbwerk.ui.text.TextEditing.session?.done()
+        resetTransientModes()
         when (tool) {
             Tool.TRANSFORM -> transformTool.commit()
             Tool.ADJUST -> adjustmentTool.apply()
@@ -236,8 +240,24 @@ class EditorState(val context: Context) {
         showGallery = true
     }
 
+    /**
+     * Beendet modale Zustände, die an das aktuelle Dokument gebunden sind (Leinwand-Override, Status-/Seitenleiste,
+     * QuickMenu, Zuschneiden/Zeichenhilfe-Editor/Text), damit beim Dokument-/Galeriewechsel nichts hängen bleibt.
+     */
+    private fun resetTransientModes() {
+        at.techgaisi.farbwerk.ui.actions.ActionModes.crop?.cancel()
+        at.techgaisi.farbwerk.ui.actions.ActionModes.guideEditor?.cancel()
+        at.techgaisi.farbwerk.ui.text.TextEditing.session = null
+        canvasOverride = null
+        statusBar = null
+        sidebarSource = null
+        quickMenuAt = null
+    }
+
     fun saveNow() {
         val d = document ?: return
+        // Laufendes „Form bearbeiten“ übernehmen – die Ebene enthält sonst den Zustand ohne Form
+        brushEngine.commitPendingShapeEdit()
         try {
             store.save(d)
         } catch (t: Throwable) {

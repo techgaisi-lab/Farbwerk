@@ -742,6 +742,14 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         state.invalidate()
     }
 
+    /**
+     * Übernimmt eine laufende „Form bearbeiten“-Sitzung (z. B. vor dem Speichern/Schließen) – sonst fehlte die
+     * Form in der Ebene, weil diese während der Bearbeitung den Zustand ohne Form enthält.
+     */
+    fun commitPendingShapeEdit() {
+        if (editor != null && checkShapeEdit()) commitShapeEdit()
+    }
+
     /** Läuft gerade "Form bearbeiten"? */
     val isEditingShape: Boolean get() = editor != null
 

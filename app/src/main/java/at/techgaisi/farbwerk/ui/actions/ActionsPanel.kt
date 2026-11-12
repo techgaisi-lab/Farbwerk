@@ -74,8 +74,6 @@ internal object ActionsMemory {
 fun ActionsPanel(state: EditorState, modifier: Modifier = Modifier) {
     @Suppress("UNUSED_VARIABLE") val rev = state.revision
     val ui = LocalUi.current
-    val act = androidx.compose.ui.platform.LocalContext.current
-    androidx.compose.runtime.LaunchedEffect(Unit) { OverlayHost.install(act.findActivity(), state) }
     PanelCard(modifier, title = "Aktionen") {
         // Reiterleiste
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {

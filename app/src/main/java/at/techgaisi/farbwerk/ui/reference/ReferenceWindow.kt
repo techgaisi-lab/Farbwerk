@@ -107,7 +107,7 @@ fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
         if (uri != null) scope.launch {
             val bmp = withContext(Dispatchers.IO) { try { Importers.decodeImage(ctx, uri, 2048, 2048) } catch (_: Throwable) { null } }
             if (bmp == null) state.flash("Bild konnte nicht geladen werden")
-            else { rs.image?.recycle(); rs.image = bmp; rs.mode = ReferenceMode.IMAGE; rs.resetView() }
+            else { rs.image = bmp; rs.mode = ReferenceMode.IMAGE; rs.resetView() }
         }
     }
 
@@ -203,7 +203,7 @@ fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
                         if (rs.mode == ReferenceMode.IMAGE && rs.image != null) {
                             RefButton("Neues Bild", false) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
                             RefButton("Bild löschen", false, destructive = true) {
-                                val b = rs.image; rs.image = null; rs.mode = ReferenceMode.CANVAS; b?.recycle()
+                                rs.image = null; rs.mode = ReferenceMode.CANVAS
                             }
                         }
                     }

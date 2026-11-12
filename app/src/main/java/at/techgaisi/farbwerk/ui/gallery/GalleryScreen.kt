@@ -131,11 +131,7 @@ fun GalleryScreen(state: EditorState) {
     val scope = rememberCoroutineScope()
 
     fun toast(msg: String) { message = msg }
-    // Overlays des Aktionen-Pakets (Fallback-Host, falls nicht im EditorScreen eingebettet)
-    val activity = androidx.compose.ui.platform.LocalContext.current
-    LaunchedEffect(Unit) {
-        at.techgaisi.farbwerk.ui.actions.OverlayHost.install(findAct(activity), state)
-    }
+    // Overlays des Aktionen-Pakets sind im EditorScreen eingebettet (ActionOverlays) – kein Fallback-Host.
     val onError: (Throwable) -> Unit = { t -> toast("Fehler: ${t.message ?: t.javaClass.simpleName}") }
 
     LaunchedEffect(store.changeCount) {
@@ -631,10 +627,4 @@ private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () ->
         Text(if (item.members.size == 1) "1 Werk" else "${item.members.size} Werke", color = ui.textMuted, fontSize = 12.sp,
             modifier = Modifier.align(Alignment.CenterHorizontally))
     }
-}
-
-private fun findAct(c: android.content.Context): android.app.Activity? {
-    var x: android.content.Context? = c
-    while (x is android.content.ContextWrapper) { if (x is android.app.Activity) return x; x = x.baseContext }
-    return null
 }
