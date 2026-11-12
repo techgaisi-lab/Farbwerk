@@ -10,6 +10,15 @@ internal object BrushPresets {
     private fun b(id: String, name: String, set: String, vararg p: Pair<BP, Float>): Brush {
         val br = Brush(id, name, set, builtIn = true, created = 0L)
         for ((k, v) in p) br[k] = v
+        val keys = p.map { it.first }.toSet()
+        // Touch-Verjüngung wie Druck-Verjüngung, solange nicht eigens angegeben
+        if (TOUCH_TAPER_START !in keys && TOUCH_TAPER_END !in keys) {
+            br[TOUCH_TAPER_START] = br[TAPER_START]; br[TOUCH_TAPER_END] = br[TAPER_END]
+            br[TOUCH_TAPER_SIZE] = br[TAPER_SIZE]; br[TOUCH_TAPER_OPACITY] = br[TAPER_OPACITY]
+            br[TOUCH_TAPER_TIP] = br[TAPER_TIP]
+        }
+        // Streuung wirkt in beiden Richtungen (wie die frühere runde Streuung)
+        if (JITTER in keys && JITTER_LONG !in keys) br[JITTER_LONG] = br[JITTER]
         return br
     }
 
@@ -107,6 +116,13 @@ internal object BrushPresets {
                 b("tupfer", "Tupfer", "kunst",
                     SHAPE_KIND to s(ShapeKind.SPONGE), SPACING to 0.6f, JITTER to 0.3f, ROTATION_MODE to 2f, SIZE_JITTER to 0.3f,
                     PRESSURE_SIZE to 0.3f, MAX_SIZE to 150f, PREVIEW_SIZE to 0.7f),
+                b("nasse_lasur", "Nasse Lasur", "kunst",
+                    SHAPE_KIND to s(ShapeKind.MEDIUM), GRAIN_KIND to g(GrainKind.WATERCOLOR), GRAIN_DEPTH to 0.45f, GRAIN_SCALE to 1.6f,
+                    FLOW to 0.45f, WET_EDGES to 0.7f, BURNT_EDGES to 0.25f, PRESSURE_OPACITY to 0.4f, PRESSURE_SIZE to 0.3f,
+                    DILUTION to 0.15f, WET_BLUR to 0.3f, SPACING to 0.05f, MAX_SIZE to 260f, PREVIEW_SIZE to 0.75f),
+                b("pixelstift", "Pixelstift", "kunst",
+                    SHAPE_KIND to s(ShapeKind.SQUARE), SHAPE_FILTER to 0f, ALPHA_THRESHOLD to 1f, PRESSURE_SIZE to 0f,
+                    STREAMLINE to 0f, SPACING to 0.05f, MAX_SIZE to 24f, MIN_SIZE to 1f, PREVIEW_SIZE to 0.25f),
             )),
             PresetSet("airbrush", "Airbrush", listOf(
                 b("airbrush_weich", "Weiche Airbrush", "airbrush",

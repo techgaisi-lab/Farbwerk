@@ -11,6 +11,9 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
+import at.techgaisi.farbwerk.ui.theme.LocalUi
+import at.techgaisi.farbwerk.ui.theme.UiMetrics
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -25,17 +28,20 @@ fun ShortcutOverlay(modifier: Modifier = Modifier) {
     if (!KeyboardShortcuts.overlayVisible) return
     val list = KeyboardShortcuts.SHORTCUTS
     val half = (list.size + 1) / 2
+    val ui = LocalUi.current
     Row(
-        modifier.clip(RoundedCornerShape(16.dp)).background(Color(0xEE1E1E22)).padding(20.dp),
+        modifier
+            .shadow(UiMetrics.popoverShadow, RoundedCornerShape(UiMetrics.popoverRadius), ambientColor = ui.shadow, spotColor = ui.shadow)
+            .clip(RoundedCornerShape(UiMetrics.popoverRadius)).background(ui.panel).padding(20.dp),
         horizontalArrangement = Arrangement.spacedBy(28.dp)
     ) {
         for (col in listOf(list.take(half), list.drop(half))) {
             Column(verticalArrangement = Arrangement.spacedBy(5.dp)) {
                 col.forEach { (k, v) ->
                     Row {
-                        Text(k, color = Color.White, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
+                        Text(k, color = ui.text, fontSize = 12.sp, fontWeight = FontWeight.SemiBold,
                             modifier = Modifier.width(170.dp))
-                        Text(v, color = Color(0xFFB8B8C0), fontSize = 12.sp)
+                        Text(v, color = ui.textMuted, fontSize = 12.sp)
                     }
                 }
             }

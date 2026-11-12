@@ -53,6 +53,60 @@ class Prefs(context: Context) {
     /** Bewegungsvorhersage (vorhergesagte Punkte als Vorschau zeichnen). */
     var motionPrediction by mutableStateOf(sp.getBoolean("motionPrediction", true))
 
+    // ---------------- Oberfläche (WP1) ----------------
+    /** Seitenleiste Größe & Deckkraft anzeigen. */
+    var sidebarVisible by mutableStateOf(sp.getBoolean("sidebarVisible", true))
+    /** Vertikale Lage der Seitenleiste: −1 = ganz oben, 0 = mittig, 1 = ganz unten. */
+    var sidebarOffset by mutableFloatStateOf(sp.getFloat("sidebarOffset", 0f))
+    /** Zwei-Finger-Geste dreht die Leinwand mit (Gestensteuerung → Allgemein). */
+    var rotateWithPinch by mutableStateOf(sp.getBoolean("rotateWithPinch", true))
+    /** Oberfläche beim Malen automatisch ausblenden. */
+    var autoFullscreen by mutableStateOf(sp.getBoolean("autoFullscreen", false))
+    /** Verzögerung, nach der die Oberfläche nach dem Malen zurückkehrt (ms). */
+    var autoFullscreenDelayMs by mutableIntStateOf(sp.getInt("autoFullscreenDelay", 900))
+    /** Leertaste kurz tippen = QuickMenu (halten + ziehen verschiebt weiterhin die Leinwand). */
+    var spaceQuickMenu by mutableStateOf(sp.getBoolean("spaceQuickMenu", true))
+    /**
+     * Gestensteuerung: Zuordnung Funktion → Auslöser, kodiert als "FUNKTION:AUSLÖSER,AUSLÖSER;…"
+     * (Auswertung in input/GestureMap). Leer = Standardbelegung.
+     */
+    var gestureTriggers by mutableStateOf(sp.getString("gestureTriggers", "") ?: "")
+    /** Verzögerung „Berühren & halten“ für QuickMenu/Ebene wählen (ms). */
+    var holdMenuDelayMs by mutableIntStateOf(sp.getInt("holdMenuDelay", 450))
+    /** QuickMenu-Profile als JSON (Auswertung in ui/quickmenu). Leer = Standardprofil. */
+    var quickMenuProfiles by mutableStateOf(sp.getString("qmProfiles", "") ?: "")
+    /** Index des aktiven QuickMenu-Profils. */
+    var quickMenuProfile by mutableIntStateOf(sp.getInt("qmProfile", 0))
+    /** Pinselcursor-Sichtbarkeit: 0 = beim Schweben, 1 = beim Malen, 2 = beides. */
+    var cursorVisibility by mutableIntStateOf(sp.getInt("cursorVisibility", 2))
+    /** Pinselcursor-Umriss: 0 = hoher Kontrast, 1 = aktive Farbe, 2 = pro Pinsel. */
+    var cursorStyle by mutableIntStateOf(sp.getInt("cursorStyle", 0))
+    /** Deckkraft der Auswahl-Schraffur außerhalb der Auswahl (0..1). */
+    var selectionMaskOpacity by mutableFloatStateOf(sp.getFloat("selMaskOpacity", 0.35f))
+    /** Vereinfachtes Rückgängig im Transformieren: alle Schritte einer Sitzung = ein Schritt. */
+    var simplifiedUndo by mutableStateOf(sp.getBoolean("simplifiedUndo", false))
+    /** Version der Größen-/Deckkraftmarken (Compose liest das, um Marken neu zu zeichnen). */
+    var marksVersion by mutableIntStateOf(0)
+        private set
+
+    /**
+     * Größen- bzw. Deckkraftmarken der Seitenleiste je Pinsel und Werkzeug (max. 4).
+     * [key] z. B. "PAINT/<pinsel-id>", [opacity] wählt die Deckkraftmarken.
+     */
+    fun sliderMarks(key: String, opacity: Boolean): List<Float> {
+        val raw = sp.getString(marksKey(key, opacity), null) ?: return emptyList()
+        return raw.split(",").mapNotNull { it.toFloatOrNull() }.filter { it in 0f..1f }.take(MAX_MARKS)
+    }
+
+    fun setSliderMarks(key: String, opacity: Boolean, marks: List<Float>) {
+        val k = marksKey(key, opacity)
+        val list = marks.distinct().sorted().take(MAX_MARKS)
+        sp.edit().apply { if (list.isEmpty()) remove(k) else putString(k, list.joinToString(",")) }.apply()
+        marksVersion++
+    }
+
+    private fun marksKey(key: String, opacity: Boolean) = "marks_" + (if (opacity) "o_" else "s_") + key
+
     fun save() {
         sp.edit()
             .putBoolean("light", lightInterface)
@@ -80,6 +134,20 @@ class Prefs(context: Context) {
             .putInt("palmRejection", palmRejection)
             .putBoolean("hoverPreview", hoverPreview)
             .putBoolean("motionPrediction", motionPrediction)
+            .putBoolean("sidebarVisible", sidebarVisible)
+            .putFloat("sidebarOffset", sidebarOffset)
+            .putBoolean("rotateWithPinch", rotateWithPinch)
+            .putBoolean("autoFullscreen", autoFullscreen)
+            .putInt("autoFullscreenDelay", autoFullscreenDelayMs)
+            .putBoolean("spaceQuickMenu", spaceQuickMenu)
+            .putString("gestureTriggers", gestureTriggers)
+            .putInt("holdMenuDelay", holdMenuDelayMs)
+            .putString("qmProfiles", quickMenuProfiles)
+            .putInt("qmProfile", quickMenuProfile)
+            .putInt("cursorVisibility", cursorVisibility)
+            .putInt("cursorStyle", cursorStyle)
+            .putFloat("selMaskOpacity", selectionMaskOpacity)
+            .putBoolean("simplifiedUndo", simplifiedUndo)
             .apply()
     }
 
@@ -96,6 +164,11 @@ class Prefs(context: Context) {
             if (x < p) lo = t else hi = t
         }
         return bez(t, c[1], c[3]).coerceIn(0f, 1f)
+    }
+
+    companion object {
+        /** Höchstzahl der Größen- bzw. Deckkraftmarken je Pinsel und Werkzeug. */
+        const val MAX_MARKS = 4
     }
 
     private fun bez(t: Float, p1: Float, p2: Float): Float {

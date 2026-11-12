@@ -17,6 +17,7 @@ import at.techgaisi.farbwerk.model.InputPoint
 import at.techgaisi.farbwerk.model.Layer
 import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.model.ToolInputHandler
+import at.techgaisi.farbwerk.undo.LayerPixelsAction
 import at.techgaisi.farbwerk.undo.PixelEdit
 import kotlin.math.atan2
 import kotlin.math.floor
@@ -36,7 +37,7 @@ import kotlin.math.max
  * QuickShape: Nach dem Halten wird der Strich durch eine perfekte Form ersetzt; solange gehalten wird,
  * skaliert/dreht weiteres Ziehen die Form, ein zweiter Finger perfektioniert sie (Kreis, Quadrat, 15°).
  */
-class BrushEngine(private val state: EditorState) : ToolInputHandler {
+class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShapeEditor.Host {
     /** Wenn gesetzt, überschreibt das Werkzeug (z. B. Radierer-Ende des Stifts). */
     var temporaryTool: Tool? = null
 
@@ -62,6 +63,25 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     private val plainPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
     private val restorePaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+    /** Alpha-Schwelle: Puffer wird mit diesem Filter in eine Ebene (mit [mergePaint]) gezeichnet. */
+    private val thresholdPaint = Paint()
+    private var thresholdOn = false
+    private var strokeBrush: Brush? = null
+
+    // Zeichenassistent (Raster/Isometrie/Perspektive)
+    private val assist = AssistBridge()
+    private val apt = FloatArray(2)
+
+    // QuickShape "Form bearbeiten"
+    private class LastShape(
+        val shape: EditShape, val layer: Layer, val docId: String, val r0: Rect, val pre: Bitmap,
+        val brush: Brush, val tool: Tool, val diameter: Float, val opacity: Float, val color: Int, val secondary: Int,
+        val pressure: Float, val symm: List<Matrix>, val mergeAlpha: Int, val blend: BlendMode?, val threshold: Boolean,
+        val selPath: android.graphics.Path?,
+    ) { var undoVersion = 0 }
+    private var lastShape: LastShape? = null
+    private var editor: QuickShapeEditor? = null
+    private var editAfter: Bitmap? = null
 
     // QuickShape
     private var shape: QShape? = null
@@ -151,7 +171,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
             if (sel != null) { c.save(); c.clipPath(sel) }
             if (!dirty.isEmpty) {
                 c.save(); c.clipRect(dirty)
-                c.drawBitmap(buf, 0f, 0f, mergePaint)
+                drawBuffer(c, buf)
                 c.restore()
             }
             if (sel != null) c.restore()
@@ -163,8 +183,12 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
 
     override fun onStrokeStart(p: InputPoint) {
         reset()
+        // Weitermalen verwirft die Schaltfläche "Form bearbeiten"
+        lastShape = null
+        if (state.flashActionLabel == EDIT_SHAPE_LABEL) { state.flashMessage = null; state.flashActionLabel = null }
+        thresholdOn = false
         val doc = state.document ?: return
-        val l = doc.activeLayer ?: return
+        val l = at.techgaisi.farbwerk.model.LayerOps.paintTarget(state) ?: return
         if (l.locked) { state.flash("Ebene gesperrt"); return }
         val tool = temporaryTool ?: state.tool
         if (tool != Tool.PAINT && tool != Tool.SMUDGE && tool != Tool.ERASE) return
@@ -186,11 +210,13 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         renderer.diameter = diameter
         // "Starke Lasur" wendet die Deckkraft pro Tupfer an – nur beim Malen; sonst beim Zusammenführen
         renderer.opacity = if (tool == Tool.PAINT) opacity else 1f
-        renderer.color = state.color
-        renderer.secondaryColor = state.previousColor
+        renderer.color = at.techgaisi.farbwerk.model.LayerOps.paintColor(state, state.color)
+        renderer.secondaryColor = state.secondaryColor
+        renderer.viewRotation = viewRotation()
+        strokeBrush = brush
         renderer.globalPressureSmoothing = state.prefs.pressureSmoothing
         renderer.globalMotionFilter = state.prefs.motionFilteringAmount
-        renderer.viewScale = viewScale()
+        renderer.viewScale = viewScaleInternal()
         renderer.sampler = if (tool == Tool.PAINT) sampler else null
         painter.setup(brush)
 
@@ -211,6 +237,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
                 ensureBuffer(doc.width, doc.height)
                 val heavy = brush.int(BP.RENDER_MODE) == RenderMode.HEAVY_GLAZE && tool == Tool.PAINT
                 mergePaint.alpha = if (heavy) 255 else (opacity * 255f + 0.5f).toInt().coerceIn(0, 255)
+                thresholdOn = brush.on(BP.ALPHA_THRESHOLD)
+                if (thresholdOn) thresholdPaint.colorFilter = StrokeEffects.thresholdFilter(brush[BP.ALPHA_THRESHOLD_VALUE])
                 mergePaint.blendMode = when {
                     tool == Tool.ERASE -> BlendMode.DST_OUT
                     l.alphaLock -> BlendMode.SRC_ATOP
@@ -222,6 +250,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         }
         active = true
         lastX = p.x; lastY = p.y
+        assist.begin(doc, p.x, p.y)
         renderer.begin(p.x, p.y, p.pressure, p.tilt, p.orientation, p.time, p.isStylus)
     }
 
@@ -244,7 +273,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         }
         for (i in points.indices) {
             val p = points[i]
-            renderer.add(p.x, p.y, p.pressure, p.tilt, p.orientation, p.time)
+            assist.map(p.x, p.y, apt)
+            renderer.add(apt[0], apt[1], p.pressure, p.tilt, p.orientation, p.time)
         }
         val last = points.last()
         lastX = last.x; lastY = last.y
@@ -254,7 +284,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         predN = 0
         if (!active) { reset(); return }
         if (shape == null) {
-            renderer.add(p.x, p.y, p.pressure, p.tilt, p.orientation, p.time)
+            assist.map(p.x, p.y, apt)
+            renderer.add(apt[0], apt[1], p.pressure, p.tilt, p.orientation, p.time)
             renderer.end()
             if (strokeTool != Tool.SMUDGE && renderer.needsEndTaper()) applyEndTaper()
         }
@@ -274,7 +305,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     override fun onPredicted(points: List<InputPoint>) {
         val had = predN > 0
         predN = 0
-        if (active && shape == null && strokeTool != Tool.SMUDGE && points.isNotEmpty() && predictionAllowed()) {
+        if (active && shape == null && strokeTool != Tool.SMUDGE && !assist.active && points.isNotEmpty() && predictionAllowed()) {
             val n = minOf(points.size, MAX_PREDICTED)
             for (i in 0 until n) { predX[i] = points[i].x; predY[i] = points[i].y }
             predN = n
@@ -352,7 +383,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
             holdX = p.x; holdY = p.y
             lastX = p.x; lastY = p.y
             lastMoveX = p.x; lastMoveY = p.y
-            moveThreshold = 6f / viewScale()
+            moveThreshold = 6f / viewScaleInternal()
             movedSinceHold = false
             lastMoveTime = SystemClock.uptimeMillis()
             renderShape(det)
@@ -403,7 +434,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         val s = size.coerceIn(0f, 1f)
         var d = minS + (maxS - minS) * s * s
         // Dynamische Pinselskalierung aus: Größe bezieht sich auf den Bildschirm, nicht auf die Leinwand
-        if (!state.prefs.dynamicBrushScaling) d /= viewScale().coerceAtLeast(0.01f)
+        if (!state.prefs.dynamicBrushScaling) d /= viewScaleInternal().coerceAtLeast(0.01f)
         return d
     }
 
@@ -425,28 +456,65 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     private fun finish() {
         val l = layer
         val e = edit
+        val sh = shape
         if (l != null && e != null) {
             if (strokeTool != Tool.SMUDGE) {
                 val buf = buffer
+                val b = strokeBrush
                 if (buf != null && !dirty.isEmpty) {
-                    val c = Canvas(l.bitmap)
-                    c.save()
-                    c.clipRect(dirty)
-                    c.drawBitmap(buf, 0f, 0f, mergePaint)
-                    c.restore()
+                    if (b != null && strokeTool == Tool.PAINT && StrokeEffects.needsPostPass(b)) {
+                        StrokeEffects.apply(buf, dirty, b, renderer.diameter)
+                    }
+                    mergeBuffer(l, buf, state.document?.selection?.path)
                 }
                 l.drawOverride = null
             }
             val r = Rect(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt())
+            r.intersect(0, 0, l.width, l.height)
+            // QuickShape: Zustand für "Form bearbeiten" merken (nicht beim Wischen)
+            val doc = state.document
+            val b = strokeBrush
+            val remember = sh != null && strokeTool != Tool.SMUDGE && !dirty.isEmpty && doc != null && b != null && !r.isEmpty
+            val pre = if (remember) Bitmap.createBitmap(e.original, r.left, r.top, r.width(), r.height()) else null
             clearBuffer()
             if (dirty.isEmpty) e.cancel()
-            else e.commit(r, when (strokeTool) { Tool.SMUDGE -> "Wischen"; Tool.ERASE -> "Radieren"; else -> "Pinselstrich" })
+            else e.commit(r, if (sh != null) "QuickShape" else when (strokeTool) { Tool.SMUDGE -> "Wischen"; Tool.ERASE -> "Radieren"; else -> "Pinselstrich" })
+            if (remember && pre != null && sh != null && doc != null && b != null) {
+                val ls = LastShape(
+                    EditShape.from(sh), l, doc.id, Rect(r), pre, b, strokeTool, renderer.diameter, renderer.opacity,
+                    renderer.color, renderer.secondaryColor, shapePressure, symm, mergePaint.alpha, mergePaint.blendMode,
+                    thresholdOn, doc.selection?.path?.let { android.graphics.Path(it) },
+                )
+                ls.undoVersion = state.undo.version
+                lastShape = ls
+                val label = EditShape.from(sh).title + " erstellt"
+                state.flash(label, EDIT_SHAPE_LABEL) { beginShapeEdit() }
+            }
         }
         reset()
     }
 
+    /** Zeichnet den Strich-Puffer mit Strichdeckkraft/Mischmodus (und ggf. Alpha-Schwelle). */
+    private fun drawBuffer(c: Canvas, buf: Bitmap) {
+        if (thresholdOn) {
+            val sc = c.saveLayer(null, mergePaint)
+            c.drawBitmap(buf, 0f, 0f, thresholdPaint)
+            c.restoreToCount(sc)
+        } else c.drawBitmap(buf, 0f, 0f, mergePaint)
+    }
+
+    private fun mergeBuffer(l: Layer, buf: Bitmap, sel: android.graphics.Path?) {
+        val c = Canvas(l.bitmap)
+        c.save()
+        c.clipRect(dirty)
+        if (sel != null) c.clipPath(sel)
+        drawBuffer(c, buf)
+        c.restore()
+    }
+
     private fun reset() {
         predN = 0
+        assist.end()
         active = false
         layer = null
         edit = null
@@ -484,10 +552,17 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         return atan2(mValues[Matrix.MSKEW_Y], mValues[Matrix.MSCALE_X])
     }
 
-    private fun viewScale(): Float {
+    private fun viewScaleInternal(): Float {
         val m = state.canvasView?.docToViewMatrix() ?: return 1f
         m.getValues(mValues)
         return hypot(mValues[Matrix.MSCALE_X], mValues[Matrix.MSKEW_Y]).coerceAtLeast(0.001f)
+    }
+
+    /** Drehung der Ansicht in Radiant (für "An Bildschirm ausrichten"). */
+    private fun viewRotation(): Float {
+        val m = state.canvasView?.docToViewMatrix() ?: return 0f
+        m.getValues(mValues)
+        return atan2(mValues[Matrix.MSKEW_Y], mValues[Matrix.MSCALE_X])
     }
 
     /** Ende des Strichs verjüngen: betroffenen Bereich leeren und alle berührenden Tupfer neu zeichnen. */
@@ -552,13 +627,134 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         state.canvasView?.postInvalidateOnAnimation()
     }
 
+    // ------------------------------------------------------------ QuickShape "Form bearbeiten"
+
+    /** Startet die Bearbeitung der zuletzt erstellten QuickShape-Form (Schaltfläche in der Hinweisleiste). */
+    fun beginShapeEdit() {
+        val ls = lastShape ?: return
+        if (editor != null || active) return
+        if (!shapeEditStillValid(ls)) { lastShape = null; state.flash("Form kann nicht mehr bearbeitet werden"); return }
+        val l = ls.layer
+        val doc = state.document ?: return
+        // Zustand mit alter Form sichern, dann Ebene im Formbereich auf "vor dem Strich" zurücksetzen
+        editAfter = Bitmap.createBitmap(l.bitmap, ls.r0.left, ls.r0.top, ls.r0.width(), ls.r0.height())
+        Canvas(l.bitmap).drawBitmap(ls.pre, ls.r0.left.toFloat(), ls.r0.top.toFloat(), restorePaint)
+        ensureBuffer(doc.width, doc.height)
+        dirty.setEmpty()
+        renderer.brush = ls.brush
+        renderer.diameter = ls.diameter
+        renderer.opacity = ls.opacity
+        renderer.color = ls.color
+        renderer.secondaryColor = ls.secondary
+        renderer.sampler = null
+        renderer.sink = paintSink
+        painter.setup(ls.brush)
+        symm = ls.symm
+        mergePaint.alpha = ls.mergeAlpha
+        mergePaint.blendMode = ls.blend
+        thresholdOn = ls.threshold
+        if (thresholdOn) thresholdPaint.colorFilter = StrokeEffects.thresholdFilter(ls.brush[BP.ALPHA_THRESHOLD_VALUE])
+        l.drawOverride = editOverride
+        val ed = QuickShapeEditor(state, this, ls.shape)
+        editor = ed
+        state.canvasOverride = ed
+        ed.updateStatus()
+        renderEditShape(ls.shape)
+    }
+
+    private val editOverride: (Canvas) -> Unit = { c ->
+        val ls = lastShape; val buf = buffer
+        if (ls != null && buf != null) {
+            c.drawBitmap(ls.layer.bitmap, 0f, 0f, plainPaint)
+            if (!dirty.isEmpty) {
+                c.save(); c.clipRect(dirty)
+                ls.selPath?.let { c.clipPath(it) }
+                drawBuffer(c, buf)
+                c.restore()
+            }
+        }
+    }
+
+    private fun shapeEditStillValid(ls: LastShape): Boolean {
+        val doc = state.document ?: return false
+        return doc.id == ls.docId && doc.indexOf(ls.layer) >= 0 && state.undo.version == ls.undoVersion && !ls.layer.locked
+    }
+
+    override fun renderEditShape(shape: EditShape) {
+        val ls = lastShape ?: return
+        val n = shape.sample(shapeXs, shapeYs)
+        if (n < 2) return
+        clearBuffer()
+        dirty.setEmpty()
+        renderer.renderPath(shapeXs.data, shapeYs.data, n, shape.closed, ls.pressure)
+        state.canvasView?.postInvalidateOnAnimation()
+    }
+
+    override fun commitShapeEdit() {
+        val ls = lastShape ?: return endShapeEdit()
+        val after = editAfter ?: return endShapeEdit()
+        val buf = buffer ?: return endShapeEdit()
+        val l = ls.layer
+        val r = Rect(ls.r0)
+        if (!dirty.isEmpty) r.union(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt())
+        if (!r.intersect(0, 0, l.width, l.height)) return endShapeEdit()
+        // "vorher" = Zustand mit der alten Form
+        val before = Bitmap.createBitmap(l.bitmap, r.left, r.top, r.width(), r.height()).copy(Bitmap.Config.ARGB_8888, true)
+        Canvas(before).drawBitmap(after, (ls.r0.left - r.left).toFloat(), (ls.r0.top - r.top).toFloat(), restorePaint)
+        if (!dirty.isEmpty) {
+            if (ls.tool == Tool.PAINT && StrokeEffects.needsPostPass(ls.brush)) StrokeEffects.apply(buf, dirty, ls.brush, ls.diameter)
+            mergeBuffer(l, buf, ls.selPath)
+        }
+        val afterBmp = Bitmap.createBitmap(l.bitmap, r.left, r.top, r.width(), r.height())
+        clearBuffer()
+        state.undo.push(LayerPixelsAction("Form bearbeiten", l, r, before, afterBmp))
+        endShapeEdit()
+    }
+
+    override fun checkShapeEdit(): Boolean {
+        val ls = lastShape ?: run { endShapeEdit(); return false }
+        val doc = state.document
+        if (doc == null || doc.id != ls.docId || doc.indexOf(ls.layer) < 0 || state.undo.version != ls.undoVersion) {
+            // Verlauf/Dokument hat sich geändert (z. B. Rückgängig): Sitzung ohne Wiederherstellen beenden
+            clearBuffer()
+            endShapeEdit()
+            return false
+        }
+        if (state.tool != ls.tool && state.tool != Tool.PAINT && state.tool != Tool.ERASE) {
+            commitShapeEdit()
+            return false
+        }
+        return true
+    }
+
+    override fun viewScale(): Float = viewScaleInternal()
+
+    private fun endShapeEdit() {
+        lastShape?.layer?.drawOverride = null
+        if (state.canvasOverride === editor) state.canvasOverride = null
+        if (editor != null) state.statusBar = null
+        editor = null
+        editAfter = null
+        lastShape = null
+        symm = emptyList()
+        renderer.sink = null
+        dirty.setEmpty()
+        state.invalidate()
+    }
+
+    /** Läuft gerade "Form bearbeiten"? */
+    val isEditingShape: Boolean get() = editor != null
+
     private companion object {
+        const val EDIT_SHAPE_LABEL = "Form bearbeiten"
         const val MAX_PREDICTED = 32
         const val MAX_PREDICTED_DABS = 300f
     }
 
     /** Gibt Speicher frei (z. B. beim Schließen eines Dokuments). */
     fun release() {
+        if (editor != null) { clearBuffer(); endShapeEdit() }
+        lastShape = null
         buffer?.recycle(); buffer = null; bufferCanvas = null
         painter.release()
         smudger.release()

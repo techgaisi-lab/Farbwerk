@@ -50,7 +50,7 @@ fun AdjustmentsMenu(state: EditorState, modifier: Modifier = Modifier) {
     PanelCard(modifier, title = "Anpassungen") {
         Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 8.dp)) {
             var lastSection = -1
-            for (k in AdjustmentKind.entries) {
+            for (k in AdjustmentKind.entries.filter { it.inMenu }) {
                 if (lastSection >= 0 && k.section != lastSection) {
                     Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp).height(0.5.dp).background(ui.divider))
                 }
@@ -60,7 +60,8 @@ fun AdjustmentsMenu(state: EditorState, modifier: Modifier = Modifier) {
                     Modifier.fillMaxWidth()
                         .clickable { startAdjustment(state, k) }
                         .background(if (active) ui.selectedRow.copy(alpha = 0.35f) else androidx.compose.ui.graphics.Color.Transparent)
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
+                        .padding(horizontal = 16.dp)
+                        .height(46.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Icon(iconFor(k), null, tint = ui.icon, modifier = Modifier.size(22.dp))
@@ -72,7 +73,7 @@ fun AdjustmentsMenu(state: EditorState, modifier: Modifier = Modifier) {
     }
 }
 
-/** Öffnet die Anpassung [k] (auch für Tastenkürzel nutzbar). */
+/** Öffnet die Anpassung [k] (auch für Tastenkürzel und QuickMenu nutzbar, z. B. Umfärben). */
 fun startAdjustment(state: EditorState, k: AdjustmentKind) = state.adjustmentTool.open(k)
 
 private fun iconFor(k: AdjustmentKind): ImageVector = when (k) {
@@ -91,4 +92,5 @@ private fun iconFor(k: AdjustmentKind): ImageVector = when (k) {
     AdjustmentKind.CHROMATIC -> Icons.Outlined.Lens
     AdjustmentKind.LIQUIFY -> Icons.Outlined.Water
     AdjustmentKind.CLONE -> Icons.Outlined.ContentCopy
+    AdjustmentKind.RECOLOR -> Icons.Outlined.Palette
 }

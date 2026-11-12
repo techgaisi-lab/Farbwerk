@@ -2,6 +2,7 @@ package at.techgaisi.farbwerk.brush
 
 import android.graphics.Bitmap
 import android.graphics.BitmapShader
+import android.graphics.BlendMode
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
@@ -13,14 +14,18 @@ import android.graphics.Shader
 import kotlin.math.ceil
 
 /**
- * Zeichnet einzelne Pinsel-Tupfer (Stempel) auf ein Canvas: Form (rotiert, gestaucht, gespiegelt),
- * Farbe/Deckkraft und optional Körnung. Alle Hilfsobjekte werden wiederverwendet – keine Allokationen pro Tupfer.
+ * Zeichnet einzelne Pinsel-Tupfer (Stempel) auf ein Canvas: Form (rotiert, gestaucht, gespiegelt, ggf. unscharf),
+ * Farbe/Deckkraft und optional Körnung (texturiert oder bewegt, mit Maßstab/Zoom/Drehung/Tiefe).
+ * Alle Hilfsobjekte werden wiederverwendet – keine Allokationen pro Tupfer.
+ *
+ * Zusatzinformationen pro Tupfer stecken in den `flags` (siehe [encodeFlags]), damit die Tupfer-Schnittstelle
+ * [DabConsumer] unverändert bleibt.
  */
 class DabPainter {
     private val m = Matrix()
     private val shapePaint = Paint(Paint.ANTI_ALIAS_FLAG or Paint.FILTER_BITMAP_FLAG)
     private val ovalPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val grainPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
+    private val grainPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { blendMode = BlendMode.DST_OUT }
     private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
     private val blitPaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val grainMatrix = Matrix()
@@ -31,31 +36,55 @@ class DabPainter {
     private var scratch: Bitmap? = null
     private var scratchCanvas: Canvas? = null
 
-    private var shapeIndex = 0
-    private var shape: Bitmap = BrushTextures.shape(0)
-    private var grain: Bitmap? = null
+    private var baseShape: Bitmap = BrushTextures.shape(0)
+    private var analyticHard = false
     private var grainShader: BitmapShader? = null
+    private var grainMask: Bitmap? = null
     private var grainScale = 1f
     private var grainMoving = false
+    private var grainMovement = 1f
+    private var grainZoom = 0f
+    private var grainRotation = 0f
+    private var baseDepth = 0f
+    private var offX = 0f
+    private var offY = 0f
 
     /** Übernimmt Form und Körnung des Pinsels. Vor jedem Strich aufrufen. */
     fun setup(brush: Brush) {
-        shapeIndex = brush.int(BP.SHAPE_KIND)
-        shape = BrushTextures.shape(shapeIndex)
-        val g = BrushTextures.grain(brush.int(BP.GRAIN_KIND), brush[BP.GRAIN_DEPTH], brush.on(BP.GRAIN_INVERT))
-        if (g !== grain) {
-            grain = g
+        val idx = brush.int(BP.SHAPE_KIND)
+        val img = brush.shapeImage
+        baseShape = img ?: BrushTextures.shape(idx)
+        analyticHard = img == null && idx == ShapeKind.HARD.ordinal
+        when (brush.int(BP.SHAPE_FILTER)) {
+            0 -> { shapePaint.isAntiAlias = false; shapePaint.isFilterBitmap = false; ovalPaint.isAntiAlias = false }
+            1 -> { shapePaint.isAntiAlias = false; shapePaint.isFilterBitmap = true; ovalPaint.isAntiAlias = true }
+            else -> { shapePaint.isAntiAlias = true; shapePaint.isFilterBitmap = true; ovalPaint.isAntiAlias = true }
+        }
+        val g = BrushImages.grainMask(
+            brush.int(BP.GRAIN_KIND), brush.grainImage, brush.on(BP.GRAIN_INVERT),
+            brush[BP.GRAIN_BRIGHTNESS], brush[BP.GRAIN_CONTRAST],
+        )
+        if (g !== grainMask) {
+            grainMask = g
             grainShader = g?.let { BitmapShader(it, Shader.TileMode.REPEAT, Shader.TileMode.REPEAT) }
             grainPaint.shader = grainShader
         }
+        grainPaint.isFilterBitmap = brush.int(BP.GRAIN_FILTER) != 0
         grainScale = brush[BP.GRAIN_SCALE]
         grainMoving = brush.int(BP.GRAIN_MODE) == 1
+        grainMovement = brush[BP.GRAIN_MOVEMENT]
+        grainZoom = brush[BP.GRAIN_ZOOM]
+        grainRotation = brush[BP.GRAIN_ROTATION]
+        baseDepth = brush[BP.GRAIN_DEPTH]
+        if (brush.on(BP.GRAIN_OFFSET_JITTER)) {
+            offX = (Math.random() * BrushImages.SIZE).toFloat(); offY = (Math.random() * BrushImages.SIZE).toFloat()
+        } else { offX = 0f; offY = 0f }
     }
 
     /**
      * Zeichnet einen Tupfer mit Mittelpunkt ([x],[y]).
      * @param angle Drehung in Radiant
-     * @param flags Bit 0 = horizontal gespiegelt, Bit 1 = vertikal gespiegelt
+     * @param flags siehe [encodeFlags]
      */
     fun draw(
         c: Canvas, x: Float, y: Float, diam: Float, aspect: Float, angle: Float,
@@ -63,7 +92,8 @@ class DabPainter {
     ) {
         if (alpha <= 0.002f || diam <= 0.05f) return
         val g = grainShader
-        if (g == null) {
+        val depth = if (flags and FLAG_DEPTH != 0) ((flags shr 8) and 0xFF) / 255f else baseDepth
+        if (g == null || depth <= 0.004f) {
             drawShape(c, x, y, diam, aspect, angle, alpha, color, flags)
             return
         }
@@ -77,11 +107,21 @@ class DabPainter {
         val half = s / 2f
         sc.drawRect(0f, 0f, s.toFloat(), s.toFloat(), clearPaint)
         drawShape(sc, half, half, diam, aspect, angle, alpha, color, flags)
-        // Körnung: Texturiert = fest im Dokument, Bewegt = fest am Tupfer
-        grainMatrix.setScale(grainScale, grainScale)
-        if (grainMoving) grainMatrix.postTranslate(half, half)
-        else grainMatrix.postTranslate(-(x - half), -(y - half))
+        // Körnung: Texturiert = fest im Dokument, Bewegt = (je nach "Bewegung") am Tupfer
+        if (grainMoving) {
+            val sEff = (grainScale * (1f + grainZoom * (diam / 128f - 1f))).coerceAtLeast(0.03f)
+            val mv = grainMovement
+            grainMatrix.setScale(sEff, sEff)
+            grainMatrix.postTranslate(half * mv + (half - x) * (1f - mv) + offX, half * mv + (half - y) * (1f - mv) + offY)
+            if (grainRotation != 0f) {
+                grainMatrix.postRotate(Math.toDegrees(angle.toDouble()).toFloat() * grainRotation, half, half)
+            }
+        } else {
+            grainMatrix.setScale(grainScale, grainScale)
+            grainMatrix.postTranslate(-(x - half) + offX, -(y - half) + offY)
+        }
         g.setLocalMatrix(grainMatrix)
+        grainPaint.alpha = (depth.coerceIn(0f, 1f) * 255f + 0.5f).toInt()
         sc.drawRect(0f, 0f, s.toFloat(), s.toFloat(), grainPaint)
         src.set(0, 0, s, s)
         dst.set(x - half, y - half, x + half, y + half)
@@ -96,7 +136,8 @@ class DabPainter {
         if (a == 0) return
         val col = (color and 0x00FFFFFF) or (a shl 24)
         val deg = Math.toDegrees(angle.toDouble()).toFloat()
-        if (shapeIndex == ShapeKind.HARD.ordinal) {
+        val blur = (flags shr 16) and 0x7
+        if (analyticHard && blur == 0) {
             // Harte runde Spitze analytisch → bei jeder Größe scharfe Kanten
             ovalPaint.color = col
             val r = diam / 2f
@@ -108,7 +149,8 @@ class DabPainter {
             c.restore()
             return
         }
-        val n = BrushTextures.SHAPE_SIZE.toFloat()
+        val shape = if (blur == 0) baseShape else BrushImages.blurred(baseShape, blur.coerceAtMost(4))
+        val n = shape.width.toFloat()
         val fx = if (flags and 1 != 0) -1f else 1f
         val fy = if (flags and 2 != 0) -1f else 1f
         m.setTranslate(-n / 2f, -n / 2f)
@@ -139,5 +181,19 @@ class DabPainter {
 
     companion object {
         const val MAX_SCRATCH = 1024
+        private const val FLAG_DEPTH = 0x80
+
+        /**
+         * Tupfer-Flags: Bit 0/1 = horizontal/vertikal gespiegelt, Bit 7 + Bits 8–15 = eigene Körnungstiefe
+         * (0..255), Bits 16–18 = Unschärfestufe 0..4 der Form.
+         */
+        fun encodeFlags(flipX: Boolean, flipY: Boolean, depth: Float, blurLevel: Int): Int {
+            var f = 0
+            if (flipX) f = f or 1
+            if (flipY) f = f or 2
+            if (depth >= 0f) f = f or FLAG_DEPTH or (((depth.coerceIn(0f, 1f) * 255f + 0.5f).toInt() and 0xFF) shl 8)
+            f = f or ((blurLevel.coerceIn(0, 4)) shl 16)
+            return f
+        }
     }
 }

@@ -86,10 +86,14 @@ class LayerThumbnailCache {
     }
 }
 
-/** Zeichnet eine Miniatur seitenverhältnistreu auf Schachbrett (Transparenz). */
+/**
+ * Zeichnet eine Miniatur seitenverhältnistreu. [checker] = Schachbrett (Transparenz, z. B. Alpha-Sperre),
+ * sonst [background] (null = transparent).
+ */
 @Composable
 fun ThumbnailImage(
     image: ImageBitmap?, version: Int, docAspect: Float, modifier: Modifier, checker: Boolean = true,
+    background: ComposeColor? = null,
 ) {
     Canvas(modifier) {
         if (version < 0) return@Canvas // Lesen → Neuzeichnen nach Refresh
@@ -99,6 +103,7 @@ fun ThumbnailImage(
         if (docAspect > boxAspect) { w = size.width; h = size.width / docAspect } else { h = size.height; w = size.height * docAspect }
         val left = (size.width - w) / 2f
         val top = (size.height - h) / 2f
+        if (!checker && background != null) drawRect(background, Offset(left, top), Size(w, h))
         if (checker) {
             drawRect(ComposeColor.White, Offset(left, top), Size(w, h))
             val cell = 5f * density

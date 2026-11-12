@@ -219,9 +219,14 @@ class ProjectStore(private val context: Context) {
         val b = Bitmap.createBitmap(tw, th, Bitmap.Config.ARGB_8888)
         val c = Canvas(b)
         c.scale(tw / doc.width.toFloat(), th / doc.height.toFloat())
-        Compositor.draw(c, doc)
+        // Private Ebenen erscheinen nicht in der Miniatur
+        val hidden = doc.layers.filter { it.isPrivate && it.drawOverride == null }
+        hidden.forEach { it.drawOverride = HIDE }
+        try { Compositor.draw(c, doc) } finally { hidden.forEach { if (it.drawOverride === HIDE) it.drawOverride = null } }
         b
     } catch (t: Throwable) { Log.e(TAG, "thumb", t); null }
+
+    private val HIDE: (Canvas) -> Unit = {}
 
     // =================================================================== Laden
 
@@ -355,11 +360,17 @@ class ProjectStore(private val context: Context) {
 
     // =================================================================== Stapel
 
-    private class Index(val stacks: MutableMap<String, StackInfo>, val members: MutableMap<String, String>)
+    private class Index(
+        val stacks: MutableMap<String, StackInfo>,
+        val members: MutableMap<String, String>,
+        /** Manuelle Reihenfolge der Galerie (Schlüssel "p:<id>" bzw. "s:<id>"), vorne = oben. */
+        val order: MutableList<String> = ArrayList(),
+    )
 
     private fun readIndex(): Index = synchronized(indexLock) {
         val stacks = LinkedHashMap<String, StackInfo>()
         val members = HashMap<String, String>()
+        val order = ArrayList<String>()
         try {
             if (indexFile.exists()) {
                 val o = JSONObject(indexFile.readText())
@@ -373,9 +384,10 @@ class ProjectStore(private val context: Context) {
                 o.optJSONObject("members")?.let { m ->
                     for (k in m.keys()) { val v = m.getString(k); if (stacks.containsKey(v)) members[k] = v }
                 }
+                o.optJSONArray("order")?.let { a -> for (i in 0 until a.length()) order += a.getString(i) }
             }
         } catch (t: Throwable) { Log.e(TAG, "index", t) }
-        Index(stacks, members)
+        Index(stacks, members, order)
     }
 
     private fun updateIndex(block: (Index) -> Unit) = synchronized(indexLock) {
@@ -389,10 +401,26 @@ class ProjectStore(private val context: Context) {
             idx.stacks.values.forEach { put(JSONObject().put("id", it.id).put("name", it.name).put("created", it.created)) }
         })
         o.put("members", JSONObject().apply { idx.members.forEach { (k, v) -> put(k, v) } })
+        o.put("order", org.json.JSONArray().apply { idx.order.distinct().forEach { put(it) } })
         writeAtomic(indexFile, o.toString().toByteArray())
     }
 
     fun stacks(): List<StackInfo> = readIndex().stacks.values.toList()
+
+    /** Manuelle Galerie-Reihenfolge (Schlüssel "p:<id>"/"s:<id>"); Unbekanntes kommt nach Änderungszeit davor. */
+    fun order(): List<String> = readIndex().order
+
+    /**
+     * Speichert eine neue Reihenfolge für die angegebenen Schlüssel. Andere bekannte Schlüssel behalten ihre
+     * relative Lage dahinter (z. B. Inhalte anderer Stapel).
+     */
+    fun setOrder(keys: List<String>) {
+        updateIndex { idx ->
+            val rest = idx.order.filter { it !in keys }
+            idx.order.clear(); idx.order.addAll(keys); idx.order.addAll(rest)
+        }
+        notifyChanged()
+    }
 
     /** Legt einen Stapel mit den angegebenen Projekten an. Liefert die Stapel-ID. */
     fun createStack(name: String, projectIds: Collection<String>): String {

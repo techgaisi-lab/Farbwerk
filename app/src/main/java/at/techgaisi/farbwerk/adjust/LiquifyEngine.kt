@@ -42,9 +42,25 @@ class LiquifyEngine(val width: Int, val height: Int) {
 
     val isIdentity: Boolean get() = pos.contentEquals(base)
 
-    fun reset() { base.copyInto(pos) }
+    /** Stand bei Beginn von „Anpassen“ (100 %), null = nicht aktiv. */
+    private var adjustFrom: FloatArray? = null
+
+    fun reset() { adjustFrom = null; base.copyInto(pos) }
     fun snapshot(): FloatArray = pos.copyOf()
-    fun restore(s: FloatArray) { s.copyInto(pos) }
+    fun restore(s: FloatArray) { adjustFrom = null; s.copyInto(pos) }
+
+    /**
+     * „Anpassen“: schwächt alle bisherigen Verformungen auf [amount] (0..1) ab. Bezugspunkt ist der Stand
+     * beim ersten Aufruf; [commitAdjust] macht den abgeschwächten Stand zum neuen Ausgangspunkt.
+     */
+    fun setAdjust(amount: Float) {
+        val from = adjustFrom ?: pos.copyOf().also { adjustFrom = it }
+        val a = amount.coerceIn(0f, 1f)
+        for (i in pos.indices) pos[i] = base[i] + (from[i] - base[i]) * a
+    }
+
+    /** Beendet „Anpassen“ (vor dem nächsten Pinselstrich). */
+    fun commitAdjust() { adjustFrom = null }
 
     /**
      * Einen Pinselschritt anwenden.

@@ -104,4 +104,36 @@ object AppIcons {
         moveTo(19.5f, 10.5f); lineTo(10f, 10.5f); curveTo(6.5f, 10.5f, 4.5f, 12.5f, 4.5f, 15f)
         curveTo(4.5f, 17.5f, 6.5f, 19f, 9f, 19f)
     })
+
+    /** Vollbild verlassen: zwei Winkel, die nach außen zeigen (Oberfläche zurückholen). */
+    val FullscreenExit = icon("fullscreenExit", {
+        moveTo(4.5f, 9.5f); lineTo(4.5f, 4.5f); lineTo(9.5f, 4.5f)
+        moveTo(4.5f, 4.5f); lineTo(10f, 10f)
+        moveTo(19.5f, 14.5f); lineTo(19.5f, 19.5f); lineTo(14.5f, 19.5f)
+        moveTo(19.5f, 19.5f); lineTo(14f, 14f)
+    })
+
+    val Plus = icon("plus", {
+        moveTo(12f, 5f); lineTo(12f, 19f)
+        moveTo(5f, 12f); lineTo(19f, 12f)
+    })
+
+    val Minus = icon("minus", {
+        moveTo(5f, 12f); lineTo(19f, 12f)
+    })
+
+    /** Warnsymbol (Dreieck mit Ausrufezeichen) für Gesten-Konflikte. */
+    val Warning = icon("warning", {
+        moveTo(12f, 3.5f); lineTo(21.5f, 20f); lineTo(2.5f, 20f); close()
+        moveTo(12f, 9.5f); lineTo(12f, 14f)
+        moveTo(12f, 17f); lineTo(12f, 17.2f)
+    })
+
+    /** Pipette (Tropfer) – eigene Zeichnung. */
+    val Eyedropper = icon("eyedropper", {
+        moveTo(14f, 6f); lineTo(18f, 10f)
+        moveTo(16f, 8f); lineTo(7f, 17f); lineTo(4.5f, 19.5f)
+        moveTo(15f, 5f); curveTo(16.5f, 3.5f, 18.5f, 3.5f, 19.5f, 4.5f)
+        curveTo(20.5f, 5.5f, 20.5f, 7.5f, 19f, 9f)
+    })
 }

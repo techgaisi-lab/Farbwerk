@@ -13,7 +13,7 @@ import at.techgaisi.farbwerk.model.SymmetryMode
 object Symmetry {
     fun matrices(doc: ArtDocument): List<Matrix> {
         val g = doc.guides
-        if (g.kind != GuideKind.SYMMETRY || !g.assisted) return emptyList()
+        if (g.kind != GuideKind.SYMMETRY || doc.activeLayer?.assisted != true) return emptyList()
         val cx = if (g.symmetryCenterX.isNaN()) doc.width / 2f else g.symmetryCenterX
         val cy = if (g.symmetryCenterY.isNaN()) doc.height / 2f else g.symmetryCenterY
         val rot = g.rotationalSymmetry

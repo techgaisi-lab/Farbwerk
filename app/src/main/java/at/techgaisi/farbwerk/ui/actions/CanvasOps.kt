@@ -27,6 +27,9 @@ object CanvasOps {
         if (state.tool == Tool.TRANSFORM || state.tool == Tool.ADJUST) state.selectTool(Tool.PAINT)
     }
 
+    /** Für Overlays aus diesem Paket: laufende Modi beenden. */
+    fun finishModesPublic(state: EditorState) = finishModes(state)
+
     /**
      * Neue Leinwandgröße. [anchorX]/[anchorY] ∈ {0,1,2} (links/Mitte/rechts bzw. oben/Mitte/unten).
      * [scaleContent] = Inhalt mitskalieren (Bildgröße) statt zuschneiden/erweitern (Leinwandgröße).
@@ -34,26 +37,40 @@ object CanvasOps {
      */
     fun resizeCanvas(state: EditorState, newW: Int, newH: Int, anchorX: Int, anchorY: Int, scaleContent: Boolean) {
         val old = state.document ?: return
-        finishModes(state)
         if (newW == old.width && newH == old.height) return
         val dx = if (scaleContent) 0f else (newW - old.width) * anchorX / 2f
         val dy = if (scaleContent) 0f else (newH - old.height) * anchorY / 2f
         val sx = newW / old.width.toFloat(); val sy = newH / old.height.toFloat()
         val m = Matrix().apply { if (scaleContent) setScale(sx, sy) else setTranslate(dx.toInt().toFloat(), dy.toInt().toFloat()) }
+        transformCanvas(state, m, newW, newH, old.dpi, "Leinwand")
+    }
+
+    /**
+     * Allgemeines Zuschneiden/Skalieren/Drehen der Leinwand: jede Ebene (und Maske) wird mit [m]
+     * (Dokument → neues Dokument) in eine neue Bitmap [newW]×[newH] gezeichnet. Zeichenhilfen, Textebenen,
+     * Gruppen und Animationsdaten werden mitgeführt. Der Verlauf wird geleert (neues Dokument, gleiche ID).
+     */
+    fun transformCanvas(state: EditorState, m: Matrix, newW: Int, newH: Int, dpi: Int, label: String) {
+        val old = state.document ?: return
+        finishModes(state)
+        if (newW <= 0 || newH <= 0) return
+        if (newW == old.width && newH == old.height && m.isIdentity) {
+            if (dpi != old.dpi) { old.dpi = dpi; state.markDirty(); state.invalidate() }
+            return
+        }
         val paint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG).apply {
             xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC)
         }
-
         val doc = ArtDocument(old.name, newW, newH, old.id)
-        doc.dpi = old.dpi
+        doc.dpi = dpi
         doc.backgroundColor = old.backgroundColor
         doc.backgroundVisible = old.backgroundVisible
         doc.flipHorizontal = old.flipHorizontal
         doc.flipVertical = old.flipVertical
         doc.created = old.created
         doc.modified = System.currentTimeMillis()
-        copyGuides(old, doc, if (scaleContent) null else m, if (scaleContent) sx else 1f, if (scaleContent) sy else 1f)
-        if (newW <= 0 || newH <= 0) return
+        doc.animation = old.animation
+        copyGuides(old, doc, m)
         try {
             buildResizedLayers(old, doc, newW, newH, m, paint)
         } catch (oom: OutOfMemoryError) {
@@ -70,17 +87,27 @@ object CanvasOps {
         doc.secondarySelection.addAll(old.secondarySelection)
         doc.dirty = true
         state.openDocument(doc)
-        state.flash("Leinwand: $newW × $newH px")
+        state.flash("$label: $newW × $newH px")
     }
 
     private fun buildResizedLayers(old: ArtDocument, doc: ArtDocument, newW: Int, newH: Int, m: Matrix, paint: Paint) {
         for (l in old.layers) {
             val nb = Bitmap.createBitmap(newW, newH, Bitmap.Config.ARGB_8888)
-            Canvas(nb).drawBitmap(l.bitmap, m, paint)
             val nl = Layer(l.name, nb, l.id)
+            val td = l.text as? at.techgaisi.farbwerk.text.TextData
+            if (td != null) {
+                // Text bleibt Vektor: Matrix erweitern und neu setzen
+                val t = td.copy()
+                val tm = t.matrix(); tm.postConcat(m); t.setMatrix(tm)
+                nl.text = t
+                at.techgaisi.farbwerk.text.TextRenderer.render(t, nb)
+            } else {
+                Canvas(nb).drawBitmap(l.bitmap, m, paint)
+            }
             nl.visible = l.visible; nl.opacity = l.opacity; nl.blend = l.blend
             nl.alphaLock = l.alphaLock; nl.clipping = l.clipping; nl.locked = l.locked
             nl.isReference = l.isReference; nl.groupId = l.groupId
+            nl.assisted = l.assisted; nl.isPrivate = l.isPrivate
             l.mask?.let { mask ->
                 val cfg = if (mask.config == Bitmap.Config.ALPHA_8) Bitmap.Config.ALPHA_8 else Bitmap.Config.ARGB_8888
                 val nm = Bitmap.createBitmap(newW, newH, cfg)
@@ -93,16 +120,24 @@ object CanvasOps {
         }
     }
 
-    private fun copyGuides(old: ArtDocument, doc: ArtDocument, translate: Matrix?, sx: Float, sy: Float) {
+    private fun copyGuides(old: ArtDocument, doc: ArtDocument, m: Matrix) {
         val a = old.guides; val b = doc.guides
-        b.kind = a.kind; b.visible = a.visible; b.gridSize = a.gridSize; b.color = a.color; b.opacity = a.opacity
+        b.kind = a.kind; b.visible = a.visible; b.color = a.color; b.opacity = a.opacity
         b.symmetry = a.symmetry; b.rotationalSymmetry = a.rotationalSymmetry; b.radialSegments = a.radialSegments
-        b.assisted = a.assisted
+        b.assisted = a.assisted; b.thickness = a.thickness
+        val v = FloatArray(9); m.getValues(v)
+        val scale = kotlin.math.hypot(v[Matrix.MSCALE_X], v[Matrix.MSKEW_Y])
+        b.gridSize = (a.gridSize * scale).coerceAtLeast(2f)
+        b.rotation = a.rotation + Math.toDegrees(kotlin.math.atan2(v[Matrix.MSKEW_Y].toDouble(), v[Matrix.MSCALE_X].toDouble())).toFloat()
+        val p = FloatArray(2)
+        fun map(x: Float, y: Float): FloatArray { p[0] = x; p[1] = y; m.mapPoints(p); return p }
+        // Rasterursprung mitführen
+        val o = map(old.width / 2f + a.offsetX, old.height / 2f + a.offsetY)
+        b.offsetX = o[0] - doc.width / 2f; b.offsetY = o[1] - doc.height / 2f
         if (!a.symmetryCenterX.isNaN()) {
-            val v = FloatArray(9); translate?.getValues(v)
-            b.symmetryCenterX = a.symmetryCenterX * sx + (if (translate != null) v[Matrix.MTRANS_X] else 0f)
-            b.symmetryCenterY = a.symmetryCenterY * sy + (if (translate != null) v[Matrix.MTRANS_Y] else 0f)
+            val c = map(a.symmetryCenterX, a.symmetryCenterY); b.symmetryCenterX = c[0]; b.symmetryCenterY = c[1]
         }
+        a.vanishingPoints.forEach { vp -> val q = map(vp.x, vp.y); b.vanishingPoints.add(android.graphics.PointF(q[0], q[1])) }
     }
 
     /**
@@ -151,6 +186,12 @@ object CanvasOps {
         val g = doc.guides
         if (horizontal && !g.symmetryCenterX.isNaN()) g.symmetryCenterX = doc.width - g.symmetryCenterX
         if (!horizontal && !g.symmetryCenterY.isNaN()) g.symmetryCenterY = doc.height - g.symmetryCenterY
+        if (horizontal) { g.offsetX = -g.offsetX; g.rotation = 180f - g.rotation } else { g.offsetY = -g.offsetY; g.rotation = -g.rotation }
+        g.vanishingPoints.forEach { if (horizontal) it.x = doc.width - it.x else it.y = doc.height - it.y }
+        // Textebenen bleiben Vektor: Spiegelung in die Textmatrix übernehmen
+        for (l in doc.layers) (l.text as? at.techgaisi.farbwerk.text.TextData)?.let { t ->
+            val tm = t.matrix(); tm.postConcat(m); t.setMatrix(tm); t.renderedGeneration = l.bitmap.generationId
+        }
     }
 
     /**

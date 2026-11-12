@@ -33,6 +33,9 @@ enum class ExportFormat(val label: String, val ext: String, val mime: String, va
     PNG("PNG", "png", "image/png", "Bild mit Transparenz"),
     TIFF("TIFF", "tif", "image/tiff", "Unkomprimiert mit Alpha"),
     LAYERS_PNG("PNG-Dateien", "zip", "application/zip", "Jede Ebene als PNG"),
+    PDF_PAGES("PDF-Seiten", "pdf", "application/pdf", "Jede Ebene/Seite eine Seite"),
+    ANIM_GIF("Animiertes GIF", "gif", "image/gif", "Ebenen als Bilder"),
+    ANIM_MP4("Animiertes MP4", "mp4", "video/mp4", "Ebenen als Video"),
 }
 
 /**
@@ -55,6 +58,18 @@ object Exporters {
 
     /** Exportiert [doc] im Format [format]. Muss aus einer Coroutine auf dem Main-Thread kommen. */
     suspend fun export(context: Context, doc: ArtDocument, format: ExportFormat): File {
+        // Private Ebenen erscheinen nicht in Exporten (außer im Projektformat)
+        if (format == ExportFormat.PROJECT) return exportInner(context, doc, format)
+        val hidden = doc.layers.filter { it.isPrivate && it.drawOverride == null }
+        hidden.forEach { it.drawOverride = PRIVATE_HIDE }
+        try { return exportInner(context, doc, format) }
+        finally { hidden.forEach { if (it.drawOverride === PRIVATE_HIDE) it.drawOverride = null } }
+    }
+
+    /** Zeichnet nichts (blendet private Ebenen während eines Exports aus). */
+    private val PRIVATE_HIDE: (Canvas) -> Unit = {}
+
+    private suspend fun exportInner(context: Context, doc: ArtDocument, format: ExportFormat): File {
         val dir = exportDir(context)
         val out = File(dir, safeName(doc.name) + "." + format.ext)
         when (format) {
@@ -95,6 +110,9 @@ object Exporters {
                 }
             }
             ExportFormat.LAYERS_PNG -> withContext(Dispatchers.IO) { writeLayersZip(doc, out) }
+            ExportFormat.PDF_PAGES -> at.techgaisi.farbwerk.animation.AnimationExport.exportPagesPdf(doc, out)
+            ExportFormat.ANIM_GIF -> at.techgaisi.farbwerk.animation.AnimationExport.exportGif(doc, out)
+            ExportFormat.ANIM_MP4 -> at.techgaisi.farbwerk.animation.AnimationExport.exportMp4(doc, out)
         }
         return out
     }
@@ -125,7 +143,7 @@ object Exporters {
         ZipOutputStream(BufferedOutputStream(FileOutputStream(out), 1 shl 16)).use { zip ->
             zip.setLevel(Deflater.BEST_SPEED)
             val used = HashSet<String>()
-            doc.layers.forEachIndexed { i, l ->
+            doc.layers.filter { !it.isPrivate }.forEachIndexed { i, l ->
                 var n = "%02d %s".format(i + 1, safeName(l.name))
                 while (!used.add(n)) n += "_"
                 zip.putNextEntry(ZipEntry("$n.png"))

@@ -236,6 +236,10 @@ object LayerOps {
         l.clipping = src.clipping
         l.groupId = src.groupId
         l.mask = src.mask?.let { it.copy(it.config ?: Bitmap.Config.ALPHA_8, true) }
+        l.assisted = src.assisted
+        l.isPrivate = src.isPrivate
+        l.isReference = false
+        l.text = src.text
         return l
     }
 
@@ -309,15 +313,25 @@ object LayerOps {
     fun clearActiveLayer(state: EditorState) {
         val l = state.document?.activeLayer ?: return
         if (!checkUnlocked(state, l)) return
-        val e = state.beginPixelEdit(l)
-        l.bitmap.eraseColor(Color.TRANSPARENT)
-        e.commit(null, "Ebene löschen")
+        // Wird die Maske bearbeitet, setzt "Löschen" sie auf Weiß (alles sichtbar) zurück
+        val target = paintTarget(state) ?: return
+        val e = state.beginPixelEdit(target)
+        if (target !== l) target.bitmap.eraseColor(Color.WHITE) else target.bitmap.eraseColor(Color.TRANSPARENT)
+        // PixelEdit beschneidet auf eine aktive Auswahl → Schrubben/Löschen wirkt nur innerhalb der Auswahl
+        e.commit(null, if (target !== l) "Maske löschen" else "Ebene löschen")
     }
 
     /** Füllt die Ebene mit der aktuellen Farbe (Alpha-Sperre und Auswahl werden respektiert). */
     fun fillLayer(state: EditorState, layer: Layer? = state.document?.activeLayer) {
         val l = layer ?: return
         if (!checkUnlocked(state, l)) return
+        if (l === state.document?.activeLayer && editingMaskLayer(state) === l) {
+            val m = paintTarget(state) ?: return
+            val e = state.beginPixelEdit(m)
+            Canvas(m.bitmap).drawColor(paintColor(state, state.color), BlendMode.SRC)
+            e.commit(null, "Maske füllen")
+            return
+        }
         val e = state.beginPixelEdit(l)
         val c = Canvas(l.bitmap)
         if (l.alphaLock) c.drawColor(state.color, BlendMode.SRC_ATOP) else c.drawColor(state.color, BlendMode.SRC)
@@ -328,6 +342,7 @@ object LayerOps {
     fun invert(state: EditorState, layer: Layer? = state.document?.activeLayer) {
         val l = layer ?: return
         if (!checkUnlocked(state, l)) return
+        if (l === state.document?.activeLayer && editingMaskLayer(state) === l) { invertMask(state, l); return }
         val e = state.beginPixelEdit(l)
         val p = Paint().apply { blendMode = BlendMode.SRC; colorFilter = Compositor.INVERT_FILTER }
         Canvas(l.bitmap).drawBitmap(e.original, 0f, 0f, p)
@@ -412,15 +427,18 @@ object LayerOps {
         val l = layer ?: return
         val doc = state.document ?: return
         if (l.mask != null) { state.flash("Ebene hat bereits eine Maske"); return }
-        val m = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ALPHA_8)
-        m.eraseColor(Color.BLACK) // Alpha 255 = sichtbar
+        // Graustufen-Maske als ARGB (deckend, Weiß = sichtbar): direkt mit Pinseln bemalbar
+        val m = Bitmap.createBitmap(doc.width, doc.height, Bitmap.Config.ARGB_8888)
+        m.eraseColor(Color.WHITE)
         property(state, "Maske", null, m) { l.mask = it }
+        if (l === doc.activeLayer) setMaskEditing(state, l, true)
     }
 
     fun removeMask(state: EditorState, layer: Layer? = state.document?.activeLayer) {
         val l = layer ?: return
         val m = l.mask ?: return
         property(state, "Maske entfernen", m, null) { l.mask = it }
+        state.document?.let { maskEditing.remove(it) }
     }
 
     /** Wendet die Maske auf die Pixel an und entfernt sie. */
@@ -440,6 +458,7 @@ object LayerOps {
         c.drawBitmap(m, 0f, 0f, p)
         val after = l.bitmap.copy(Bitmap.Config.ARGB_8888, false)
         l.mask = null
+        state.document?.let { maskEditing.remove(it) }
         state.undo.push(LambdaAction("Maske anwenden", {
             Canvas(l.bitmap).drawBitmap(before, 0f, 0f, SRC_PAINT); l.mask = m
         }, {
@@ -665,6 +684,214 @@ object LayerOps {
         if (end == startValue) return
         state.undo.push(LambdaAction("Gruppendeckkraft", { g.opacity = startValue }, { g.opacity = end }))
         state.invalidate()
+    }
+
+    // =========================================================================================
+    // Mehrfachauswahl (Ebenenmenü über den Titel)
+    // =========================================================================================
+
+    /** Markiert alle Ebenen (die aktive bleibt primär). */
+    fun selectAll(state: EditorState) {
+        val doc = state.document ?: return
+        val active = doc.activeLayer
+        doc.secondarySelection.clear()
+        doc.layers.forEach { if (it !== active) doc.secondarySelection.add(it.id) }
+        state.invalidate()
+    }
+
+    /** Hebt die Sekundärauswahl auf (nur die Primärebene bleibt markiert). */
+    fun deselectAll(state: EditorState) {
+        val doc = state.document ?: return
+        if (doc.secondarySelection.isEmpty()) return
+        doc.secondarySelection.clear()
+        state.invalidate()
+    }
+
+    /** Fügt alle markierten Ebenen zu einer zusammen. */
+    fun mergeSelected(state: EditorState) {
+        val doc = state.document ?: return
+        val ids = selectedLayers(doc).map { it.id }
+        if (ids.size < 2) { state.flash("Mindestens zwei Ebenen markieren"); return }
+        mergeLayers(state, ids)
+    }
+
+    /**
+     * Schreibt die Ebenen als PNG-Dateien (nummeriert ab der untersten) in den Exportordner und liefert
+     * die Dateien. Läuft blockierend – im Hintergrund aufrufen (z. B. Dispatchers.IO).
+     */
+    fun exportLayersPng(context: Context, doc: ArtDocument, layers: List<Layer>): List<java.io.File> {
+        val dir = at.techgaisi.farbwerk.io.Exporters.exportDir(context)
+        val base = at.techgaisi.farbwerk.io.Exporters.safeName(doc.name)
+        val ordered = layers.sortedBy { doc.indexOf(it) }
+        return ordered.mapIndexed { i, l ->
+            val f = java.io.File(dir, "${base}_${i + 1}_${at.techgaisi.farbwerk.io.Exporters.safeName(l.name)}.png")
+            // Maske einrechnen, damit das geteilte Bild dem sichtbaren Ergebnis entspricht
+            val bmp = if (l.mask != null) renderMerged(doc, listOf(copyForExport(l))) else l.bitmap
+            java.io.FileOutputStream(f).use { bmp.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            if (bmp !== l.bitmap) bmp.recycle()
+            f
+        }
+    }
+
+    /** Kopie für den Export: Normal, volle Deckkraft, sichtbar, ohne Schnittmaske. */
+    private fun copyForExport(src: Layer): Layer {
+        val l = Layer(src.name, src.bitmap)
+        l.mask = src.mask
+        return l
+    }
+
+    // =========================================================================================
+    // Solo-Sichtbarkeit (Häkchen halten)
+    // =========================================================================================
+
+    private class Solo(val layerId: String, val visibility: Map<String, Boolean>)
+
+    private val solo = java.util.WeakHashMap<ArtDocument, Solo>()
+
+    /** ID der Ebene im Solo-Modus oder null. */
+    fun soloLayerId(doc: ArtDocument): String? = solo[doc]?.layerId
+
+    /**
+     * Solo-Sichtbarkeit umschalten: nur [layer] ist sichtbar. Erneut halten beendet Solo und stellt die
+     * vorherige Sichtbarkeit wieder her (zuvor ausgeblendete Ebenen bleiben ausgeblendet). Halten auf eine
+     * andere Ebene wechselt die Solo-Ebene. Reiner Ansichtsmodus (kein Undo-Eintrag).
+     */
+    fun toggleSolo(state: EditorState, layer: Layer) {
+        val doc = state.document ?: return
+        val cur = solo.remove(doc)
+        if (cur != null) {
+            doc.layers.forEach { l -> cur.visibility[l.id]?.let { l.visible = it } }
+            if (cur.layerId == layer.id) {
+                state.flash("Solo-Sichtbarkeit aus")
+                state.invalidate()
+                return
+            }
+        }
+        solo[doc] = Solo(layer.id, doc.layers.associate { it.id to it.visible })
+        doc.layers.forEach { it.visible = it === layer }
+        state.flash("Solo-Sichtbarkeit: ${layer.name}")
+        state.invalidate()
+    }
+
+    // =========================================================================================
+    // Zeichenassistent / Zusätze
+    // =========================================================================================
+
+    /** Zeichenassistent für diese Ebene an/aus. */
+    fun toggleAssisted(state: EditorState, l: Layer) {
+        property(state, "Zeichenassistent", l.assisted, !l.assisted) { l.assisted = it }
+        state.flash(if (l.assisted) "Zeichenassistent an" else "Zeichenassistent aus")
+    }
+
+    /** Sichtbare Ebenen mit Inhalt an einer Dokumentposition, oberste zuerst (für „Ebene wählen“). */
+    fun layersAt(doc: ArtDocument, x: Float, y: Float): List<Layer> {
+        val ix = x.toInt()
+        val iy = y.toInt()
+        if (ix !in 0 until doc.width || iy !in 0 until doc.height) return emptyList()
+        return doc.layers.asReversed().filter { l ->
+            l.visible && LayerGroups.isVisible(doc, l.groupId) && Color.alpha(l.bitmap.getPixel(ix, iy)) > 8
+        }
+    }
+
+    // =========================================================================================
+    // Maske als eigene Zeile: Bearbeitungsziel
+    // =========================================================================================
+
+    /** Dokument → ID der Ebene, deren Maske gerade bearbeitet wird (Maskenzeile ist primär). */
+    private val maskEditing = java.util.WeakHashMap<ArtDocument, String>()
+
+    /** Stellvertreter-Ebenen je Masken-Bitmap (für Pinsel und PixelEdit). */
+    private val maskProxies = java.util.WeakHashMap<Bitmap, Layer>()
+
+    /** Ebene, deren Maske gerade bearbeitet wird – nur gültig, solange sie aktiv ist und eine Maske hat. */
+    fun editingMaskLayer(state: EditorState): Layer? {
+        val doc = state.document ?: return null
+        val id = maskEditing[doc] ?: return null
+        val a = doc.activeLayer ?: return null
+        return if (a.id == id && a.mask != null) a else null
+    }
+
+    /** True, wenn die Maskenzeile der aktiven Ebene primär ist (Malen wirkt auf die Maske). */
+    fun isEditingMask(state: EditorState): Boolean = editingMaskLayer(state) != null
+
+    fun isEditingMask(doc: ArtDocument, layer: Layer): Boolean =
+        maskEditing[doc] == layer.id && layer.mask != null && doc.activeLayer === layer
+
+    /**
+     * Maske der Ebene als Bearbeitungsziel wählen (Tippen auf die Maskenzeile) bzw. zurück zur Ebene.
+     * Die Ebene wird dabei aktiv; Maske und Ebene bleiben gekoppelt.
+     */
+    fun setMaskEditing(state: EditorState, layer: Layer, on: Boolean) {
+        val doc = state.document ?: return
+        if (on) {
+            if (layer.mask == null) return
+            ensureArgbMask(layer)
+            val idx = doc.indexOf(layer)
+            if (idx < 0) return
+            if (doc.activeIndex != idx) { doc.activeIndex = idx; doc.secondarySelection.clear() }
+            maskEditing[doc] = layer.id
+        } else {
+            maskEditing.remove(doc)
+        }
+        state.invalidate()
+    }
+
+    /**
+     * Ziel für Malwerkzeuge, Füllen, Filter: die aktive Ebene oder – wenn die Maskenzeile primär ist – eine
+     * Stellvertreter-Ebene, deren [Layer.bitmap] die Masken-Bitmap selbst ist (ARGB-Graustufen, Weiß =
+     * sichtbar). `state.beginPixelEdit(target)` und Undo funktionieren damit unverändert.
+     * Die Stellvertreter-Ebene steht NICHT in `doc.layers`.
+     */
+    fun paintTarget(state: EditorState): Layer? {
+        val doc = state.document ?: return null
+        val l = editingMaskLayer(state) ?: return doc.activeLayer
+        return maskLayerFor(l)
+    }
+
+    /** Malfarbe für das aktuelle Ziel: bei Masken wird der Farbton ignoriert (nur Helligkeit zählt). */
+    fun paintColor(state: EditorState, argb: Int): Int {
+        if (!isEditingMask(state)) return argb
+        val g = (0.2126f * Color.red(argb) + 0.7152f * Color.green(argb) + 0.0722f * Color.blue(argb) + 0.5f)
+            .toInt().coerceIn(0, 255)
+        return Color.argb(Color.alpha(argb), g, g, g)
+    }
+
+    private fun maskLayerFor(l: Layer): Layer {
+        val m = ensureArgbMask(l)
+        val proxy = synchronized(maskProxies) { maskProxies.getOrPut(m) { Layer(l.name + " · Maske", m) } }
+        proxy.locked = l.locked
+        proxy.alphaLock = false
+        proxy.visible = true
+        return proxy
+    }
+
+    /**
+     * Wandelt eine ALPHA_8-Maske (z. B. aus PSD-Import) in eine deckende ARGB-Graustufenmaske um.
+     * Optisch identisch, daher ohne Undo-Eintrag.
+     */
+    private fun ensureArgbMask(l: Layer): Bitmap {
+        val m = l.mask ?: throw IllegalStateException("Ebene ohne Maske")
+        if (m.config == Bitmap.Config.ARGB_8888 && m.isMutable) return m
+        val argb = Bitmap.createBitmap(m.width, m.height, Bitmap.Config.ARGB_8888)
+        argb.eraseColor(Color.BLACK)
+        if (m.config == Bitmap.Config.ALPHA_8) {
+            Canvas(argb).drawBitmap(m, 0f, 0f, Paint().apply { color = Color.WHITE })
+        } else {
+            Canvas(argb).drawBitmap(m, 0f, 0f, null)
+        }
+        l.mask = argb
+        return argb
+    }
+
+    /** Kehrt die Maske um (Schwarz ↔ Weiß), mit Undo; respektiert eine aktive Auswahl. */
+    fun invertMask(state: EditorState, layer: Layer) {
+        if (layer.mask == null) return
+        if (!checkUnlocked(state, layer)) return
+        val proxy = maskLayerFor(layer)
+        val e = state.beginPixelEdit(proxy)
+        val p = Paint().apply { blendMode = BlendMode.SRC; colorFilter = Compositor.INVERT_FILTER }
+        Canvas(proxy.bitmap).drawBitmap(e.original, 0f, 0f, p)
+        e.commit(null, "Maske umkehren")
     }
 
     // =========================================================================================

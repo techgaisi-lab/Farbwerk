@@ -1,12 +1,16 @@
 package at.techgaisi.farbwerk.selection
 
 import android.graphics.Bitmap
+import android.graphics.BlendMode
 import android.graphics.Canvas
 import android.graphics.Color
 import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import android.graphics.Rect
 import android.graphics.RectF
 import android.os.Handler
 import android.os.Looper
@@ -18,9 +22,11 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import at.techgaisi.farbwerk.EditorState
+import at.techgaisi.farbwerk.StatusBar
 import at.techgaisi.farbwerk.model.InputPoint
 import at.techgaisi.farbwerk.model.Layer
 import at.techgaisi.farbwerk.model.Selection
+import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.model.ToolInputHandler
 import java.util.UUID
 import java.util.concurrent.Executors
@@ -38,7 +44,13 @@ enum class SelectionMode(val label: String) {
 }
 
 /** Im Speicher abgelegte Auswahl (Speichern & Laden). */
-class SavedSelection(val id: String, val selection: Selection, val thumbnail: ImageBitmap)
+class SavedSelection(
+    val id: String,
+    val selection: Selection,
+    val thumbnail: ImageBitmap,
+    /** Anzeigename („Auswahl 3“). */
+    val name: String = "Auswahl",
+)
 
 /**
  * Auswahlwerkzeug.
@@ -46,6 +58,11 @@ class SavedSelection(val id: String, val selection: Selection, val thumbnail: Im
  *  - Freihand: Lasso zeichnen und/oder Polygonpunkte tippen; Tippen auf den Startpunkt schließt.
  *  - Rechteck / Ellipse: Aufziehen.
  * Neue Formen werden zur Auswahl hinzugefügt bzw. (Entfernen) davon abgezogen.
+ *
+ * Öffentliche API für andere Module:
+ *  - [reloadLast] – „Letzte Auswahl neu laden“ (Halten auf das Auswahl-Symbol, WP1),
+ *  - [beginFeather]/[setFeatherLive]/[endFeather] – Weiche Kante als Live-Regler,
+ *  - [onColorChanged] – Farbfüllung färbt die zuletzt gefüllte Auswahl um.
  */
 class SelectionTool(private val state: EditorState) : ToolInputHandler {
 
@@ -57,13 +74,40 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
     var colorFill by mutableStateOf(false)
     /** Schwellenwert der automatischen Auswahl (0..1). */
     var threshold by mutableFloatStateOf(0.35f)
-    /** Schwellenwert-Anzeige während des Ziehens. */
+    /** Schwellenwert-Anzeige während des Ziehens (die Anzeige selbst läuft über [EditorState.statusBar]). */
     var thresholdVisible by mutableStateOf(false)
         private set
+    /** Weiche-Kante-Popover sichtbar (Live-Regler). Zum Öffnen/Schließen [beginFeather]/[endFeather] nutzen. */
     var featherDialogVisible by mutableStateOf(false)
+    /** Aktueller Wert des Weiche-Kante-Reglers (0..1) während der Live-Vorschau. */
+    var featherAmount by mutableFloatStateOf(0f)
+        private set
     var savedPanelVisible by mutableStateOf(false)
     val savedSelections = mutableStateListOf<SavedSelection>()
     private var savedDocId: String? = null
+    private var savedCounter = 0
+
+    /** Von uns gesetzte Statusleiste (nur diese wird wieder entfernt). */
+    private var ownStatus: StatusBar? = null
+
+    // ---------------------------------------------------------------- Weiche Kante (live)
+    private var featherBase: Selection? = null
+    private var featherResult: Selection? = null
+    private var featherToken = 0
+    private var featherBusy = false
+    private var featherPending = false
+
+    // ---------------------------------------------------------------- Farbfüllung
+    /** Zuletzt gefüllte Form – wird bei Farbwechsel umgefärbt, solange nichts anderes passiert ist. */
+    private class FillRecord(
+        val layerId: String,
+        val mask: Bitmap,
+        val bounds: Rect,
+        val before: Bitmap,
+        var color: Int,
+        var undoVersion: Int,
+    )
+    private var lastFill: FillRecord? = null
 
     private val density = state.context.resources.displayMetrics.density
     private val main = Handler(Looper.getMainLooper())
@@ -113,7 +157,16 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
         pathEffect = DashPathEffect(floatArrayOf(6f * density, 4f * density), 0f)
     }
     private val dotPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-    private val previewPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply { color = 0x703D8BFF }
+    /** Vorschau der automatischen Auswahl: Bereich farblich invertiert (Differenz mit Weiß). */
+    private val previewPaint = Paint(Paint.FILTER_BITMAP_FLAG).apply {
+        color = Color.WHITE
+        blendMode = BlendMode.DIFFERENCE
+    }
+    private val srcPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+
+    init {
+        SelectionPrefs.init(state.context)
+    }
 
     // ================================================================= Lebenszyklus
 
@@ -122,6 +175,7 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
         val doc = state.document
         if (doc != null && doc.id != savedDocId) {
             savedSelections.clear()
+            savedCounter = 0
             savedDocId = doc.id
         }
     }
@@ -129,8 +183,9 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
     fun onDeactivate() {
         if (polyCount >= 3) closePolygon() else polyCount = 0
         resetTransient()
-        featherDialogVisible = false
+        endFeather()
         savedPanelVisible = false
+        lastFill = null
     }
 
     private fun resetTransient() {
@@ -143,6 +198,50 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
         previewThreshold = -1f
         polyCount = 0
         segmentStart = 0
+        clearStatus()
+    }
+
+    private fun showThresholdStatus() {
+        val sb = StatusBar("Auswahl-Schwellenwert", threshold)
+        ownStatus = sb
+        state.statusBar = sb
+    }
+
+    private fun clearStatus() {
+        val own = ownStatus ?: return
+        if (state.statusBar === own) state.statusBar = null
+        ownStatus = null
+    }
+
+    // ================================================================= Letzte Auswahl
+
+    /**
+     * „Letzte Auswahl neu laden“: stellt die zuletzt vorhandene Auswahl des Dokuments wieder her und
+     * aktiviert das Auswahlwerkzeug (Hinweis „Maske neu geladen“). Für das Halten auf das Auswahl-Symbol.
+     */
+    fun reloadLast() {
+        val doc = state.document ?: return
+        val last = SelectionActions.lastSelectionFor(doc)
+        if (last == null) {
+            state.flash("Keine frühere Auswahl")
+            return
+        }
+        if (state.tool != Tool.SELECT) state.selectTool(Tool.SELECT)
+        if (doc.selection !== last) {
+            SelectionActions.setSelection(state, SelectionActions.copyOf(last), "Auswahl neu laden")
+        }
+        state.flash("Maske neu geladen")
+        state.invalidate()
+    }
+
+    /**
+     * „Hinzufügen“ bzw. „Entfernen“: übernimmt eine offene Freihand-Form (schließt die Schleife) und
+     * stellt die Verknüpfung der nächsten Form ein.
+     */
+    fun setCombine(subtractNext: Boolean) {
+        if (mode == SelectionMode.FREEHAND && polyCount >= 3) closePolygon()
+        subtract = subtractNext
+        state.invalidate()
     }
 
     /** Moduswechsel: offene Freihand-Polygone werden abgeschlossen. */
@@ -202,6 +301,8 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
                     threshold = nt
                     requestFlood()
                 }
+                // Statusleiste erst beim Ziehen zeigen (einfaches Tippen bleibt ruhig)
+                if (moved) showThresholdStatus()
             }
             else -> {}
         }
@@ -257,6 +358,7 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
                 thresholdVisible = false
                 previewBytes = null
                 threshold = autoStartThreshold
+                clearStatus()
             }
             else -> {}
         }
@@ -338,6 +440,7 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
         finishAfterFlood = false
         thresholdVisible = false
         previewBytes = null
+        clearStatus()
         if (doc == null || bytes == null || bytes.size != doc.width * doc.height) { state.invalidate(); return }
         applyShape(MaskUtils.fromBytes(doc.width, doc.height, bytes), null)
     }
@@ -370,27 +473,129 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
         val layer = doc.activeLayer ?: return
         if (layer.locked) { state.flash("Ebene gesperrt"); return }
         val bounds = MaskUtils.bounds(mask) ?: return
+        val before = MaskUtils.crop(layer.bitmap, bounds)
         val e = state.beginPixelEdit(layer)
-        Canvas(layer.bitmap).drawBitmap(mask, 0f, 0f, Paint().apply { color = state.color })
+        val argb = state.color
+        Canvas(layer.bitmap).drawBitmap(mask, 0f, 0f, Paint().apply { color = argb })
         e.commit(bounds, "Farbfüllung")
+        lastFill = FillRecord(layer.id, mask, bounds, before, argb, state.undo.version)
+    }
+
+    /**
+     * Farbe wurde geändert: Ist die Farbfüllung aktiv und die zuletzt gefüllte Form noch der letzte
+     * Schritt, wird sie in der neuen Farbe neu gefüllt (wie im Vorbild). Die UI ruft das entprellt auf.
+     */
+    fun onColorChanged(argb: Int) {
+        if (!colorFill) return
+        val rec = lastFill ?: return
+        if (rec.color == argb) return
+        val doc = state.document
+        val layer = doc?.layers?.firstOrNull { it.id == rec.layerId }
+        if (layer == null || state.undo.version != rec.undoVersion ||
+            layer.bitmap.width < rec.bounds.right || layer.bitmap.height < rec.bounds.bottom) {
+            lastFill = null
+            return
+        }
+        if (layer.locked) return
+        val e = state.beginPixelEdit(layer)
+        val c = Canvas(layer.bitmap)
+        c.drawBitmap(rec.before, rec.bounds.left.toFloat(), rec.bounds.top.toFloat(), srcPaint)
+        c.drawBitmap(rec.mask, 0f, 0f, Paint().apply { color = argb })
+        e.commit(rec.bounds, "Farbfüllung")
+        rec.color = argb
+        rec.undoVersion = state.undo.version
+        state.invalidate()
     }
 
     /** Schaltet Farbfüllung um; beim Einschalten wird eine bestehende Auswahl sofort gefüllt. */
     fun toggleColorFill() {
         colorFill = !colorFill
+        if (!colorFill) lastFill = null
         if (colorFill) state.document?.selection?.let { fillMask(it.mask) }
         state.flash(if (colorFill) "Farbfüllung an" else "Farbfüllung aus")
     }
 
-    /** Weiche Kante (0..1 → bis 10 % der kürzeren Dokumentseite). */
+    /** Weiche Kante (0..1 → bis 10 % der kürzeren Dokumentseite) in einem Schritt anwenden. */
     fun applyFeather(amount: Float) {
         val doc = state.document ?: return
         val sel = doc.selection ?: run { state.flash("Keine Auswahl"); return }
         if (amount <= 0f) return
-        val radius = amount * min(doc.width, doc.height) * 0.1f
+        val radius = featherRadius(amount)
         val mask = MaskUtils.feather(sel.mask, radius)
         val ns = Selection(mask, sel.path?.let { Path(it) }).also { it.feather = sel.feather + radius }
         SelectionActions.setSelection(state, ns, "Weiche Kante")
+    }
+
+    private fun featherRadius(amount: Float): Float {
+        val doc = state.document ?: return 0f
+        return amount * min(doc.width, doc.height) * 0.1f
+    }
+
+    /** Weiche-Kante-Regler öffnen: merkt sich die Ausgangsauswahl für die Live-Vorschau. */
+    fun beginFeather() {
+        val sel = state.document?.selection ?: run { state.flash("Keine Auswahl"); return }
+        savedPanelVisible = false
+        featherBase = sel
+        featherResult = null
+        featherAmount = 0f
+        featherToken++
+        featherDialogVisible = true
+    }
+
+    /** Live-Vorschau: rechnet im Hintergrund (neuester Wert gewinnt) und zeigt das Ergebnis sofort an. */
+    fun setFeatherLive(amount: Float) {
+        val base = featherBase ?: return
+        featherAmount = amount.coerceIn(0f, 1f)
+        val doc = state.document ?: return
+        if (featherAmount <= 0.001f) {
+            featherResult = null
+            doc.selection = base
+            state.invalidate()
+            return
+        }
+        if (featherBusy) { featherPending = true; return }
+        featherBusy = true
+        featherPending = false
+        val token = featherToken
+        val a = featherAmount
+        val radius = featherRadius(a)
+        exec.execute {
+            val mask = try { MaskUtils.feather(base.mask, radius) } catch (t: Throwable) { null }
+            main.post {
+                featherBusy = false
+                if (token != featherToken) return@post
+                val d = state.document
+                if (mask != null && d != null && (d.selection === base || d.selection === featherResult)) {
+                    val ns = Selection(mask, base.path?.let { Path(it) }).also { it.feather = base.feather + radius }
+                    featherResult = ns
+                    d.selection = ns
+                    state.invalidate()
+                }
+                if (featherPending || a != featherAmount) setFeatherLive(featherAmount)
+            }
+        }
+    }
+
+    /** Regler schließen: Ergebnis als ein Verlaufsschritt „Weiche Kante“ übernehmen. */
+    fun endFeather() {
+        if (!featherDialogVisible && featherBase == null) return
+        featherDialogVisible = false
+        val base = featherBase
+        val result = featherResult
+        featherBase = null
+        featherResult = null
+        featherToken++
+        featherPending = false
+        val doc = state.document ?: return
+        if (base == null) return
+        if (result != null && doc.selection === result && featherAmount > 0.001f) {
+            state.undo.push(SelectionActions.selectionChange(doc, base, result, "Weiche Kante"))
+            SelectionActions.noteSelection(doc, result)
+        } else if (doc.selection === result) {
+            doc.selection = base
+        }
+        featherAmount = 0f
+        state.invalidate()
     }
 
     fun invert() = ClipboardOps.invertSelection(state)
@@ -404,7 +609,8 @@ class SelectionTool(private val state: EditorState) : ToolInputHandler {
     fun saveCurrent() {
         val sel = state.document?.selection ?: run { state.flash("Keine Auswahl"); return }
         val copy = SelectionActions.copyOf(sel)
-        savedSelections.add(SavedSelection(UUID.randomUUID().toString(), copy, thumbnail(copy.mask)))
+        savedCounter++
+        savedSelections.add(SavedSelection(UUID.randomUUID().toString(), copy, thumbnail(copy.mask), "Auswahl $savedCounter"))
         state.flash("Auswahl gespeichert")
     }
 

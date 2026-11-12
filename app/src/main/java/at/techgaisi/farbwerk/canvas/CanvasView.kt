@@ -21,6 +21,10 @@ import android.view.View
 import androidx.input.motionprediction.MotionEventPredictor
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.guides.GuidesOverlay
+import at.techgaisi.farbwerk.input.GestureFunction
+import at.techgaisi.farbwerk.input.GestureMap
+import at.techgaisi.farbwerk.input.GestureTrigger
+import at.techgaisi.farbwerk.input.LayerPick
 import at.techgaisi.farbwerk.model.InputPoint
 import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.model.ToolInputHandler
@@ -101,6 +105,101 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         return android.graphics.PointF(pts[0], pts[1])
     }
 
+    /** Dokument-Koordinaten → Fenster-Koordinaten (z. B. für die schwebende Pipette, QuickMenu). */
+    fun docToWindow(docX: Float, docY: Float): android.graphics.PointF {
+        val loc = IntArray(2); getLocationInWindow(loc)
+        val pts = floatArrayOf(docX, docY)
+        displayMatrix().mapPoints(pts)
+        return android.graphics.PointF(pts[0] + loc[0], pts[1] + loc[1])
+    }
+
+    // ===================================================================== Hooks der Oberfläche (WP1/WP2)
+
+    /** QuickMenu-Anbindung (gesetzt vom Editor-Bildschirm). */
+    var quickMenuHook: QuickMenuHook? = null
+
+    /**
+     * „Ebene wählen“-Auslöser (Halten bzw. Modifizierer + Berühren). Das Ebenen-Paket kann hier ein Popup
+     * anmelden; ohne Anmeldung wird die oberste Ebene mit Inhalt unter dem Finger aktiv ([LayerPick]).
+     */
+    var onSelectLayerAt: ((docX: Float, docY: Float, windowX: Float, windowY: Float) -> Unit)? = null
+
+    /** Wird mit true beim Strichbeginn und mit false beim Strichende/-abbruch aufgerufen (Auto-Vollbild). */
+    var onStrokeActivity: ((Boolean) -> Unit)? = null
+
+    /** Modifizierer-Taste der Seitenleiste wird gehalten: Funktion für „Modifizierer + Berühren“. */
+    var heldModifier: GestureFunction? = null
+    /** Während des Haltens wurde die Leinwand berührt (dann löst das Loslassen kein „Tippen“ aus). */
+    var modifierUsed = false
+    /** Leertaste gehalten und dabei die Leinwand verschoben (dann öffnet Loslassen kein QuickMenu). */
+    var spacePanned = false
+
+    private var floatingEyedropper = false
+    private var floatingDocX = 0f
+    private var floatingDocY = 0f
+
+    /** Läuft gerade die schwebende Pipette (Modifizierer tippen)? */
+    val floatingEyedropperActive: Boolean get() = floatingEyedropper
+
+    /** Schwebende Pipette an ([docX], [docY]) zeigen (Ring wie bei Berühren & halten). */
+    fun beginFloatingEyedropper(docX: Float, docY: Float) {
+        if (mode == Mode.STROKE || mode == Mode.EYEDROPPER) return
+        floatingEyedropper = true
+        eyedropperActive = true
+        floatingDocX = docX; floatingDocY = docY
+        state.eyedropper.begin(InputPoint(docX, docY, 1f, 0f, 0f, SystemClock.uptimeMillis(), false))
+        invalidate()
+    }
+
+    /** Schwebende Pipette um ([dxView], [dyView]) Bildschirmpixel verschieben. */
+    fun moveFloatingEyedropperBy(dxView: Float, dyView: Float) {
+        if (!floatingEyedropper) return
+        val m = displayMatrix()
+        val pts = floatArrayOf(floatingDocX, floatingDocY)
+        m.mapPoints(pts)
+        pts[0] += dxView; pts[1] += dyView
+        val inv = Matrix(); m.invert(inv); inv.mapPoints(pts)
+        floatingDocX = pts[0]; floatingDocY = pts[1]
+        state.eyedropper.move(InputPoint(floatingDocX, floatingDocY, 1f, 0f, 0f, SystemClock.uptimeMillis(), false))
+        invalidate()
+    }
+
+    /** Schwebende Pipette beenden; [commit] übernimmt die Farbe. */
+    fun endFloatingEyedropper(commit: Boolean) {
+        if (!floatingEyedropper) return
+        floatingEyedropper = false
+        eyedropperActive = false
+        if (commit) state.eyedropper.end(InputPoint(floatingDocX, floatingDocY, 1f, 0f, 0f, SystemClock.uptimeMillis(), false))
+        else state.eyedropper.cancel()
+        invalidate()
+    }
+
+    private fun viewToWindow(x: Float, y: Float): android.graphics.PointF {
+        val loc = IntArray(2); getLocationInWindow(loc)
+        return android.graphics.PointF(x + loc[0], y + loc[1])
+    }
+
+    /** QuickMenu an einer Berührung öffnen; [dragging] = Finger bleibt liegen (Schnellwahl per Ziehen). */
+    private fun openQuickMenu(x: Float, y: Float, dragging: Boolean) {
+        val hook = quickMenuHook ?: return
+        val w = viewToWindow(x, y)
+        hook.openAt(w.x, w.y, dragging)
+        if (dragging) mode = Mode.QUICKMENU
+    }
+
+    /** „Ebene wählen“ an einer View-Position auslösen. */
+    private fun selectLayerAt(x: Float, y: Float) {
+        prepareInverse()
+        mapTmp[0] = x; mapTmp[1] = y
+        invDisplay.mapPoints(mapTmp)
+        val w = viewToWindow(x, y)
+        val cb = onSelectLayerAt
+        if (cb != null) cb(mapTmp[0], mapTmp[1], w.x, w.y) else LayerPick.pickTopmost(state, mapTmp[0], mapTmp[1])
+    }
+
+    /** Finger-Kontakt ohne Malen (nur Stift malt) – Kandidat für den Auslöser „Tippen“. */
+    private var idleFingerTap = false
+
     private fun updateInverse() { viewMatrix.invert(inverse) }
 
     override fun onSizeChanged(w: Int, h: Int, oldw: Int, oldh: Int) {
@@ -161,7 +260,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
 
     override fun onDraw(canvas: Canvas) {
         val light = state.prefs.lightInterface
-        canvas.drawColor(if (light) Color.rgb(214, 214, 218) else Color.rgb(28, 28, 32))
+        canvas.drawColor(if (light) Color.rgb(217, 217, 221) else Color.rgb(30, 30, 32)) // Arbeitsfläche (Theme: workspace)
         val doc = state.document ?: return
         val bounds = RectF(0f, 0f, doc.width.toFloat(), doc.height.toFloat())
 
@@ -227,7 +326,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
 
     // ===================================================================== Eingabe
 
-    private enum class Mode { IDLE, STROKE, GESTURE, EYEDROPPER, PAN_SPACE, BLOCKED }
+    private enum class Mode { IDLE, STROKE, GESTURE, EYEDROPPER, PAN_SPACE, BLOCKED, QUICKMENU }
 
     private var mode = Mode.IDLE
     private var strokePointerId = -1
@@ -528,7 +627,14 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             return
         }
         val stylus = isStylus(e, 0)
+        idleFingerTap = false
+        if (state.quickMenuAt != null) {
+            // Offenes QuickMenu: Wegtippen schließt (Finger malt dabei nicht), Weitermalen mit dem Stift schließt und malt
+            quickMenuHook?.dismiss() ?: run { state.quickMenuAt = null }
+            if (!stylus) { mode = Mode.BLOCKED; return }
+        }
         if (state.spaceHeld) {
+            spacePanned = true
             mode = Mode.PAN_SPACE
             gestureLastCx = e.x; gestureLastCy = e.y
             return
@@ -539,6 +645,15 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             return
         }
         if (stylus && handleStylusButtonDown(e, 0)) return
+        // Modifizierer der Seitenleiste gehalten + Leinwand berühren
+        when (heldModifier) {
+            GestureFunction.SMUDGE -> { modifierUsed = true; strokeTempTool = Tool.SMUDGE }
+            GestureFunction.ERASE -> { modifierUsed = true; strokeTempTool = Tool.ERASE }
+            GestureFunction.QUICKMENU -> { modifierUsed = true; openQuickMenu(e.x, e.y, dragging = true); if (mode == Mode.QUICKMENU) return }
+            GestureFunction.SELECT_LAYER -> { modifierUsed = true; selectLayerAt(e.x, e.y); mode = Mode.BLOCKED; return }
+            GestureFunction.EYEDROPPER -> modifierUsed = true
+            null -> {}
+        }
         if (state.eyedropperArmed) {
             startEyedropper(toDoc(e, 0), e.getPointerId(0), stylus)
             return
@@ -556,6 +671,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             if (!fingerMayPaint() && state.tool in BRUSH_TOOLS) {
                 // Finger malen nicht: nur Gesten/Pipette
                 mode = Mode.IDLE
+                idleFingerTap = true
                 scheduleHoldEyedropper(e)
                 return
             }
@@ -628,12 +744,15 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val p = toDoc(e, idx)
         lastPoint = p
         try { handlerTool?.onStrokeStart(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "start", t) }
+        onStrokeActivity?.invoke(true)
         if (!strokeIsStylus && state.tool in BRUSH_TOOLS) scheduleHoldEyedropper(e)
         invalidate()
     }
 
     private fun onPointerDown(e: MotionEvent) {
         val idx = e.actionIndex
+        idleFingerTap = false
+        if (mode == Mode.QUICKMENU) return
         if (isStylus(e, idx)) { onStylusJoins(e, idx); return }
         if (isPalmContact(e, idx)) { onPalmJoins(); return }
         when (mode) {
@@ -757,6 +876,10 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 val idx = e.findPointerIndex(eyedropperPointerId).let { if (it < 0) 0 else it }
                 state.eyedropper.move(toDoc(e, idx)); invalidate()
             }
+            Mode.QUICKMENU -> {
+                val w = viewToWindow(e.x, e.y)
+                quickMenuHook?.dragTo(w.x, w.y)
+            }
             Mode.PAN_SPACE -> {
                 viewMatrix.postTranslate(e.x - gestureLastCx, e.y - gestureLastCy)
                 gestureLastCx = e.x; gestureLastCy = e.y
@@ -764,7 +887,10 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             }
             Mode.IDLE -> {
                 if (fingerSuppressed && isPalmContact(e, 0)) { mode = Mode.BLOCKED; return }
-                if (hypot(e.x - strokeStartX, e.y - strokeStartY) > slop) handler.removeCallbacks(holdEyedropperRunnable)
+                if (hypot(e.x - strokeStartX, e.y - strokeStartY) > slop) {
+                    handler.removeCallbacks(holdEyedropperRunnable)
+                    idleFingerTap = false
+                }
             }
             else -> {}
         }
@@ -829,8 +955,20 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 eyedropperActive = false
                 state.eyedropperArmed = false
             }
+            Mode.QUICKMENU -> {
+                val w = viewToWindow(e.x, e.y)
+                if (canceled) quickMenuHook?.dismiss() else quickMenuHook?.release(w.x, w.y)
+            }
+            Mode.IDLE -> {
+                // Auslöser „Tippen“ (Finger, während nur der Stift malt)
+                if (idleFingerTap && !fingerSuppressed && !canceled && e.eventTime - strokeStartTime < 350 &&
+                    hypot(e.x - strokeStartX, e.y - strokeStartY) <= slop &&
+                    GestureMap.owner(state.prefs, GestureTrigger.FINGER_TAP) == GestureFunction.QUICKMENU
+                ) openQuickMenu(e.x, e.y, dragging = false)
+            }
             else -> {}
         }
+        idleFingerTap = false
         mode = Mode.IDLE
         fingerSuppressed = false
         invalidate()
@@ -840,6 +978,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         cancelTimers()
         if (mode == Mode.STROKE) cancelStroke()
         if (mode == Mode.EYEDROPPER) { state.eyedropper.cancel(); eyedropperActive = false }
+        if (mode == Mode.QUICKMENU) quickMenuHook?.dismiss()
+        idleFingerTap = false
         mode = Mode.IDLE
         fingerSuppressed = false
         invalidate()
@@ -855,6 +995,9 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         strokePointerId = -1
         try { h?.onStrokeEnd(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "end", t) }
         state.brushEngine.temporaryTool = null
+        // Zuletzt bemalte Stelle (schwebende Pipette per Modifizierer)
+        if (h === state.brushEngine) state.lastPaintPoint = android.graphics.PointF(p.x, p.y)
+        onStrokeActivity?.invoke(false)
         invalidate()
     }
 
@@ -874,6 +1017,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         handler.removeCallbacks(holdEyedropperRunnable)
         try { strokeHandler?.onStrokeCancel() } catch (t: Throwable) { android.util.Log.e("Farbwerk", "cancel", t) }
         state.brushEngine.temporaryTool = null
+        if (strokeHandler != null) onStrokeActivity?.invoke(false)
         strokeHandler = null
         strokePointerId = -1
         mode = Mode.IDLE
@@ -888,18 +1032,27 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private var holdEvent: MotionEvent? = null
     private val holdEyedropperRunnable = Runnable {
         val ev = holdEvent ?: return@Runnable
+        if (state.canvasOverride != null) return@Runnable // Overlay-Werkzeuge (Zuschneiden, Text …) nicht stören
         if (mode == Mode.STROKE && !strokeMoved) cancelStroke()
         if (mode == Mode.STROKE || mode == Mode.GESTURE || mode == Mode.BLOCKED) return@Runnable
-        prepareInverse()
-        startEyedropper(toDoc(ev, 0), ev.getPointerId(0), false)
+        idleFingerTap = false
+        when (GestureMap.owner(state.prefs, GestureTrigger.TOUCH_HOLD)) {
+            GestureFunction.QUICKMENU -> openQuickMenu(ev.x, ev.y, dragging = true)
+            GestureFunction.SELECT_LAYER -> { selectLayerAt(ev.x, ev.y); mode = Mode.BLOCKED }
+            else -> {
+                prepareInverse()
+                startEyedropper(toDoc(ev, 0), ev.getPointerId(0), false)
+            }
+        }
     }
 
     private fun scheduleHoldEyedropper(e: MotionEvent) {
-        if (!state.prefs.gestureHoldEyedropper) return
+        val owner = GestureMap.owner(state.prefs, GestureTrigger.TOUCH_HOLD) ?: return
         holdEvent?.recycle()
         holdEvent = MotionEvent.obtain(e)
         handler.removeCallbacks(holdEyedropperRunnable)
-        handler.postDelayed(holdEyedropperRunnable, state.prefs.holdDelayMs.toLong())
+        val delay = if (owner == GestureFunction.EYEDROPPER) state.prefs.holdDelayMs else state.prefs.holdMenuDelayMs
+        handler.postDelayed(holdEyedropperRunnable, delay.toLong())
     }
 
     private fun startEyedropper(p: InputPoint, pointerId: Int, byStylus: Boolean) {
@@ -1013,7 +1166,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                     var da = angle - gestureLastAngle
                     if (da > Math.PI) da -= (2 * Math.PI).toFloat()
                     if (da < -Math.PI) da += (2 * Math.PI).toFloat()
-                    viewMatrix.postRotate(Math.toDegrees(da.toDouble()).toFloat(), cx, cy)
+                    if (state.prefs.rotateWithPinch) viewMatrix.postRotate(Math.toDegrees(da.toDouble()).toFloat(), cx, cy)
                     updateInverse(); invalidate()
                 }
                 gestureLastSpan = span
@@ -1142,6 +1295,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         // Laufenden Strich sauber beenden (sonst bleibt z. B. drawOverride/PixelEdit offen)
         if (mode == Mode.STROKE) cancelStroke()
         if (mode == Mode.EYEDROPPER) { state.eyedropper.cancel(); eyedropperActive = false }
+        if (floatingEyedropper) endFloatingEyedropper(commit = false)
         mode = Mode.IDLE
         cancelTimers()
         animator?.cancel()
@@ -1149,4 +1303,15 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         // Keine Referenz auf eine abgelöste Ansicht behalten (Galerie → neues Dokument erzeugt eine neue View)
         if (state.canvasView === this) state.canvasView = null
     }
+}
+
+/**
+ * Anbindung des QuickMenus an die Leinwand. Koordinaten sind Fenster-Koordinaten.
+ * [openAt] mit dragging = true: Finger bleibt liegen, [dragTo]/[release] folgen (Schnellwahl per Ziehen).
+ */
+interface QuickMenuHook {
+    fun openAt(windowX: Float, windowY: Float, dragging: Boolean)
+    fun dragTo(windowX: Float, windowY: Float)
+    fun release(windowX: Float, windowY: Float)
+    fun dismiss()
 }

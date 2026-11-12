@@ -256,7 +256,7 @@ class EditorState(val context: Context) {
         flashActionLabel = actionLabel
         flashAction = onAction
         handler.removeCallbacks(clearFlash)
-        handler.postDelayed(clearFlash, if (actionLabel != null) 3500 else 1200)
+        handler.postDelayed(clearFlash, if (actionLabel != null) 3500 else 1500)
     }
 
     /** Hinweis-Schaltfläche wurde angetippt. */

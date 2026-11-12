@@ -86,6 +86,8 @@ class StrokeRenderer {
     var globalMotionFilter = 0f
     /** Faktor Dokumentpixel → Bildschirmpixel (für Tempo-Normierung). */
     var viewScale = 1f
+    /** Drehung der Ansicht (Radiant) – für "An Bildschirm ausrichten". */
+    var viewRotation = 0f
     var sampler: ColorSampler? = null
     var sink: DabConsumer? = null
 
@@ -148,7 +150,13 @@ class StrokeRenderer {
     private var taperStartLen = 0f
     private var taperEndLen = 0f
     private var taperExp = 1f
+    private var taperSizeAmt = 0.9f
+    private var taperOpAmt = 0f
+    private var taperPressAmt = 0f
     private var streamK = 1f
+    private var strokeRotOffset = 0f
+    private var linearMix = false
+    private var expr = 0f
 
     // ------------------------------------------------------------ Strich-API
 
@@ -181,8 +189,8 @@ class StrokeRenderer {
         lastRawX = x; lastRawY = y; lastTime = time
 
         val p = inputPressure(pressure)
-        val ps = max(globalPressureSmoothing, brush[BP.PRESSURE_SMOOTHING])
-        smP += (p - smP) * (1f - 0.92f * ps)
+        val ps = max(max(globalPressureSmoothing, brush[BP.PRESSURE_SMOOTHING]), brush[BP.STREAMLINE_PRESSURE])
+        smP += (p - smP) * (1f - 0.95f * ps)
         pressureSum += smP; pressureCount++
         // Neigung und Ausrichtung leicht glätten (Ausrichtung über den kürzesten Winkelweg)
         smT += (tilt - smT) * 0.5f
@@ -193,6 +201,11 @@ class StrokeRenderer {
         var ax = 0f; var ay = 0f
         for (i in 0 until stabCount) { ax += stabX[i]; ay += stabY[i] }
         ax /= stabCount; ay /= stabCount
+        // Bewegungsfilterung "Ausdruck": schnelle Bewegungen kommen ungefiltert durch
+        if (expr > 0f) {
+            val e = expr * (speed / 3f).coerceIn(0f, 1f)
+            ax += (x - ax) * e; ay += (y - ay) * e
+        }
         smX += (ax - smX) * streamK
         smY += (ay - smY) * streamK
         addControl(smX, smY, smP, smT, smO)
@@ -266,7 +279,7 @@ class StrokeRenderer {
         val l = dabs
         val total = distAlong
         val simple = brush.int(BP.COUNT) <= 1 && brush[BP.JITTER] <= 0.001f
-        val tSize = brush[BP.TAPER_SIZE]; val tOp = brush[BP.TAPER_OPACITY]
+        val tSize = taperSizeAmt; val tOp = taperOpAmt
         val spacing = brush[BP.SPACING]
         for (i in 0 until l.size) {
             val f = endFactor(total, l.dist[i])
@@ -324,11 +337,25 @@ class StrokeRenderer {
             RenderMode.INTENSE_BLEND -> 0.5f
             else -> 0f
         }).coerceIn(0f, 0.95f)
-        taperOn = (b[BP.TAPER_START] > 0f || b[BP.TAPER_END] > 0f) && !(b.on(BP.TAPER_TOUCH_ONLY) && stylus)
+        // Stift → Druck-Verjüngung, Finger → Touch-Verjüngung
+        val tStart: Float; var tEnd: Float; val tTip: Float
+        if (stylus) {
+            tStart = b[BP.TAPER_START]; tEnd = b[BP.TAPER_END]; tTip = b[BP.TAPER_TIP]
+            if (b.on(BP.TAPER_LINK)) tEnd = tStart
+            taperSizeAmt = b[BP.TAPER_SIZE]; taperOpAmt = b[BP.TAPER_OPACITY]; taperPressAmt = b[BP.TAPER_PRESSURE]
+        } else {
+            tStart = b[BP.TOUCH_TAPER_START]; tEnd = b[BP.TOUCH_TAPER_END]; tTip = b[BP.TOUCH_TAPER_TIP]
+            if (b.on(BP.TOUCH_TAPER_LINK)) tEnd = tStart
+            taperSizeAmt = b[BP.TOUCH_TAPER_SIZE]; taperOpAmt = b[BP.TOUCH_TAPER_OPACITY]; taperPressAmt = 0f
+        }
+        taperOn = tStart > 0f || tEnd > 0f
         val base = diameter * 8f + 150f
-        taperStartLen = b[BP.TAPER_START] * base
-        taperEndLen = b[BP.TAPER_END] * base
-        taperExp = 1.6f + (0.45f - 1.6f) * b[BP.TAPER_TIP]
+        taperStartLen = tStart * base
+        taperEndLen = tEnd * base
+        taperExp = 1.6f + (0.45f - 1.6f) * tTip
+        expr = b[BP.MOTION_FILTER_EXPR]
+        linearMix = b.on(BP.LUMINANCE_BLEND)
+        strokeRotOffset = if (b.on(BP.SHAPE_RANDOMIZE)) rand() * 2f * PI.toFloat() else 0f
         val s = b[BP.STREAMLINE]
         streamK = 1f - s.pow(0.6f) * 0.93f
         stabWindow = (1 + ((b[BP.STABILIZE] + b[BP.MOTION_FILTER] * 0.5f + globalMotionFilter * 0.5f) * 24f).roundToInt())
@@ -336,24 +363,40 @@ class StrokeRenderer {
 
         // Strich-Farbstreuung
         var c = color
-        if (b[BP.STROKE_HUE_JITTER] > 0f || b[BP.STROKE_BRIGHT_JITTER] > 0f) {
+        if (b[BP.STROKE_HUE_JITTER] > 0f || b[BP.STROKE_BRIGHT_JITTER] > 0f || b[BP.STROKE_SAT_JITTER] > 0f ||
+            b[BP.STROKE_DARK_JITTER] > 0f) {
             Color.colorToHSV(c, hsv)
             hsv[0] = (hsv[0] + (rand() - 0.5f) * 2f * b[BP.STROKE_HUE_JITTER] * 180f + 360f) % 360f
+            hsv[1] = (hsv[1] + (rand() - 0.5f) * 2f * b[BP.STROKE_SAT_JITTER]).coerceIn(0f, 1f)
             hsv[2] = (hsv[2] * (1f + (rand() - 0.5f) * 2f * b[BP.STROKE_BRIGHT_JITTER])).coerceIn(0f, 1f)
+            hsv[2] = hsv[2] * (1f - b[BP.STROKE_DARK_JITTER] * rand())
             c = Color.HSVToColor(hsv)
         }
+        if (b[BP.STROKE_SECONDARY_JITTER] > 0f) c = mixC(c, secondaryColor, b[BP.STROKE_SECONDARY_JITTER] * rand())
         strokeColor = c
         carR = Color.red(c).toFloat(); carG = Color.green(c).toFloat(); carB = Color.blue(c).toFloat()
     }
 
     private fun inputPressure(raw: Float): Float {
-        if (stylus) return raw.coerceIn(0.01f, 1f)
+        if (stylus) return brush.mapPressure(raw.coerceIn(0.01f, 1f)).coerceIn(0.01f, 1f)
         if (brush.on(BP.FINGER_PRESSURE)) {
             val sn = (speed / 4f).coerceIn(0f, 1f)
-            return (1.1f - sn * 0.85f).coerceIn(0.2f, 1f)
+            return brush.mapPressure((1.1f - sn * 0.85f).coerceIn(0.2f, 1f)).coerceIn(0.01f, 1f)
         }
         return 1f
     }
+
+    /** Parameterwert mit Druck-/Neigungskopplung (für Parameter mit [BP.dyn]). */
+    private fun m(p: BP, pr: Float, tiltT: Float): Float {
+        val b = brush
+        val v = b[p]
+        val pc = b.couplings[p.ordinal * 2]; val tc = b.couplings[p.ordinal * 2 + 1]
+        if (pc == 0f && tc == 0f) return v
+        val f = (1f - pc * (1f - pr)) * (1f - tc * tiltT)
+        return (v * f).coerceIn(p.min, p.max)
+    }
+
+    private fun mixC(a: Int, b: Int, t: Float): Int = if (linearMix) mixLinear(a, b, t) else mix(a, b, t)
 
     private fun pushStab(x: Float, y: Float) {
         stabX[stabPos] = x; stabY[stabPos] = y
@@ -427,40 +470,57 @@ class StrokeRenderer {
         val tiltT = tiltFactor(b, tilt)
         val speedNorm = (speed / 4f).coerceIn(0f, 1f)
 
-        // Verjüngung
+        // Verjüngung (Druckkopplung: stärkerer Druck schwächt die Verjüngung ab)
         var tf = 1f
         if (taperOn && !closedShape) {
             if (taperStartLen > 0f) tf = min(tf, (distAlong / taperStartLen).coerceIn(0f, 1f).pow(taperExp))
             if (knownTotalLength > 0f) tf = min(tf, endFactor(knownTotalLength, distAlong))
+            if (taperPressAmt > 0f) tf += (1f - tf) * taperPressAmt * p
         }
 
         // Größe
         var d = diameter
         d *= 1f - b[BP.PRESSURE_SIZE] * (1f - p)
         d *= 1f + b[BP.TILT_SIZE] * tiltT
-        d *= (1f - b[BP.SPEED_SIZE] * speedNorm).coerceAtLeast(0.05f)
-        d *= 1f - b[BP.TAPER_SIZE] * (1f - tf)
+        d *= signedSpeed(b[BP.SPEED_SIZE], speedNorm).coerceAtLeast(0.05f)
+        d *= 1f - taperSizeAmt * (1f - tf)
         d = max(d, 0.3f)
 
         // Deckkraft / Fluss
-        var a = flowEff
+        var a = flowEff * (m(BP.FLOW, p, tiltT) / b[BP.FLOW].coerceAtLeast(0.01f))
         a *= 1f - b[BP.PRESSURE_OPACITY] * (1f - p)
         a *= 1f - b[BP.PRESSURE_FLOW] * (1f - p)
         a *= 1f - b[BP.TILT_OPACITY] * tiltT
-        a *= 1f - b[BP.SPEED_OPACITY] * speedNorm
-        a *= 1f - b[BP.TAPER_OPACITY] * (1f - tf)
+        a *= 1f - 0.6f * b[BP.TILT_GRADATION] * tiltT
+        a *= signedSpeed(b[BP.SPEED_OPACITY], speedNorm).coerceAtLeast(0f)
+        a *= 1f - taperOpAmt * (1f - tf)
         if (b[BP.FALLOFF] > 0f) a *= 1f - b[BP.FALLOFF] * min(1f, distAlong / 1500f)
         if (b[BP.CHARGE] < 0.999f) a *= exp(-distAlong / (b[BP.CHARGE] * 4000f + 60f))
-        a *= 1f - 0.85f * b[BP.DILUTION]
+        a *= 1f - 0.85f * m(BP.DILUTION, p, tiltT)
+        a *= m(BP.ATTACK, p, tiltT)
         if (heavy) a *= opacity
 
-        distToNext = max(0.3f, b[BP.SPACING] * d)
+        // Abstand (Streuung vergrößert nur – der Mindestabstand bleibt)
+        var sp = m(BP.SPACING, p, tiltT) * signedSpeed(-b[BP.SPEED_SPACING], speedNorm).coerceAtLeast(0.1f)
+        val sj = m(BP.SPACING_JITTER, p, tiltT)
+        if (sj > 0f) sp *= 1f + 2f * sj * rand()
+        distToNext = max(0.3f, sp * d)
         headDiameter = d
 
-        // Farbe
+        // Farbe: Druck/Neigung → Farbton/Sättigung/Helligkeit/Sekundärfarbe
         var col = strokeColor
+        val ph = b[BP.PRESSURE_HUE] * (1f - p) + b[BP.TILT_HUE] * tiltT
+        val psat = b[BP.PRESSURE_SAT] * (1f - p) + b[BP.TILT_SAT] * tiltT
+        val pb = b[BP.PRESSURE_BRIGHT] * (1f - p) + b[BP.TILT_BRIGHT] * tiltT
+        if (ph > 0f || psat > 0f || pb > 0f) {
+            Color.colorToHSV(col, hsv)
+            hsv[0] = (hsv[0] + ph * 180f) % 360f
+            hsv[1] = (hsv[1] * (1f - psat)).coerceIn(0f, 1f)
+            hsv[2] = (hsv[2] * (1f - pb)).coerceIn(0f, 1f)
+            col = Color.HSVToColor(hsv)
+        }
         val cp = b[BP.COLOR_PRESSURE] * (1f - p) + b[BP.COLOR_TILT] * tiltT
-        if (cp > 0f) col = mix(col, secondaryColor, cp.coerceIn(0f, 1f))
+        if (cp > 0f) col = mixC(col, secondaryColor, cp.coerceIn(0f, 1f))
         val smp = sampler
         if (pullEff > 0f && smp != null) {
             val s = smp.sample(x, y)
@@ -475,28 +535,51 @@ class StrokeRenderer {
             carG += (Color.green(col) - carG) * re
             carB += (Color.blue(col) - carB) * re
             val carried = Color.rgb(carR.toInt().coerceIn(0, 255), carG.toInt().coerceIn(0, 255), carB.toInt().coerceIn(0, 255))
-            col = mix(col, carried, pullEff)
+            col = mixC(col, carried, pullEff)
         }
+
+        // Körnungstiefe (Minimum über Druck, Streuung, Ausbluten, Körnigkeit)
+        val hasGrain = b.grainImage != null || b.int(BP.GRAIN_KIND) > 0
+        val depthBase = if (hasGrain) m(BP.GRAIN_DEPTH, p, tiltT) else 0f
+        val depthMin = b[BP.GRAIN_DEPTH_MIN]
+        val depthJ = b[BP.GRAIN_DEPTH_JITTER]
+        val bleed = b[BP.PRESSURE_BLEED] * (1f - p) + b[BP.TILT_BLEED] * tiltT + b[BP.GRADE] * 0.5f
+        val customDepth = hasGrain && (depthMin < 0.999f || depthJ > 0f || bleed > 0f ||
+            b.pressureCoupling(BP.GRAIN_DEPTH) != 0f || b.tiltCoupling(BP.GRAIN_DEPTH) != 0f)
+
+        // Unschärfe der Form
+        val blurAmt = m(BP.WET_BLUR, p, tiltT)
+        val blurJ = b[BP.WET_BLUR_JITTER]
 
         // Stempel
         val baseCount = b.int(BP.COUNT).coerceAtLeast(1)
         val count = baseCount + (rand() * b[BP.COUNT_JITTER] * baseCount).toInt()
-        val jitter = b[BP.JITTER]
+        val jitter = m(BP.JITTER, p, tiltT)
+        val jitterLong = m(BP.JITTER_LONG, p, tiltT)
         val rotMode = b.int(BP.ROTATION_MODE)
-        val baseRot = Math.toRadians(b[BP.ROTATION].toDouble()).toFloat()
-        val scatter = b[BP.SCATTER]
+        val baseRot = Math.toRadians(m(BP.ROTATION, p, tiltT).toDouble()).toFloat() + strokeRotOffset -
+            (if (b.on(BP.ORIENT_SCREEN)) viewRotation else 0f)
+        val scatter = m(BP.SCATTER, p, tiltT)
         val tiltRound = b[BP.TILT_ROUNDNESS]
-        val aspect = (b[BP.ROUNDNESS] * (1f - tiltRound * tiltT * 0.7f)).coerceIn(0.03f, 1f)
+        val roundBase = m(BP.ROUNDNESS, p, tiltT) * (1f - b[BP.ROUNDNESS_PRESSURE] * (1f - p))
+        val aspect0 = (roundBase * (1f - tiltRound * tiltT * 0.7f)).coerceIn(0.03f, 1f)
+        val roundJ = b[BP.ROUNDNESS_JITTER]
         // Schraffieren mit geneigtem Stift: Bei runden Spitzen mit "Neigung → Rundheit" liegt die lange Achse der
         // abgeflachten Spitze entlang der Stiftausrichtung (wie die Mine eines flach gehaltenen Bleistifts).
         val tiltOriented = tiltRound > 0f && tiltT > 0f && b[BP.ROUNDNESS] > 0.95f && rotMode == RotationMode.FIXED
-        val hj = b[BP.HUE_JITTER]; val sj = b[BP.SAT_JITTER]; val bj = b[BP.BRIGHT_JITTER]
+        val hj = m(BP.HUE_JITTER, p, tiltT); val sjc = m(BP.SAT_JITTER, p, tiltT); val bj = m(BP.BRIGHT_JITTER, p, tiltT)
+        val dj0 = m(BP.DARK_JITTER, p, tiltT); val secj = m(BP.SECONDARY_JITTER, p, tiltT)
+        val sizeJ = m(BP.SIZE_JITTER, p, tiltT); val opJ = m(BP.OPACITY_JITTER, p, tiltT)
+        val cosD = kotlin.math.cos(dir); val sinD = kotlin.math.sin(dir)
         for (k in 0 until count) {
             var sx = x; var sy = y
             if (jitter > 0f) {
-                val r = jitter * d * sqrt(rand())
-                val an = rand() * 2f * PI.toFloat()
-                sx += kotlin.math.cos(an) * r; sy += kotlin.math.sin(an) * r
+                val off = (rand() - 0.5f) * 2f * jitter * d
+                sx += -sinD * off; sy += cosD * off
+            }
+            if (jitterLong > 0f) {
+                val off = (rand() - 0.5f) * 2f * jitterLong * d
+                sx += cosD * off; sy += sinD * off
             }
             var ang = when (rotMode) {
                 RotationMode.FOLLOW -> dir + baseRot
@@ -505,23 +588,34 @@ class StrokeRenderer {
                 else -> if (tiltOriented) orient + baseRot else baseRot
             }
             if (scatter > 0f) ang += (rand() - 0.5f) * 2f * PI.toFloat() * scatter
-            val dj = d * (1f - b[BP.SIZE_JITTER] * rand())
-            val aj = a * (1f - b[BP.OPACITY_JITTER] * rand())
-            var flags = 0
-            if (b.on(BP.FLIP_X) && rand() < 0.5f) flags = flags or 1
-            if (b.on(BP.FLIP_Y) && rand() < 0.5f) flags = flags or 2
+            val dj = d * (1f - sizeJ * rand())
+            val aj = a * (1f - opJ * rand())
+            val asp = if (roundJ > 0f) (aspect0 * (1f - roundJ * rand())).coerceIn(0.03f, 1f) else aspect0
+            val depth = if (customDepth) {
+                (depthBase * (depthMin + (1f - depthMin) * p) * (1f - depthJ * rand()) + bleed).coerceIn(0f, 1f)
+            } else -1f
+            val blurLevel = if (blurAmt > 0f) ((blurAmt * (1f - blurJ * rand())) * 4f + 0.5f).toInt() else 0
+            val flags = DabPainter.encodeFlags(
+                b.on(BP.FLIP_X) && rand() < 0.5f, b.on(BP.FLIP_Y) && rand() < 0.5f, depth, blurLevel,
+            )
             var c = col
-            if (hj > 0f || sj > 0f || bj > 0f) {
+            if (hj > 0f || sjc > 0f || bj > 0f || dj0 > 0f) {
                 Color.colorToHSV(c, hsv)
                 hsv[0] = (hsv[0] + (rand() - 0.5f) * 2f * hj * 180f + 360f) % 360f
-                hsv[1] = (hsv[1] + (rand() - 0.5f) * 2f * sj).coerceIn(0f, 1f)
+                hsv[1] = (hsv[1] + (rand() - 0.5f) * 2f * sjc).coerceIn(0f, 1f)
                 hsv[2] = (hsv[2] + (rand() - 0.5f) * 2f * bj).coerceIn(0f, 1f)
+                hsv[2] = hsv[2] * (1f - dj0 * rand())
                 c = Color.HSVToColor(hsv)
             }
-            dabs.add(sx, sy, max(dj, 0.3f), aspect, ang, aj, c, flags, distAlong)
-            sink?.dab(sx, sy, max(dj, 0.3f), aspect, ang, aj, c, flags)
+            if (secj > 0f) c = mixC(c, secondaryColor, secj * rand())
+            dabs.add(sx, sy, max(dj, 0.3f), asp, ang, aj, c, flags, distAlong)
+            sink?.dab(sx, sy, max(dj, 0.3f), asp, ang, aj, c, flags)
         }
     }
+
+    /** Tempo-Dynamik: positiv = schneller verringert, negativ = langsamer verringert. */
+    private fun signedSpeed(amount: Float, speedNorm: Float): Float =
+        if (amount >= 0f) 1f - amount * speedNorm else 1f + amount * (1f - speedNorm)
 
     private fun rand(): Float {
         var x = rng
@@ -552,6 +646,19 @@ class StrokeRenderer {
             while (r > PI) r -= TWO_PI
             while (r < -PI) r += TWO_PI
             return r
+        }
+
+        /** Lichtrichtiges Mischen in linearem RGB (Luminanz-Mischen). */
+        fun mixLinear(a: Int, b: Int, t: Float): Int {
+            fun lin(c: Int) = (c / 255f).let { it * it }
+            fun srgb(v: Float) = (kotlin.math.sqrt(v.coerceIn(0f, 1f)) * 255f + 0.5f).toInt()
+            val u = 1f - t
+            return Color.argb(
+                255,
+                srgb(lin(Color.red(a)) * u + lin(Color.red(b)) * t),
+                srgb(lin(Color.green(a)) * u + lin(Color.green(b)) * t),
+                srgb(lin(Color.blue(a)) * u + lin(Color.blue(b)) * t),
+            )
         }
 
         fun mix(a: Int, b: Int, t: Float): Int {

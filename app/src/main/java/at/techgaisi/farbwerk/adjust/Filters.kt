@@ -41,6 +41,8 @@ class FilterInput(
     val curveLuts: Array<IntArray>?,
     val gradientLut: IntArray?,
     val token: CancelToken,
+    /** Umfärben: neue Farbe (ARGB). */
+    val recolorColor: Int = 0,
 )
 
 /**
@@ -57,8 +59,10 @@ object Filters {
         AdjustmentKind.CURVES -> curves?.isIdentity ?: true
         AdjustmentKind.GRADIENT_MAP -> v[0] <= 0f
         AdjustmentKind.GAUSSIAN_BLUR, AdjustmentKind.MOTION_BLUR, AdjustmentKind.NOISE,
-        AdjustmentKind.SHARPEN, AdjustmentKind.BLOOM, AdjustmentKind.CHROMATIC -> v[0] <= 0f
-        AdjustmentKind.PERSPECTIVE_BLUR, AdjustmentKind.GLITCH, AdjustmentKind.HALFTONE -> v[1] <= 0f
+        AdjustmentKind.SHARPEN, AdjustmentKind.BLOOM -> v[0] <= 0f
+        AdjustmentKind.PERSPECTIVE_BLUR, AdjustmentKind.GLITCH, AdjustmentKind.HALFTONE,
+        AdjustmentKind.CHROMATIC -> v[1] <= 0f
+        AdjustmentKind.RECOLOR -> false
         AdjustmentKind.LIQUIFY, AdjustmentKind.CLONE -> false
     }
 
@@ -92,6 +96,7 @@ object Filters {
             AdjustmentKind.GLITCH -> glitch(src, w, h, inp)
             AdjustmentKind.HALFTONE -> halftone(src, w, h, inp)
             AdjustmentKind.CHROMATIC -> chromatic(src, w, h, inp)
+            AdjustmentKind.RECOLOR -> recolor(src, w, h, inp)
             AdjustmentKind.LIQUIFY, AdjustmentKind.CLONE -> src.copyOf()
         }
     }
@@ -390,12 +395,19 @@ object Filters {
 
     // ================================================================= Effekte
 
+    /**
+     * Rauschen. Kanäle *Einfach* = Graustufen-Rauschen, *Mehrfach* = je Farbkanal eigenes Rauschen.
+     * *Additiv* aus: das Bild wird zum Rauschmuster hin gemischt; an: das Rauschen wird transparent
+     * aufaddiert (Farben bleiben erhalten, nur hellere/dunklere Körnung).
+     */
     private fun noise(src: IntArray, w: Int, h: Int, inp: FilterInput): IntArray {
         val amount = inp.v[0] / 100f
         val type = inp.v[1].roundToInt()
         val sizePx = 2f + inp.v[2] / 100f * inp.fullMax * 0.12f
         val octaves = inp.v[3].roundToInt().coerceIn(1, 6)
         val turb = inp.v[4] / 100f
+        val multi = inp.v.getOrElse(5) { 0f } >= 0.5f
+        val additive = inp.v.getOrElse(6) { 0f } >= 0.5f
         val out = IntArray(src.size)
         val inv = 1f / (sizePx * inp.scale)
         val k = amount * 255f
@@ -406,20 +418,33 @@ object Filters {
                 val p = src[i]
                 val a = p ushr 24
                 if (a == 0) continue
-                var n = fbm(x * inv, y * inv, octaves, turb)
-                n = when (type) {
-                    1 -> abs(2f * n - 1f)
-                    2 -> 1f - abs(2f * n - 1f)
-                    else -> n
+                val fx = x * inv
+                val fy = y * inv
+                val nr = shapeNoise(fbm(fx, fy, octaves, turb), type)
+                val ng = if (multi) shapeNoise(fbm(fx + 37.3f, fy + 11.7f, octaves, turb), type) else nr
+                val nb = if (multi) shapeNoise(fbm(fx + 71.9f, fy + 53.1f, octaves, turb), type) else nr
+                val r0 = (p shr 16) and 0xFF; val g0 = (p shr 8) and 0xFF; val b0 = p and 0xFF
+                val r: Int; val g: Int; val b: Int
+                if (additive) {
+                    r = (r0 + ((nr - 0.5f) * 2f * k).toInt()).coerceIn(0, 255)
+                    g = (g0 + ((ng - 0.5f) * 2f * k).toInt()).coerceIn(0, 255)
+                    b = (b0 + ((nb - 0.5f) * 2f * k).toInt()).coerceIn(0, 255)
+                } else {
+                    r = (r0 + (nr * 255f - r0) * amount).toInt().coerceIn(0, 255)
+                    g = (g0 + (ng * 255f - g0) * amount).toInt().coerceIn(0, 255)
+                    b = (b0 + (nb * 255f - b0) * amount).toInt().coerceIn(0, 255)
                 }
-                val d = ((n - 0.5f) * 2f * k).toInt()
-                val r = (((p shr 16) and 0xFF) + d).coerceIn(0, 255)
-                val g = (((p shr 8) and 0xFF) + d).coerceIn(0, 255)
-                val b = ((p and 0xFF) + d).coerceIn(0, 255)
                 out[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
         return out
+    }
+
+    /** Art des Rauschens: 0 Wolken (weich), 1 Wogen (Täler), 2 Kämme (Grate). */
+    private fun shapeNoise(n: Float, type: Int): Float = when (type) {
+        1 -> abs(2f * n - 1f)
+        2 -> 1f - abs(2f * n - 1f)
+        else -> n
     }
 
     private fun fbm(x: Float, y: Float, octaves: Int, turb: Float): Float {
@@ -519,16 +544,23 @@ object Filters {
         return unpremul(out)
     }
 
+    /**
+     * Glitch. Ziehen = Gesamtstärke ([FilterInput.v] 1); je Modus eigene Regler (siehe AdjustmentKind):
+     * Artefakt 2..4, Welle 5..7, Signal 8..10, Divergieren 11..14 (jeweils zuletzt Zoom).
+     */
     private fun glitch(src: IntArray, w: Int, h: Int, inp: FilterInput): IntArray {
-        val type = inp.v[0].roundToInt()
-        val amount = inp.v[1] / 100f
-        val size = 0.05f + inp.v[2] / 100f
-        val rnd = Random(1234L + inp.v[3].roundToInt() * 7919L)
-        val sc = inp.fullMax * inp.scale
+        val v = inp.v
+        val type = v[0].roundToInt()
+        val amount = v[1] / 100f
+        val rnd = Random(1234L)
+        val base = inp.fullMax * inp.scale
         val out = src.copyOf()
         when (type) {
             0 -> { // Artefakt: verschobene Blöcke mit Kanaltausch
-                val blocks = (amount * 80).toInt() + 1
+                val menge = v[2] / 100f
+                val size = 0.05f + v[3] / 100f
+                val sc = base * (1f + v[4] / 100f * 3f)
+                val blocks = (amount * menge * 160).toInt() + 1
                 val bs = max(2f, size * 0.12f * sc)
                 for (n in 0 until blocks) {
                     inp.token.check()
@@ -549,9 +581,13 @@ object Filters {
                     }
                 }
             }
-            1 -> { // Welle
-                val amp = amount * 0.04f * sc
-                val period = max(4f, (0.02f + size * 0.25f) * sc)
+            1 -> { // Welle: Amplitude und Frequenz müssen beide > 0 sein
+                val ampl = v[5] / 100f
+                val freq = v[6] / 100f
+                if (ampl <= 0f || freq <= 0f) return out
+                val sc = base * (1f + v[7] / 100f * 3f)
+                val amp = amount * ampl * 0.06f * sc
+                val period = max(4f, (0.3f - freq * 0.28f) * sc)
                 val phase = rnd.nextFloat() * 6.283f
                 for (y in 0 until h) {
                     if (y and 31 == 0) inp.token.check()
@@ -560,19 +596,22 @@ object Filters {
                 }
             }
             2 -> { // Signal: Störstreifen + RGB-Versatz
+                val menge = v[8] / 100f
+                val size = 0.05f + v[9] / 100f
+                val sc = base * (1f + v[10] / 100f * 3f)
                 val split = (amount * 0.012f * sc).roundToInt()
                 var y = 0
                 while (y < h) {
                     inp.token.check()
                     val band = max(1, (rnd.nextFloat() * size * 0.05f * sc).toInt())
-                    val shift = if (rnd.nextFloat() < amount * 0.6f) ((rnd.nextFloat() - 0.5f) * amount * 0.15f * sc).toInt() else 0
+                    val shift = if (rnd.nextFloat() < amount * menge * 1.2f) ((rnd.nextFloat() - 0.5f) * amount * 0.15f * sc).toInt() else 0
                     for (yy in y until min(h, y + band)) {
                         val row = yy * w
                         for (x in 0 until w) {
-                            val base = (x - shift).coerceIn(0, w - 1)
-                            val pr = src[row + (base - split).coerceIn(0, w - 1)]
-                            val pg = src[row + base]
-                            val pb = src[row + (base + split).coerceIn(0, w - 1)]
+                            val bx = (x - shift).coerceIn(0, w - 1)
+                            val pr = src[row + (bx - split).coerceIn(0, w - 1)]
+                            val pg = src[row + bx]
+                            val pb = src[row + (bx + split).coerceIn(0, w - 1)]
                             val a = max(pg ushr 24, max(pr ushr 24, pb ushr 24))
                             out[row + x] = (a shl 24) or (pr and 0xFF0000) or (pg and 0xFF00) or (pb and 0xFF)
                         }
@@ -580,15 +619,19 @@ object Filters {
                     y += band
                 }
             }
-            else -> { // Divergieren: Farbkanäle auseinanderziehen
-                val off = (amount * 0.025f * sc).roundToInt()
-                val offY = (amount * size * 0.01f * sc).roundToInt()
+            else -> { // Divergieren: Farbkanäle einzeln verschieben
+                val sc = base * (1f + v[14] / 100f * 3f)
+                val k = amount * 0.03f * sc
+                val oR = (v[11] / 100f * k).roundToInt()
+                val oG = (v[12] / 100f * k).roundToInt()
+                val oB = (v[13] / 100f * k).roundToInt()
+                val oy = (amount * v[14] / 100f * 0.004f * sc).roundToInt()
                 for (y in 0 until h) {
                     if (y and 31 == 0) inp.token.check()
                     for (x in 0 until w) {
-                        val pr = src[(y - offY).coerceIn(0, h - 1) * w + (x - off).coerceIn(0, w - 1)]
-                        val pg = src[y * w + x]
-                        val pb = src[(y + offY).coerceIn(0, h - 1) * w + (x + off).coerceIn(0, w - 1)]
+                        val pr = src[(y - oy).coerceIn(0, h - 1) * w + (x - oR).coerceIn(0, w - 1)]
+                        val pg = src[y * w + (x - oG).coerceIn(0, w - 1)]
+                        val pb = src[(y + oy).coerceIn(0, h - 1) * w + (x - oB).coerceIn(0, w - 1)]
                         val a = max(pg ushr 24, max(pr ushr 24, pb ushr 24))
                         out[y * w + x] = (a shl 24) or (pr and 0xFF0000) or (pg and 0xFF00) or (pb and 0xFF)
                     }
@@ -598,13 +641,17 @@ object Filters {
         return out
     }
 
+    /**
+     * Halbton. Modi: 0 Vollfarbe (CMY-Raster auf Weiß), 1 Siebdruck (Punkte in der Zellfarbe, dazwischen
+     * transparent – der Untergrund scheint durch), 2 Zeitung (schwarzes Raster auf Weiß).
+     */
     private fun halftone(src: IntArray, w: Int, h: Int, inp: FilterInput): IntArray {
         val amount = inp.v[1] / 100f
+        val mode = inp.v[0].roundToInt().coerceIn(0, 2)
         val cell = max(2f, (0.003f + amount * 0.035f) * inp.fullMax * inp.scale)
-        val color = inp.v[0] < 0.5f
         val bmp = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
         val c = Canvas(bmp)
-        c.drawColor(Color.WHITE)
+        if (mode != 1) c.drawColor(Color.WHITE)
         val paint = Paint(Paint.ANTI_ALIAS_FLAG)
         val cols = (w / cell).toInt() + 2
         val rows = (h / cell).toInt() + 2
@@ -612,6 +659,7 @@ object Filters {
         val avgR = FloatArray(cols * rows); val avgG = FloatArray(cols * rows); val avgB = FloatArray(cols * rows)
         val cnt = FloatArray(cols * rows)
         for (y in 0 until h) {
+            if (y and 63 == 0) inp.token.check()
             val cy = (y / cell).toInt()
             for (x in 0 until w) {
                 val p = src[y * w + x]
@@ -623,8 +671,11 @@ object Filters {
             }
         }
         inp.token.check()
-        if (color) paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.MULTIPLY)
-        val inks = if (color) intArrayOf(0xFF00AEEF.toInt(), 0xFFEC008C.toInt(), 0xFFFFF200.toInt()) else intArrayOf(Color.BLACK)
+        if (mode == 0) paint.xfermode = PorterDuffXfermode(PorterDuff.Mode.MULTIPLY)
+        val inks = when (mode) {
+            0 -> intArrayOf(0xFF00AEEF.toInt(), 0xFFEC008C.toInt(), 0xFFFFF200.toInt())
+            else -> intArrayOf(Color.BLACK)
+        }
         val offsets = floatArrayOf(0f, 0.33f, 0.66f)
         for ((k, ink) in inks.withIndex()) {
             paint.color = ink
@@ -633,7 +684,17 @@ object Filters {
                 val ci = cy * cols + cx
                 if (cnt[ci] <= 0f) continue
                 val r = avgR[ci] / cnt[ci] / 255f; val g = avgG[ci] / cnt[ci] / 255f; val b = avgB[ci] / cnt[ci] / 255f
-                val ink01 = if (!color) 1f - (0.299f * r + 0.587f * g + 0.114f * b) else when (k) { 0 -> 1f - r; 1 -> 1f - g; else -> 1f - b }
+                val lum = 0.299f * r + 0.587f * g + 0.114f * b
+                val ink01 = when (mode) {
+                    0 -> when (k) { 0 -> 1f - r; 1 -> 1f - g; else -> 1f - b }
+                    1 -> {
+                        // Siebdruck: Punkt in der Zellfarbe, helle Flächen kleine Punkte
+                        val sat = max(r, max(g, b)) - min(r, min(g, b))
+                        paint.color = Color.rgb((r * 255).toInt(), (g * 255).toInt(), (b * 255).toInt())
+                        max(1f - lum, sat * 0.85f)
+                    }
+                    else -> 1f - lum
+                }
                 if (ink01 <= 0.01f) continue
                 val rad = cell * 0.72f * sqrt(ink01)
                 c.drawCircle(cx * cell + cell / 2f + o, cy * cell + cell / 2f + o, rad, paint)
@@ -644,31 +705,146 @@ object Filters {
         bmp.recycle()
         for (i in out.indices) {
             val a = src[i] ushr 24
-            out[i] = if (a == 0) 0 else (a shl 24) or (out[i] and 0xFFFFFF)
+            out[i] = when {
+                a == 0 -> 0
+                mode == 1 -> {
+                    val da = out[i] ushr 24
+                    if (da == 0) 0 else ((a * da / 255) shl 24) or (out[i] and 0xFFFFFF)
+                }
+                else -> (a shl 24) or (out[i] and 0xFFFFFF)
+            }
         }
         return out
     }
 
+    /**
+     * Chromatische Aberration.
+     * *Perspektive*: Rot/Blau radial vom Brennpunkt ([FilterInput.cx]/cy) versetzt; Übergang = ab welchem
+     * Abstand, Abfall = wie schnell der Effekt nach außen zunimmt.
+     * *Verschieben*: Rot/Blau gegenläufig in Richtung [AdjustmentKind.CHROMATIC_ANGLE] versetzt;
+     * Unschärfe weicht die Farbsäume auf, Transparenz blendet sie ab.
+     */
     private fun chromatic(src: IntArray, w: Int, h: Int, inp: FilterInput): IntArray {
-        val k = inp.v[0] / 100f * 0.05f
-        val start = inp.v[1] / 100f * 0.8f
-        val cx = inp.cx * w
-        val cy = inp.cy * h
-        val maxD = hypot(max(cx, w - cx), max(cy, h - cy)).coerceAtLeast(1f)
+        val v = inp.v
+        val strength = v[1] / 100f
         val out = IntArray(src.size)
+        if (v[0] < 0.5f) {
+            val k = strength * 0.05f
+            val start = v[2] / 100f * 0.8f
+            val expo = 0.4f + v[3] / 100f * 2.6f
+            val cx = inp.cx * w
+            val cy = inp.cy * h
+            val maxD = hypot(max(cx, w - cx), max(cy, h - cy)).coerceAtLeast(1f)
+            for (y in 0 until h) {
+                if (y and 31 == 0) inp.token.check()
+                for (x in 0 until w) {
+                    val dx = x - cx
+                    val dy = y - cy
+                    var f = ((hypot(dx, dy) / maxD - start) / (1f - start + 1e-4f)).coerceIn(0f, 1f)
+                    if (f > 0f) f = f.pow(expo)
+                    val s = k * f
+                    val pr = sample(src, w, h, cx + dx * (1f - s), cy + dy * (1f - s))
+                    val pg = src[y * w + x]
+                    val pb = sample(src, w, h, cx + dx * (1f + s), cy + dy * (1f + s))
+                    val a = max(pg ushr 24, max(pr ushr 24, pb ushr 24))
+                    if (a == 0) continue
+                    out[y * w + x] = (a shl 24) or (pr and 0xFF0000) or (pg and 0xFF00) or (pb and 0xFF)
+                }
+            }
+            return out
+        }
+        // Verschieben
+        val dist = strength * strength * inp.fullMax * 0.04f * inp.scale
+        val ang = Math.toRadians(v[AdjustmentKind.CHROMATIC_ANGLE].toDouble())
+        val ox = (cos(ang) * dist).toFloat()
+        val oy = (sin(ang) * dist).toFloat()
+        val sigma = v[4] / 100f * inp.fullMax * 0.012f * inp.scale
+        val fringe = if (sigma >= 0.3f) unpremul(gaussian(premul(src), w, h, sigma, inp.token)) else src
+        val keep = v[5] / 100f
         for (y in 0 until h) {
             if (y and 31 == 0) inp.token.check()
             for (x in 0 until w) {
-                val dx = x - cx
-                val dy = y - cy
-                val f = ((hypot(dx, dy) / maxD - start) / (1f - start + 1e-4f)).coerceIn(0f, 1f)
-                val s = k * f
-                val pr = sample(src, w, h, cx + dx * (1f - s), cy + dy * (1f - s))
-                val pg = src[y * w + x]
-                val pb = sample(src, w, h, cx + dx * (1f + s), cy + dy * (1f + s))
-                val a = max(pg ushr 24, max(pr ushr 24, pb ushr 24))
+                val i = y * w + x
+                val p = src[i]
+                var pr = sample(fringe, w, h, x + 0.5f - ox, y + 0.5f - oy)
+                var pb = sample(fringe, w, h, x + 0.5f + ox, y + 0.5f + oy)
+                if (keep > 0f) { pr = lerpPacked(pr, p, keep); pb = lerpPacked(pb, p, keep) }
+                val a = max(p ushr 24, max(pr ushr 24, pb ushr 24))
                 if (a == 0) continue
-                out[y * w + x] = (a shl 24) or (pr and 0xFF0000) or (pg and 0xFF00) or (pb and 0xFF)
+                out[i] = (a shl 24) or (pr and 0xFF0000) or (p and 0xFF00) or (pb and 0xFF)
+            }
+        }
+        return out
+    }
+
+    /**
+     * Umfärben: Pixel, die der Farbe unter dem Fadenkreuz ([FilterInput.cx]/cy) ähneln, erhalten die neue
+     * Farbe [FilterInput.recolorColor] – Schattierung bleibt erhalten (Farbdifferenz wird verschoben).
+     * Füllen = Toleranz, Weichheit = weicher Übergang, Ausbreitung Zusammenhängend (Flutfüllung) / Global.
+     */
+    private fun recolor(src: IntArray, w: Int, h: Int, inp: FilterInput): IntArray {
+        val v = inp.v
+        val out = src.copyOf()
+        val sx = (inp.cx * w).toInt().coerceIn(0, w - 1)
+        val sy = (inp.cy * h).toInt().coerceIn(0, h - 1)
+        val target = src[sy * w + sx]
+        if (target ushr 24 == 0) return out
+        val tol = 0.02f + v[0] / 100f * 0.6f
+        val soft = v[1] / 100f
+        val inner = tol * (1f - soft)
+        val global = v[2] >= 0.5f
+        val tr = (target shr 16) and 0xFF; val tg = (target shr 8) and 0xFF; val tb = target and 0xFF
+        val nc = inp.recolorColor
+        val dr = ((nc shr 16) and 0xFF) - tr
+        val dg = ((nc shr 8) and 0xFF) - tg
+        val db = (nc and 0xFF) - tb
+        fun dist(p: Int): Float {
+            val r = (p shr 16) and 0xFF; val g = (p shr 8) and 0xFF; val b = p and 0xFF
+            return max(abs(r - tr), max(abs(g - tg), abs(b - tb))) / 255f
+        }
+        fun paint(i: Int) {
+            val p = src[i]
+            val a = p ushr 24
+            if (a == 0) return
+            val d = dist(p)
+            if (d >= tol) return
+            val wgt = if (d <= inner) 1f else 1f - smooth(inner, tol, d)
+            val r = (((p shr 16) and 0xFF) + dr * wgt).toInt().coerceIn(0, 255)
+            val g = (((p shr 8) and 0xFF) + dg * wgt).toInt().coerceIn(0, 255)
+            val b = ((p and 0xFF) + db * wgt).toInt().coerceIn(0, 255)
+            out[i] = (a shl 24) or (r shl 16) or (g shl 8) or b
+        }
+        if (global) {
+            for (i in src.indices) {
+                if (i and 0xFFFF == 0) inp.token.check()
+                paint(i)
+            }
+            return out
+        }
+        // Zusammenhängend: Flutfüllung (4er-Nachbarschaft) über alle Pixel innerhalb der Toleranz
+        val seen = BooleanArray(src.size)
+        var stack = IntArray(4096)
+        var sp = 0
+        stack[sp++] = sy * w + sx
+        seen[sy * w + sx] = true
+        var count = 0
+        while (sp > 0) {
+            val i = stack[--sp]
+            if (++count and 0xFFFF == 0) inp.token.check()
+            paint(i)
+            val x = i % w
+            val y = i / w
+            for (dir in 0 until 4) {
+                val nx = when (dir) { 0 -> x - 1; 1 -> x + 1; else -> x }
+                val ny = when (dir) { 2 -> y - 1; 3 -> y + 1; else -> y }
+                if (nx < 0 || ny < 0 || nx >= w || ny >= h) continue
+                val j = ny * w + nx
+                if (seen[j]) continue
+                seen[j] = true
+                val q = src[j]
+                if (q ushr 24 == 0 || dist(q) >= tol) continue
+                if (sp == stack.size) stack = stack.copyOf(stack.size * 2)
+                stack[sp++] = j
             }
         }
         return out

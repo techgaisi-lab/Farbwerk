@@ -87,6 +87,9 @@ internal object ProjectFormat {
             lo.put("locked", l.locked)
             lo.put("isReference", l.isReference)
             l.groupId?.let { lo.put("groupId", it) }
+            if (l.assisted) lo.put("assisted", true)
+            if (l.isPrivate) lo.put("private", true)
+            (l.text as? at.techgaisi.farbwerk.text.TextData)?.let { lo.put("text", it.toJson()) }
             l.mask?.let { m ->
                 lo.put("mask", "masks/$i.png")
                 lo.put("maskConfig", if (m.config == Bitmap.Config.ALPHA_8) "ALPHA_8" else "ARGB_8888")
@@ -96,6 +99,7 @@ internal object ProjectFormat {
         o.put("layers", arr)
         // Gruppen-Metadaten (Name, Sichtbarkeit, Deckkraft, eingeklappt) vom Ebenen-Modul
         o.put("groups", LayerGroups.toJson(doc))
+        (doc.animation as? at.techgaisi.farbwerk.animation.AnimationSettings)?.let { o.put("animation", it.toJson()) }
         return o
     }
 
@@ -112,6 +116,13 @@ internal object ProjectFormat {
         put("rotational", g.rotationalSymmetry)
         put("radialSegments", g.radialSegments)
         put("assisted", g.assisted)
+        put("thickness", g.thickness.toDouble())
+        put("offsetX", g.offsetX.toDouble())
+        put("offsetY", g.offsetY.toDouble())
+        put("rotation", g.rotation.toDouble())
+        put("vanishingPoints", JSONArray().apply {
+            g.vanishingPoints.forEach { put(JSONArray().put(it.x.toDouble()).put(it.y.toDouble())) }
+        })
     }
 
     private fun guidesFromJson(o: JSONObject?, g: GuideSettings) {
@@ -127,6 +138,17 @@ internal object ProjectFormat {
         g.rotationalSymmetry = o.optBoolean("rotational", false)
         g.radialSegments = o.optInt("radialSegments", 8).coerceIn(2, 32)
         g.assisted = o.optBoolean("assisted", false)
+        g.thickness = o.optDouble("thickness", 1.0).toFloat().coerceIn(0.25f, 8f)
+        g.offsetX = o.optDouble("offsetX", 0.0).toFloat()
+        g.offsetY = o.optDouble("offsetY", 0.0).toFloat()
+        g.rotation = o.optDouble("rotation", 0.0).toFloat()
+        g.vanishingPoints.clear()
+        o.optJSONArray("vanishingPoints")?.let { arr ->
+            for (i in 0 until minOf(arr.length(), 3)) {
+                val p = arr.optJSONArray(i) ?: continue
+                g.vanishingPoints.add(android.graphics.PointF(p.optDouble(0).toFloat(), p.optDouble(1).toFloat()))
+            }
+        }
     }
 
     inline fun <reified T : Enum<T>> enumOr(name: String?, def: T): T =
@@ -232,6 +254,12 @@ internal object ProjectFormat {
             layer.locked = lo.optBoolean("locked", false)
             layer.isReference = lo.optBoolean("isReference", false)
             layer.groupId = if (lo.has("groupId") && !lo.isNull("groupId")) lo.getString("groupId") else null
+            layer.assisted = lo.optBoolean("assisted", false)
+            layer.isPrivate = lo.optBoolean("private", false)
+            at.techgaisi.farbwerk.text.TextData.fromJson(lo.optJSONObject("text"))?.let {
+                it.renderedGeneration = layer.bitmap.generationId
+                layer.text = it
+            }
             if (lo.has("mask")) {
                 zip.getEntry(lo.getString("mask"))?.let { entry ->
                     val m = zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, opts) }
@@ -248,6 +276,7 @@ internal object ProjectFormat {
         }
         if (doc.layers.isEmpty()) doc.layers.add(Layer("Ebene 1", doc.newLayerBitmap()))
         o.optJSONArray("groups")?.let { LayerGroups.fromJson(doc, it) }
+        doc.animation = at.techgaisi.farbwerk.animation.AnimationSettings.fromJson(o.optJSONObject("animation"))
         doc.activeIndex = o.optInt("activeIndex", 0).coerceIn(0, doc.layers.lastIndex)
         doc.dirty = false
         doc

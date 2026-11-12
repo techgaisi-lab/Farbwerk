@@ -42,10 +42,16 @@ import at.techgaisi.farbwerk.model.GuideKind
 import at.techgaisi.farbwerk.model.Panel
 import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.selection.ClipboardOps
+import at.techgaisi.farbwerk.animation.AnimationController
+import at.techgaisi.farbwerk.animation.AssistMode
+import at.techgaisi.farbwerk.text.TextLayers
 import at.techgaisi.farbwerk.ui.common.PanelCard
 import at.techgaisi.farbwerk.ui.theme.LocalUi
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.launch
+import androidx.compose.foundation.gestures.draggable
+import androidx.compose.foundation.layout.offset
 import java.io.File
 
 /** Reiter des Aktionen-Panels. */
@@ -68,6 +74,8 @@ internal object ActionsMemory {
 fun ActionsPanel(state: EditorState, modifier: Modifier = Modifier) {
     @Suppress("UNUSED_VARIABLE") val rev = state.revision
     val ui = LocalUi.current
+    val act = androidx.compose.ui.platform.LocalContext.current
+    androidx.compose.runtime.LaunchedEffect(Unit) { OverlayHost.install(act.findActivity(), state) }
     PanelCard(modifier, title = "Aktionen") {
         // Reiterleiste
         Row(Modifier.fillMaxWidth().padding(horizontal = 6.dp), horizontalArrangement = Arrangement.SpaceBetween) {
@@ -116,36 +124,48 @@ private fun errorFlash(state: EditorState): (Throwable) -> Unit = { t ->
 @Composable
 private fun AddTab(state: EditorState) {
     val ctx = state.context
-    var showText by remember { mutableStateOf(false) }
     var cameraFile by remember { mutableStateOf<File?>(null) }
+    // „Privat einfügen“ (nach links wischen): gilt für den nächsten Import
+    var privateInsert by remember { mutableStateOf(false) }
 
     val fileLauncher = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
-        if (uri != null) { closePanel(state); Importers.insertFile(state, uri) }
+        if (uri != null) { closePanel(state); Importers.insertFile(state, uri, privateInsert) }
     }
     val photoLauncher = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri: Uri? ->
-        if (uri != null) insertPhoto(state, uri)
+        if (uri != null) insertPhoto(state, uri, privateInsert)
     }
     val cameraLauncher = rememberLauncherForActivityResult(ActivityResultContracts.TakePicture()) { ok ->
         val f = cameraFile
-        if (ok && f != null) insertPhoto(state, Exporters.uriFor(ctx, f))
+        if (ok && f != null) insertPhoto(state, Exporters.uriFor(ctx, f), privateInsert)
+    }
+    fun pickFile(priv: Boolean) {
+        privateInsert = priv
+        fileLauncher.launch(arrayOf("image/*", "image/vnd.adobe.photoshop", "application/x-photoshop",
+            "application/photoshop", "application/octet-stream"))
+    }
+    fun pickPhoto(priv: Boolean) {
+        privateInsert = priv
+        photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+    }
+    fun takePhoto(priv: Boolean) {
+        privateInsert = priv
+        val f = File(Exporters.exportDir(ctx), "kamera_${System.currentTimeMillis()}.jpg")
+        cameraFile = f
+        try { cameraLauncher.launch(Exporters.uriFor(ctx, f)) }
+        catch (_: Exception) { state.flash("Keine Kamera-App gefunden") }
     }
 
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         SectionHeader("Einfügen")
-        ActionRow("Datei einfügen", ActionIcons.Import) {
-            fileLauncher.launch(arrayOf("image/*", "image/vnd.adobe.photoshop", "application/x-photoshop",
-                "application/photoshop", "application/octet-stream"))
+        SwipePrivateRow("Datei einfügen", ActionIcons.Import, { pickFile(false) }) { pickFile(true) }
+        SwipePrivateRow("Foto einfügen", ActionIcons.Photo, { pickPhoto(false) }) { pickPhoto(true) }
+        SwipePrivateRow("Foto aufnehmen", ActionIcons.Photo, { takePhoto(false) }) { takePhoto(true) }
+        ActionRow("Text hinzufügen", ActionIcons.Add) { closePanel(state); TextLayers.create(state) }
+        val active = state.document?.activeLayer
+        if (TextLayers.isText(active)) {
+            ActionRow("Text bearbeiten", chevron = true) { closePanel(state); TextLayers.beginEdit(state, active!!) }
+            ActionRow("Text rastern") { TextLayers.rasterize(state, active) }
         }
-        ActionRow("Foto einfügen", ActionIcons.Photo) {
-            photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-        }
-        ActionRow("Foto aufnehmen", ActionIcons.Photo) {
-            val f = File(Exporters.exportDir(ctx), "kamera_${System.currentTimeMillis()}.jpg")
-            cameraFile = f
-            try { cameraLauncher.launch(Exporters.uriFor(ctx, f)) }
-            catch (_: Exception) { state.flash("Keine Kamera-App gefunden") }
-        }
-        ActionRow("Text hinzufügen", ActionIcons.Add) { showText = true }
         FwDivider()
         SectionHeader("Zwischenablage")
         val hasSel = state.document?.selection != null
@@ -154,18 +174,21 @@ private fun AddTab(state: EditorState) {
         ActionRow("Alles kopieren") { ClipboardOps.copyAll(state); closePanel(state) }
         ActionRow("Duplizieren") { ClipboardOps.duplicate(state); closePanel(state) }
         ActionRow("Ausschneiden & Einfügen", enabled = hasSel) { ClipboardOps.cutAndPaste(state); closePanel(state) }
-        ActionRow("Einfügen") { ClipboardOps.paste(state); closePanel(state) }
+        SwipePrivateRow("Einfügen", null, { ClipboardOps.paste(state); closePanel(state) }) {
+            ClipboardOps.paste(state)
+            state.document?.activeLayer?.isPrivate = true
+            state.flash("Privat eingefügt")
+            closePanel(state)
+        }
     }
-
-    if (showText) TextDialog(state, onDismiss = { showText = false })
 }
 
-private fun insertPhoto(state: EditorState, uri: Uri) {
+private fun insertPhoto(state: EditorState, uri: Uri, private: Boolean = false) {
     closePanel(state)
     Background.run("Foto wird eingefügt …", errorFlash(state)) {
         val doc = state.document ?: return@run
         val img = withContext(Dispatchers.IO) { Importers.decodeImage(state.context, uri, doc.width * 2, doc.height * 2) }
-        Importers.insertImageAsLayer(state, img, "Eingefügtes Bild")
+        Importers.insertImageAsLayer(state, img, "Eingefügtes Bild", private = private)
         img.recycle()
     }
 }
@@ -177,31 +200,44 @@ private fun insertPhoto(state: EditorState, uri: Uri) {
 @Composable
 private fun CanvasTab(state: EditorState) {
     val doc = state.document ?: return
-    var showResize by remember { mutableStateOf(false) }
-    var showGuides by remember { mutableStateOf(false) }
     var showInfo by remember { mutableStateOf(false) }
+    @Suppress("UNUSED_VARIABLE") val av = AnimationController.version
+    val g = doc.guides
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
         SectionHeader("Leinwand")
-        ActionRow("Zuschneiden & Größe ändern", ActionIcons.Canvas, trailing = "${doc.width} × ${doc.height}") { showResize = true }
-        ActionRow("Leinwandinformationen", ActionIcons.Help) { showInfo = true }
+        ActionRow("Zuschneiden & Größe ändern", ActionIcons.Canvas, trailing = "${doc.width} × ${doc.height}") { openCrop(state) }
+        SwitchRow("Animationsassistent", AnimationController.isOn(doc, AssistMode.ANIMATION)) {
+            AnimationController.toggle(state, AssistMode.ANIMATION); closePanel(state)
+        }
+        SwitchRow("Seitenassistent", AnimationController.isOn(doc, AssistMode.PAGES)) {
+            AnimationController.toggle(state, AssistMode.PAGES); closePanel(state)
+        }
         FwDivider()
         SectionHeader("Zeichenhilfe")
-        SwitchRow("Zeichenhilfe", doc.guides.visible && doc.guides.kind != GuideKind.NONE,
-            subtitle = guideSummary(doc.guides.kind)) { on ->
-            if (on && doc.guides.kind == GuideKind.NONE) doc.guides.kind = GuideKind.GRID_2D
-            doc.guides.visible = on
+        SwitchRow("Zeichenhilfe", g.visible && g.kind != GuideKind.NONE, subtitle = guideSummary(g.kind)) { on ->
+            if (on && g.kind == GuideKind.NONE) g.kind = GuideKind.GRID_2D
+            g.visible = on
+            state.markDirty(); state.invalidate()
+        }
+        ActionRow("Zeichenhilfe bearbeiten", chevron = true) { openGuideEditor(state) }
+        SwitchRow("Zeichenassistent", doc.activeLayer?.assisted == true, subtitle = "Für die aktive Ebene") { on ->
+            val layer = doc.activeLayer ?: return@SwitchRow
+            val prevG = g.assisted
+            layer.assisted = on; g.assisted = on
+            state.undo.push(at.techgaisi.farbwerk.undo.LambdaAction("Zeichenassistent",
+                onUndo = { layer.assisted = !on; g.assisted = prevG }, onRedo = { layer.assisted = on; g.assisted = on }))
+            state.flash(if (on) "Zeichenassistent an" else "Zeichenassistent aus")
             state.invalidate()
         }
-        ActionRow("Zeichenhilfe bearbeiten", chevron = true) { showGuides = true }
-        SwitchRow("Zeichenassistent", doc.guides.assisted, subtitle = "Striche an der Hilfe spiegeln",
-            enabled = doc.guides.kind == GuideKind.SYMMETRY) { on -> doc.guides.assisted = on; state.invalidate() }
         FwDivider()
-        SectionHeader("Spiegeln")
+        SectionHeader("Ansicht")
+        SwitchRow("Referenz", ActionModes.reference.visible, subtitle = "Schwebendes Referenzfenster") {
+            ActionModes.reference.visible = it; if (it) closePanel(state)
+        }
         ActionRow("Leinwand horizontal spiegeln") { CanvasOps.flipCanvas(state, horizontal = true) }
         ActionRow("Leinwand vertikal spiegeln") { CanvasOps.flipCanvas(state, horizontal = false) }
+        ActionRow("Leinwandinformationen", ActionIcons.Help, chevron = true) { showInfo = true }
     }
-    if (showResize) ResizeDialog(state) { showResize = false }
-    if (showGuides) GuidesDialog(state) { showGuides = false }
     if (showInfo) CanvasInfoDialog(state) { showInfo = false }
 }
 
@@ -227,8 +263,8 @@ private fun ShareTab(state: EditorState) {
         }
         FwDivider()
         SectionHeader("Ebenen teilen")
-        ActionRow(ExportFormat.LAYERS_PNG.label, trailing = ExportFormat.LAYERS_PNG.description) {
-            share(state, ExportFormat.LAYERS_PNG)
+        listOf(ExportFormat.PDF_PAGES, ExportFormat.LAYERS_PNG, ExportFormat.ANIM_GIF, ExportFormat.ANIM_MP4).forEach { f ->
+            ActionRow(f.label, trailing = f.description) { share(state, f) }
         }
     }
 }
@@ -296,5 +332,37 @@ private fun HelpLine(key: String, value: String) {
     Row(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 5.dp)) {
         Text(key, color = ui.text, fontSize = 13.sp, modifier = Modifier.weight(0.48f))
         Text(value, color = ui.textMuted, fontSize = 13.sp, modifier = Modifier.weight(0.52f))
+    }
+}
+
+/**
+ * Zeile mit Wischaktion: nach links wischen zeigt „Privat“ (Einfügen als private Ebene, wie im Vorbild).
+ */
+@Composable
+private fun SwipePrivateRow(label: String, icon: ImageVector?, onClick: () -> Unit, onPrivate: () -> Unit) {
+    val ui = LocalUi.current
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    val reveal = with(density) { 88.dp.toPx() }
+    val off = remember { androidx.compose.animation.core.Animatable(0f) }
+    val scope = androidx.compose.runtime.rememberCoroutineScope()
+    Box(Modifier.fillMaxWidth()) {
+        Box(
+            Modifier.matchParentSize().background(ui.accent).clickable {
+                scope.launch { off.animateTo(0f) }; onPrivate()
+            }.padding(end = 16.dp),
+            contentAlignment = Alignment.CenterEnd,
+        ) { Text("Privat", color = androidx.compose.ui.graphics.Color.White, fontSize = 14.sp) }
+        Box(
+            Modifier.offset { androidx.compose.ui.unit.IntOffset(off.value.toInt(), 0) }.background(ui.panel)
+                .draggable(
+                    orientation = androidx.compose.foundation.gestures.Orientation.Horizontal,
+                    state = androidx.compose.foundation.gestures.rememberDraggableState { d ->
+                        scope.launch { off.snapTo((off.value + d).coerceIn(-reveal, 0f)) }
+                    },
+                    onDragStopped = { v -> off.animateTo(if (off.value < -reveal / 2 || v < -800f) -reveal else 0f) },
+                )
+        ) {
+            ActionRow(label, icon) { if (off.value < -1f) scope.launch { off.animateTo(0f) } else onClick() }
+        }
     }
 }

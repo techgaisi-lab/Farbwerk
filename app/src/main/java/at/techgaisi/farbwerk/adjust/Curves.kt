@@ -33,6 +33,9 @@ class Curves {
     }
 
     companion object {
+        /** Höchstzahl der Punkte je Kanal (wie im Vorbild). */
+        const val MAX_POINTS = 11
+
         fun identity(): MutableList<PointF> = mutableListOf(PointF(0f, 0f), PointF(1f, 1f))
 
         fun lut(points: List<PointF>): IntArray {

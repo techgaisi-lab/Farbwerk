@@ -114,7 +114,7 @@ object Importers {
      * Fügt [image] als neue Ebene über der aktiven ein (zentriert, bei Bedarf auf Leinwand eingepasst)
      * und wechselt ins Transformieren, damit das Bild gleich platziert werden kann. Mit Undo.
      */
-    fun insertImageAsLayer(state: EditorState, image: Bitmap, name: String, transform: Boolean = true) {
+    fun insertImageAsLayer(state: EditorState, image: Bitmap, name: String, transform: Boolean = true, private: Boolean = false) {
         val doc = state.document ?: return
         val layerBmp = doc.newLayerBitmap()
         val s = min(1f, min(doc.width / image.width.toFloat(), doc.height / image.height.toFloat()))
@@ -123,7 +123,8 @@ object Importers {
         c.translate((doc.width - dw) / 2f, (doc.height - dh) / 2f)
         c.scale(s, s)
         c.drawBitmap(image, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
-        val ok = addLayer(state, Layer(name.take(60).ifBlank { "Eingefügtes Bild" }, layerBmp), "Bild einfügen")
+        val layer = Layer(name.take(60).ifBlank { "Eingefügtes Bild" }, layerBmp).also { it.isPrivate = private }
+        val ok = addLayer(state, layer, if (private) "Privat einfügen" else "Bild einfügen")
         if (ok && transform) state.selectTool(Tool.TRANSFORM)
     }
 
@@ -160,7 +161,7 @@ object Importers {
      * Datei in die offene Leinwand einfügen (Aktionen → Hinzufügen → Datei einfügen).
      * PSD-Dateien werden als zusammengefügtes Bild eingefügt, Projekte ebenso.
      */
-    fun insertFile(state: EditorState, uri: Uri) {
+    fun insertFile(state: EditorState, uri: Uri, private: Boolean = false) {
         val ctx = state.context
         Background.run("Datei wird eingefügt …", { state.flash("Import fehlgeschlagen: ${it.message ?: "Fehler"}") }) {
             val name = displayName(ctx, uri)
@@ -176,7 +177,7 @@ object Importers {
                     else -> decodeImage(ctx, uri, maxW, maxH)
                 }
             }
-            insertImageAsLayer(state, image, name)
+            insertImageAsLayer(state, image, name, private = private)
             image.recycle()
         }
     }

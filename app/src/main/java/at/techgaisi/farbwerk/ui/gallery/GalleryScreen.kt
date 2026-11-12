@@ -36,6 +36,11 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.layout.positionInRoot
+import androidx.compose.ui.zIndex
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
@@ -119,13 +124,23 @@ fun GalleryScreen(state: EditorState) {
     var deleteTargets by remember { mutableStateOf<List<ProjectInfo>?>(null) }
     var shareTarget by remember { mutableStateOf<ProjectInfo?>(null) }
     var message by remember { mutableStateOf<String?>(null) }
+    var order by remember { mutableStateOf<List<String>>(emptyList()) }
+    var preview by remember { mutableStateOf<Pair<List<ProjectInfo>, Int>?>(null) }
+    val drag = remember { GalleryDragState() }
+    val gridState = rememberLazyGridState()
     val scope = rememberCoroutineScope()
 
     fun toast(msg: String) { message = msg }
+    // Overlays des Aktionen-Pakets (Fallback-Host, falls nicht im EditorScreen eingebettet)
+    val activity = androidx.compose.ui.platform.LocalContext.current
+    LaunchedEffect(Unit) {
+        at.techgaisi.farbwerk.ui.actions.OverlayHost.install(findAct(activity), state)
+    }
     val onError: (Throwable) -> Unit = { t -> toast("Fehler: ${t.message ?: t.javaClass.simpleName}") }
 
     LaunchedEffect(store.changeCount) {
         val (p, s) = withContext(Dispatchers.IO) { store.list() to store.stacks() }
+        order = withContext(Dispatchers.IO) { store.order() }
         projects = p; stacks = s; loaded = true
         selected.retainAll { id -> p.any { it.id == id } }
     }
@@ -180,13 +195,50 @@ fun GalleryScreen(state: EditorState) {
     }
 
     // ----------------------------------------------------------- Inhalt
-    val items: List<GalleryItem> = remember(projects, stacks, openStackId) {
-        if (openStackId != null) projects.filter { it.stackId == openStackId }.map { GalleryItem.Project(it) }
+    val items: List<GalleryItem> = remember(projects, stacks, openStackId, order) {
+        val raw = if (openStackId != null) projects.filter { it.stackId == openStackId }.map { GalleryItem.Project(it) }
         else {
             val byStack = projects.filter { it.stackId != null }.groupBy { it.stackId!! }
             (projects.filter { it.stackId == null }.map { GalleryItem.Project(it) } +
                 stacks.mapNotNull { s -> byStack[s.id]?.let { GalleryItem.Stack(s, it) } })
-                .sortedByDescending { it.sortTime }
+        }
+        // Manuelle Reihenfolge; neue (noch nicht einsortierte) Werke stehen vorne, neueste zuerst
+        val pos = HashMap<String, Int>().apply { order.forEachIndexed { i, k -> putIfAbsent(k, i) } }
+        raw.sortedWith(compareBy<GalleryItem>({ pos[it.key] ?: -1 }, { -it.sortTime }))
+    }
+
+    /** Ablegen nach dem Ziehen: stapeln, in Stapel legen, aus Stapel entfernen oder umsortieren. */
+    fun onDrop(key: String, target: String?, before: String?, overHeader: Boolean) {
+        val pid = key.removePrefix("p:")
+        val isProject = key.startsWith("p:")
+        when {
+            overHeader && openStackId != null && isProject -> {
+                scope.launch(Dispatchers.IO) { store.moveToStack(listOf(pid), null) }
+                toast("Aus Stapel entfernt")
+            }
+            target != null && isProject && target.startsWith("s:") -> {
+                scope.launch(Dispatchers.IO) { store.moveToStack(listOf(pid), target.removePrefix("s:")) }
+                toast("Zum Stapel hinzugefügt")
+            }
+            target != null && isProject && target.startsWith("p:") && openStackId == null -> {
+                val keys = items.map { it.key }
+                val at = keys.indexOf(target)
+                scope.launch(Dispatchers.IO) {
+                    val sid = store.createStack("Stapel", listOf(target.removePrefix("p:"), pid))
+                    val newKeys = keys.filter { it != key && it != target }.toMutableList()
+                    newKeys.add(at.coerceIn(0, newKeys.size), "s:$sid")
+                    store.setOrder(newKeys)
+                }
+                toast("Stapel erstellt")
+            }
+            before != null -> {
+                val keys = items.map { it.key }.toMutableList()
+                keys.remove(key)
+                val i = if (before.isEmpty()) keys.size else keys.indexOf(before).let { if (it < 0) keys.size else it }
+                keys.add(i, key)
+                order = keys + order.filter { it !in keys }
+                scope.launch(Dispatchers.IO) { store.setOrder(keys) }
+            }
         }
     }
 
@@ -199,7 +251,9 @@ fun GalleryScreen(state: EditorState) {
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (openStack != null) {
-                    Row(Modifier.clip(RoundedCornerShape(8.dp)).clickable { openStackId = null; selectMode = false; selected.clear() }
+                    Row(Modifier.clip(RoundedCornerShape(8.dp))
+                        .background(if (drag.overHeader) ui.accent.copy(alpha = 0.25f) else Color.Transparent)
+                        .clickable { openStackId = null; selectMode = false; selected.clear() }
                         .padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
                         Icon(ActionIcons.Back, "Zurück", tint = ui.accent, modifier = Modifier.size(22.dp))
                         Text("Galerie", color = ui.accent, fontSize = 16.sp)
@@ -222,6 +276,9 @@ fun GalleryScreen(state: EditorState) {
                         val ids = selected.toList()
                         scope.launch(Dispatchers.IO) { store.moveToStack(ids, null) }
                         selectMode = false; selected.clear()
+                    }
+                    HeaderButton("Vorschau", enabled = selected.isNotEmpty()) {
+                        preview = selInfos to 0
                     }
                     HeaderButton("Teilen", enabled = selected.isNotEmpty()) {
                         Background.run("Wird vorbereitet …", onError) {
@@ -256,13 +313,39 @@ fun GalleryScreen(state: EditorState) {
                 }
             } else {
                 LazyVerticalGrid(
+                    state = gridState,
                     columns = GridCells.Adaptive(210.dp),
                     contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 32.dp),
                     horizontalArrangement = Arrangement.spacedBy(22.dp),
                     verticalArrangement = Arrangement.spacedBy(22.dp),
-                    modifier = Modifier.fillMaxSize().navigationBarsPadding(),
+                    modifier = Modifier.fillMaxSize().navigationBarsPadding()
+                        .onGloballyPositioned { drag.gridOrigin = it.positionInRoot() },
                 ) {
                     items(items, key = { it.key }) { item ->
+                        val dragging = drag.dragKey == item.key
+                        val projectsHere = items.mapNotNull { (it as? GalleryItem.Project)?.info }
+                        Box(
+                            Modifier
+                                .zIndex(if (dragging) 1f else 0f)
+                                .graphicsLayer {
+                                    if (dragging) {
+                                        translationX = drag.offset.x; translationY = drag.offset.y
+                                        scaleX = 1.05f; scaleY = 1.05f; alpha = 0.92f
+                                    }
+                                }
+                                .galleryDraggable(drag, item.key, gridState, enabled = !selectMode,
+                                    canStackOnto = { k -> openStackId == null && item is GalleryItem.Project && (k.startsWith("p:") || k.startsWith("s:")) },
+                                    onDrop = { k, t, b, h -> onDrop(k, t, b, h) })
+                                .then(if (item is GalleryItem.Project) Modifier.pinchOutToPreview {
+                                    preview = projectsHere to projectsHere.indexOfFirst { it.id == item.info.id }.coerceAtLeast(0)
+                                } else Modifier)
+                        ) {
+                        // Einfügemarke links neben der Kachel
+                        if (drag.dragKey != null && drag.insertBefore == item.key) {
+                            Box(Modifier.align(Alignment.CenterStart).offset(x = (-12).dp).width(3.dp).height(150.dp)
+                                .clip(RoundedCornerShape(2.dp)).background(ui.accent))
+                        }
+                        val highlight = drag.stackTarget == item.key
                         when (item) {
                             is GalleryItem.Project -> ProjectTile(
                                 state, item.info, bg,
@@ -278,13 +361,20 @@ fun GalleryScreen(state: EditorState) {
                                 onDuplicate = { duplicate(listOf(item.info.id)) },
                                 onDelete = { deleteTargets = listOf(item.info) },
                                 onUnstack = { scope.launch(Dispatchers.IO) { store.moveToStack(listOf(item.info.id), null) } },
+                                menu = drag.menuKey == item.key,
+                                onMenuDismiss = { drag.menuKey = null },
+                                highlight = highlight,
                             )
                             is GalleryItem.Stack -> StackTile(
                                 state, item,
                                 onOpen = { if (!selectMode) openStackId = item.stack.id },
                                 onRename = { renameStack = item.stack },
                                 onDissolve = { scope.launch(Dispatchers.IO) { store.dissolveStack(item.stack.id) } },
+                                menu = drag.menuKey == item.key,
+                                onMenuDismiss = { drag.menuKey = null },
+                                highlight = highlight,
                             )
+                        }
                         }
                     }
                 }
@@ -363,6 +453,10 @@ fun GalleryScreen(state: EditorState) {
         }
     }
 
+    preview?.let { (list, idx) ->
+        GalleryPreview(state, list, idx, onClose = { preview = null }) { info -> preview = null; open(info) }
+    }
+
     BusyDialog()
 }
 
@@ -390,7 +484,7 @@ private fun rememberThumb(state: EditorState, id: String, modified: Long): Bitma
 
 /** Vorschau mit gewahrtem Seitenverhältnis, mittig in einer festen Fläche. */
 @Composable
-private fun Thumbnail(bmp: Bitmap?, w: Int, h: Int, modifier: Modifier = Modifier) {
+private fun Thumbnail(bmp: Bitmap?, w: Int, h: Int, modifier: Modifier = Modifier, highlight: Boolean = false) {
     val ui = LocalUi.current
     BoxWithConstraints(modifier, contentAlignment = Alignment.BottomCenter) {
         val ratio = if (h > 0) w / h.toFloat() else 1f
@@ -399,6 +493,7 @@ private fun Thumbnail(bmp: Bitmap?, w: Int, h: Int, modifier: Modifier = Modifie
         Box(
             Modifier.size(tw, th).shadow(6.dp, RoundedCornerShape(3.dp)).clip(RoundedCornerShape(3.dp))
                 .background(Color.White)
+                .border(if (highlight) 3.dp else 0.dp, if (highlight) LocalUi.current.accent else Color.Transparent, RoundedCornerShape(3.dp))
         ) {
             if (bmp != null) {
                 Image(bmp.asImageBitmap(), null, contentScale = ContentScale.FillBounds, modifier = Modifier.fillMaxSize())
@@ -422,10 +517,12 @@ private fun ProjectTile(
     onDuplicate: () -> Unit,
     onDelete: () -> Unit,
     onUnstack: () -> Unit,
+    menu: Boolean,
+    onMenuDismiss: () -> Unit,
+    highlight: Boolean,
 ) {
     val ui = LocalUi.current
     val thumb = rememberThumb(state, info.id, info.modified)
-    var menu by remember { mutableStateOf(false) }
     val density = LocalDensity.current
     val revealPx = with(density) { 186.dp.toPx() }
     val offset = remember { Animatable(0f) }
@@ -458,12 +555,9 @@ private fun ProjectTile(
         ) {
             Box(
                 Modifier.fillMaxWidth().height(160.dp)
-                    .combinedClickable(
-                        onClick = { if (offset.value < -1f) closeSwipe() else onOpen() },
-                        onLongClick = { if (!selectMode) menu = true },
-                    )
+                    .clickable { if (offset.value < -1f) closeSwipe() else onOpen() }
             ) {
-                Thumbnail(thumb, info.width, info.height, Modifier.fillMaxSize())
+                Thumbnail(thumb, info.width, info.height, Modifier.fillMaxSize(), highlight)
                 if (selectMode) {
                     Box(
                         Modifier.align(Alignment.TopEnd).padding(6.dp).size(24.dp).clip(CircleShape)
@@ -472,12 +566,12 @@ private fun ProjectTile(
                         contentAlignment = Alignment.Center
                     ) { if (selected) Icon(ActionIcons.Check, null, tint = Color.White, modifier = Modifier.size(16.dp)) }
                 }
-                DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                    DropdownMenuItem(text = { Text("Teilen") }, onClick = { menu = false; onShare() })
-                    DropdownMenuItem(text = { Text("Duplizieren") }, onClick = { menu = false; onDuplicate() })
-                    DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { menu = false; onRename() })
-                    if (inStack) DropdownMenuItem(text = { Text("Aus Stapel entfernen") }, onClick = { menu = false; onUnstack() })
-                    DropdownMenuItem(text = { Text("Löschen", color = Color(0xFFFF5A52)) }, onClick = { menu = false; onDelete() })
+                DropdownMenu(expanded = menu, onDismissRequest = onMenuDismiss) {
+                    DropdownMenuItem(text = { Text("Teilen") }, onClick = { onMenuDismiss(); onShare() })
+                    DropdownMenuItem(text = { Text("Duplizieren") }, onClick = { onMenuDismiss(); onDuplicate() })
+                    DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { onMenuDismiss(); onRename() })
+                    if (inStack) DropdownMenuItem(text = { Text("Aus Stapel entfernen") }, onClick = { onMenuDismiss(); onUnstack() })
+                    DropdownMenuItem(text = { Text("Löschen", color = Color(0xFFFF5A52)) }, onClick = { onMenuDismiss(); onDelete() })
                 }
             }
             Spacer(Modifier.height(8.dp))
@@ -507,13 +601,15 @@ private fun SwipeButton(label: String, icon: ImageVector, color: Color, onClick:
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () -> Unit, onRename: () -> Unit, onDissolve: () -> Unit) {
+private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () -> Unit, onRename: () -> Unit, onDissolve: () -> Unit,
+                      menu: Boolean, onMenuDismiss: () -> Unit, highlight: Boolean) {
     val ui = LocalUi.current
-    var menu by remember { mutableStateOf(false) }
     val top = item.members.sortedByDescending { it.modified }.take(3)
     Column(Modifier.fillMaxWidth()) {
         Box(
-            Modifier.fillMaxWidth().height(160.dp).combinedClickable(onClick = onOpen, onLongClick = { menu = true }),
+            Modifier.fillMaxWidth().height(160.dp).clip(RoundedCornerShape(6.dp))
+                .border(if (highlight) 3.dp else 0.dp, if (highlight) ui.accent else Color.Transparent, RoundedCornerShape(6.dp))
+                .clickable(onClick = onOpen),
             contentAlignment = Alignment.Center
         ) {
             // Gestapelte Vorschauen, hinterste zuerst
@@ -524,9 +620,9 @@ private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () ->
                     Modifier.fillMaxSize().padding(start = (depth * 10).dp, end = (20 - depth * 10).dp,
                         top = (20 - depth * 10).dp, bottom = (depth * 10).dp))
             }
-            DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
-                DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { menu = false; onRename() })
-                DropdownMenuItem(text = { Text("Stapel auflösen") }, onClick = { menu = false; onDissolve() })
+            DropdownMenu(expanded = menu, onDismissRequest = onMenuDismiss) {
+                DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { onMenuDismiss(); onRename() })
+                DropdownMenuItem(text = { Text("Stapel auflösen") }, onClick = { onMenuDismiss(); onDissolve() })
             }
         }
         Spacer(Modifier.height(8.dp))
@@ -535,4 +631,10 @@ private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () ->
         Text(if (item.members.size == 1) "1 Werk" else "${item.members.size} Werke", color = ui.textMuted, fontSize = 12.sp,
             modifier = Modifier.align(Alignment.CenterHorizontally))
     }
+}
+
+private fun findAct(c: android.content.Context): android.app.Activity? {
+    var x: android.content.Context? = c
+    while (x is android.content.ContextWrapper) { if (x is android.app.Activity) return x; x = x.baseContext }
+    return null
 }

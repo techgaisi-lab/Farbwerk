@@ -3,6 +3,7 @@ package at.techgaisi.farbwerk.transform
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.graphics.Color
+import android.graphics.DashPathEffect
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.Path
@@ -10,10 +11,12 @@ import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
 import android.graphics.RectF
+import android.graphics.Typeface
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.HapticFeedbackConstants
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import at.techgaisi.farbwerk.EditorState
@@ -25,8 +28,10 @@ import at.techgaisi.farbwerk.model.ToolInputHandler
 import at.techgaisi.farbwerk.selection.CompositeAction
 import at.techgaisi.farbwerk.selection.MaskUtils
 import at.techgaisi.farbwerk.selection.SelectionActions
+import at.techgaisi.farbwerk.selection.SelectionPrefs
 import at.techgaisi.farbwerk.undo.LayerPixelsAction
 import at.techgaisi.farbwerk.undo.UndoAction
+import java.util.Locale
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.cos
@@ -52,11 +57,34 @@ enum class Interpolation(val label: String) {
     BICUBIC("Bikubisch"),
 }
 
+/** Was das Zahlenfeld (nach Antippen eines Punkts) bearbeitet. */
+enum class TransformNumericKind { SIZE, ANGLE }
+
 /**
- * Transformieren: hebt den Inhalt der aktiven Ebene (bzw. der Auswahl) als schwebende Bitmap ab.
- * Die Geometrie wird als Viereck (4 Ecken, Dokument-Koordinaten) bzw. – nach dem Verkrümmen – als
- * 4×4-Kontrollgitter gehalten. Die Ebene zeigt während der Sitzung per drawOverride Rest + schwebenden
- * Inhalt; erst [commit] schreibt die Pixel (ein Verlaufsschritt "Transformieren").
+ * Inhalt des Zahlenfelds: aktuelle Breite/Höhe in px bzw. Winkel in Grad (positiv = gegen den
+ * Uhrzeigersinn, wie im Vorbild).
+ */
+data class TransformNumericInput(
+    val kind: TransformNumericKind,
+    val width: Float,
+    val height: Float,
+    val angle: Float,
+    /** Seitenverhältnis gekoppelt (Gleichmäßig). */
+    val linked: Boolean,
+)
+
+/**
+ * Transformieren: hebt den Inhalt der aktiven Ebene **und aller sekundär markierten Ebenen** (bzw. den
+ * Auswahlbereich darin) als schwebende Bitmaps ab. Alle Teile teilen dieselbe Geometrie – ein Viereck
+ * (4 Ecken, Dokument-Koordinaten) bzw. nach dem Verkrümmen ein 4×4-Kontrollgitter. Die Ebenen zeigen während
+ * der Sitzung per drawOverride Rest + schwebenden Inhalt; erst [commit] schreibt die Pixel
+ * (ein Verlaufsschritt „Transformieren“ für alle Ebenen).
+ *
+ * Gesten: 1 Finger innerhalb/außerhalb = verschieben, Tippen außerhalb = schubsen, Punkte ziehen = skalieren
+ * (mit Größenanzeige B × H), grüner Punkt = drehen (mit Winkelanzeige), Punkt antippen = Zahlenfeld,
+ * Kneifen/Drehen mit zwei Fingern **innerhalb** des Rahmens = gleichmäßig skalieren + drehen um die Mitte.
+ *
+ * Öffentliche API für die Tastatur (WP1): [nudge].
  */
 class TransformTool(private val state: EditorState) : ToolInputHandler {
 
@@ -65,31 +93,62 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         private set
     var interpolation by mutableStateOf(Interpolation.BILINEAR)
         private set
-    /** Magnetisch: Verschieben entlang 45°-Achsen, Drehen in 15°-Schritten, Skalieren in 5-%-Schritten. */
-    var magnetic by mutableStateOf(false)
-    /** Einrasten an Dokumentmitte und -rändern. */
-    var snapping by mutableStateOf(false)
+
+    /** Magnetisch: Verschieben auf 15°-Achsen, Drehen in 15°-Schritten, Skalieren in 5-%-Schritten. */
+    var magnetic: Boolean
+        get() = SelectionPrefs.magnetic
+        set(v) = SelectionPrefs.updateMagnetic(v)
+    /** Einrasten: blaue Hilfslinien an anderen Objekten, gelbe an Leinwandmitte/-rändern. */
+    var snapping: Boolean
+        get() = SelectionPrefs.snapping
+        set(v) = SelectionPrefs.updateSnapping(v)
     /** Einrast-Abstand in dp. */
-    var snapDistance by mutableFloatStateOf(14f)
+    var snapDistance: Float
+        get() = SelectionPrefs.snapDistance
+        set(v) = SelectionPrefs.updateSnapDistance(v)
+    /** Geschwindigkeit 0..1 (Keine … Max): bis zu welcher Zieh-Geschwindigkeit die Hilfslinien greifen. */
+    var snapSpeed: Float
+        get() = SelectionPrefs.snapSpeed
+        set(v) = SelectionPrefs.updateSnapSpeed(v)
+
     /** true, solange eine Transform-Sitzung läuft. */
     var active by mutableStateOf(false)
+        private set
+    /** Anzahl der Ebenen in der laufenden Sitzung (für die Leiste). */
+    var layerCount by mutableStateOf(0)
+        private set
+    /** Offenes Zahlenfeld (nach Antippen eines Punkts) oder null. */
+    var numericInput by mutableStateOf<TransformNumericInput?>(null)
         private set
 
     private val density = state.context.resources.displayMetrics.density
     private val main = Handler(Looper.getMainLooper())
 
+    init {
+        SelectionPrefs.init(state.context)
+    }
+
     // ---------------------------------------------------------------- Sitzung
-    private class Session(
+    /** Eine Ebene der Sitzung. */
+    private class Part(
         val layer: Layer,
         /** Ebene ohne den abgehobenen Inhalt (nur bei Auswahl; sonst ist der Rest leer). */
         val base: Bitmap?,
         val floating: Bitmap,
+    ) {
+        var draw: ((Canvas) -> Unit)? = null
+    }
+
+    private class Session(
+        val parts: List<Part>,
         val srcRect: Rect,
         val selection: Selection?,
-        /** Auswahlmaske im Koordinatensystem von [floating]. */
+        /** Auswahlmaske im Koordinatensystem der schwebenden Bitmaps. */
         val floatingMask: Bitmap?,
         val undoVersion: Int,
-    )
+    ) {
+        val primary: Layer get() = parts[0].layer
+    }
 
     private var s: Session? = null
     private val corners = FloatArray(8)       // p0 TL, p1 TR, p2 BR, p3 BL
@@ -101,7 +160,6 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     private val matrix = Matrix()
     private val srcPts = FloatArray(8)
 
-    private val drawFn: (Canvas) -> Unit = { c -> drawSession(c) }
     private val previewPaint = Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG)
     private val srcPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
 
@@ -116,49 +174,131 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     private val startMesh = FloatArray(GRID * GRID * 2)
     private var startWarped = false
     private val softWeights = FloatArray(GRID * GRID)
+
+    /** Magnetisch: Achse, auf der verschoben wird (fixiert nach kurzer Zugstrecke). */
+    private var axisLocked = false
+    private var axisAngle = 0.0
+
+    /** Geglättete Zieh-Geschwindigkeit in dp/ms (für „Geschwindigkeit“ beim Einrasten). */
+    private var speedDp = 0f
+    private var lastMoveViewX = 0f
+    private var lastMoveViewY = 0f
+    private var lastMoveTime = 0L
+
+    // ---------------------------------------------------------------- Einrasten
+    /** Senkrechte (x = const) und waagrechte (y = const) Hilfslinie; NaN = keine. */
     private var guideX = Float.NaN
+    private var guideXObject = false
     private var guideY = Float.NaN
+    private var guideYObject = false
+    private var hadGuide = false
+    /** Einrastziele (Dokument-Koordinaten) mit Herkunft (true = Objekt, false = Leinwand). */
+    private var snapXs: FloatArray? = null
+    private var snapXObj: BooleanArray? = null
+    private var snapYs: FloatArray? = null
+    private var snapYObj: BooleanArray? = null
+
+    // ---------------------------------------------------------------- Zwei Finger
+    private var pinching = false
+    private var pinchDx = 0f
+    private var pinchDy = 0f
+    private var pinchScale = 1f
+    private var pinchRot = 0f
+
+    /** Welche Werte gerade neben dem Rahmen angezeigt werden. */
+    private var showSize = false
+    private var showAngle = false
 
     // ---------------------------------------------------------------- Overlay
     private val viewMatrix = Matrix()
     private val tmp = FloatArray(64)
     private val boxPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 1.5f * density; color = 0xFF3D8BFF.toInt()
+        style = Paint.Style.STROKE; strokeWidth = 1.5f * density; color = ACCENT
+    }
+    private val boxDash = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 1.5f * density; color = Color.WHITE
     }
     private val shadowPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
         style = Paint.Style.STROKE; strokeWidth = 3.5f * density; color = 0x55000000
     }
-    private val handleFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE }
-    private val handleStroke = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 1.5f * density; color = 0xFF3D8BFF.toInt()
+    private val handleFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = ACCENT }
+    private val handleRing = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 2f * density; color = Color.WHITE
     }
+    private val handleShadow = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0x40000000 }
     private val rotFill = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xFF34C759.toInt() }
-    private val guidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE; strokeWidth = 1f * density; color = 0xFFFFC233.toInt()
+    private val canvasGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 1.2f * density; color = 0xFFFFCC00.toInt()
     }
+    private val objectGuidePaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE; strokeWidth = 1.2f * density; color = 0xFF2F9BFF.toInt()
+    }
+    private val labelBg = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = 0xE61C1C1E.toInt() }
+    private val labelText = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        color = Color.WHITE
+        textSize = 13f * state.context.resources.displayMetrics.scaledDensity
+        typeface = Typeface.create(Typeface.DEFAULT, Typeface.BOLD)
+        fontFeatureSettings = "tnum"
+        textAlign = Paint.Align.CENTER
+    }
+    private val labelRect = RectF()
     private val overlayPath = Path()
+    private val mid = FloatArray(2)
 
     // ================================================================= Lebenszyklus
 
     fun begin() {
         if (s != null) return
         val doc = state.document ?: return
-        val layer = doc.activeLayer ?: return
-        if (layer.locked) { state.flash("Ebene gesperrt"); return }
-        val sel = doc.selection
-        val rect = (if (sel != null) MaskUtils.bounds(sel.mask) else MaskUtils.alphaBounds(layer.bitmap))
-            ?: run { state.flash("Nichts zum Transformieren"); return }
-        val floating = MaskUtils.crop(layer.bitmap, rect)
-        var base: Bitmap? = null
-        var fMask: Bitmap? = null
-        if (sel != null) {
-            fMask = MaskUtils.crop(sel.mask, rect)
-            Canvas(floating).drawBitmap(fMask, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) })
-            base = layer.bitmap.copy(Bitmap.Config.ARGB_8888, true)
-            Canvas(base).drawBitmap(sel.mask, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) })
+        val primary = doc.activeLayer ?: return
+        if (primary.locked) { state.flash("Ebene gesperrt"); return }
+
+        // Primär- und Sekundärebenen (gesperrte werden übersprungen)
+        val layers = ArrayList<Layer>()
+        layers += primary
+        var skippedLocked = false
+        if (doc.secondarySelection.isNotEmpty()) {
+            for (l in doc.layers) {
+                if (l === primary || l.id !in doc.secondarySelection) continue
+                if (l.locked) skippedLocked = true else layers += l
+            }
         }
-        floating.setHasMipMap(interpolation == Interpolation.BICUBIC)
-        val ss = Session(layer, base, floating, rect, sel, fMask, state.undo.version)
+
+        val sel = doc.selection
+        val rect: Rect
+        val used: List<Layer>
+        if (sel != null) {
+            rect = MaskUtils.bounds(sel.mask) ?: run { state.flash("Nichts zum Transformieren"); return }
+            used = layers
+        } else {
+            var union: Rect? = null
+            val withContent = ArrayList<Layer>(layers.size)
+            for (l in layers) {
+                val b = MaskUtils.alphaBounds(l.bitmap) ?: continue
+                withContent += l
+                if (union == null) union = Rect(b) else union.union(b)
+            }
+            rect = union ?: run { state.flash("Nichts zum Transformieren"); return }
+            // Primärebene bleibt immer erste (bestimmt das Sitzungsende bei Ebenenwechsel)
+            if (withContent.firstOrNull() !== primary) withContent.add(0, primary)
+            used = withContent
+        }
+
+        val fMask: Bitmap? = sel?.let { MaskUtils.crop(it.mask, rect) }
+        val dstIn = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) }
+        val dstOut = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) }
+        val parts = used.map { l ->
+            val floating = MaskUtils.crop(l.bitmap, rect)
+            var base: Bitmap? = null
+            if (sel != null && fMask != null) {
+                Canvas(floating).drawBitmap(fMask, 0f, 0f, dstIn)
+                base = l.bitmap.copy(Bitmap.Config.ARGB_8888, true)
+                Canvas(base).drawBitmap(sel.mask, 0f, 0f, dstOut)
+            }
+            floating.setHasMipMap(interpolation == Interpolation.BICUBIC)
+            Part(l, base, floating)
+        }
+        val ss = Session(parts, rect, sel, fMask, state.undo.version)
         s = ss
         val l = rect.left.toFloat(); val t = rect.top.toFloat()
         val r = rect.right.toFloat(); val b = rect.bottom.toFloat()
@@ -171,32 +311,41 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         warped = false
         fineDirty = true
         updateMatrix()
-        layer.drawOverride = drawFn
+        for (p in parts) {
+            val fn: (Canvas) -> Unit = { c -> drawPart(c, p) }
+            p.draw = fn
+            p.layer.drawOverride = fn
+        }
         active = true
+        layerCount = parts.size
+        numericInput = null
+        if (skippedLocked) state.flash("Gesperrte Ebenen werden nicht transformiert")
         state.invalidate()
     }
 
-    /** Ergebnis in die Ebene schreiben (ein Verlaufsschritt). */
+    /** Ergebnis in die Ebenen schreiben (ein Verlaufsschritt). */
     fun commit() {
         val ss = s ?: return
         val doc = state.document
-        if (doc == null || doc.indexOf(ss.layer) < 0 || isUnchanged()) { cancel(); return }
-        val layer = ss.layer
-        layer.drawOverride = null
+        if (doc == null || ss.parts.none { doc.indexOf(it.layer) >= 0 } || isUnchanged()) { cancel(); return }
         val bounds = transformedBounds()
         val dirty = Rect(ss.srcRect)
         dirty.union(Rect(floor(bounds.left).toInt() - 1, floor(bounds.top).toInt() - 1,
             bounds.right.toInt() + 2, bounds.bottom.toInt() + 2))
-        if (!dirty.intersect(0, 0, layer.width, layer.height)) dirty.set(ss.srcRect)
+        if (!dirty.intersect(0, 0, doc.width, doc.height)) dirty.set(ss.srcRect)
 
-        val before = MaskUtils.crop(layer.bitmap, dirty)
-        val c = Canvas(layer.bitmap)
-        if (ss.base != null) c.drawBitmap(ss.base, 0f, 0f, srcPaint) else c.drawColor(0, PorterDuff.Mode.CLEAR)
-        drawFloatingFinal(c, ss)
-        val after = MaskUtils.crop(layer.bitmap, dirty)
-
-        val parts = ArrayList<UndoAction>(2)
-        parts += LayerPixelsAction("Transformieren", layer, dirty, before, after)
+        val actions = ArrayList<UndoAction>(ss.parts.size + 1)
+        for (p in ss.parts) {
+            val layer = p.layer
+            if (layer.drawOverride === p.draw) layer.drawOverride = null
+            if (doc.indexOf(layer) < 0) continue
+            val before = MaskUtils.crop(layer.bitmap, dirty)
+            val c = Canvas(layer.bitmap)
+            if (p.base != null) c.drawBitmap(p.base, 0f, 0f, srcPaint) else c.drawColor(0, PorterDuff.Mode.CLEAR)
+            drawFloatingFinal(c, p.floating, layer)
+            val after = MaskUtils.crop(layer.bitmap, dirty)
+            actions += LayerPixelsAction("Transformieren", layer, dirty, before, after)
+        }
         if (ss.selection != null && ss.floatingMask != null) {
             val nm = MaskUtils.create(doc.width, doc.height)
             val mc = Canvas(nm)
@@ -214,10 +363,11 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
                 }
             } else null
             val newSel = if (MaskUtils.bounds(nm) == null) null else Selection(nm, np).also { it.feather = ss.selection.feather }
-            parts += SelectionActions.selectionChange(doc, ss.selection, newSel, "Transformieren")
+            actions += SelectionActions.selectionChange(doc, ss.selection, newSel, "Transformieren")
             doc.selection = newSel
+            SelectionActions.noteSelection(doc, newSel)
         }
-        state.undo.push(CompositeAction("Transformieren", parts))
+        state.undo.push(CompositeAction("Transformieren", actions))
         end()
         state.invalidate()
     }
@@ -225,7 +375,7 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     /** Transformation verwerfen. */
     fun cancel() {
         val ss = s ?: return
-        if (ss.layer.drawOverride === drawFn) ss.layer.drawOverride = null
+        for (p in ss.parts) if (p.layer.drawOverride === p.draw) p.layer.drawOverride = null
         end()
         state.invalidate()
     }
@@ -233,20 +383,25 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     private fun end() {
         s = null
         active = false
+        layerCount = 0
         op = Op.NONE
-        guideX = Float.NaN; guideY = Float.NaN
+        pinching = false
+        showSize = false; showAngle = false
+        numericInput = null
+        clearGuides()
+        snapXs = null; snapYs = null; snapXObj = null; snapYObj = null
     }
 
     /** Prüft, ob sich Dokument/Ebene außerhalb der Sitzung geändert haben (z. B. Rückgängig-Geste). */
     private fun syncSession() {
         val ss = s ?: return
         val doc = state.document
-        val stale = doc == null || doc.activeLayer !== ss.layer || state.undo.version != ss.undoVersion
+        val stale = doc == null || doc.activeLayer !== ss.primary || state.undo.version != ss.undoVersion
         if (stale) main.post {
             val cur = s ?: return@post
             if (cur !== ss) return@post
             val d = state.document
-            if (d != null && d.activeLayer !== ss.layer && state.undo.version == ss.undoVersion) commit() else cancel()
+            if (d != null && d.activeLayer !== ss.primary && state.undo.version == ss.undoVersion) commit() else cancel()
             if (state.tool == Tool.TRANSFORM) begin()
         }
     }
@@ -256,12 +411,13 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     fun changeMode(m: TransformMode) {
         mode = m
         if (m == TransformMode.WARP) ensureMesh()
+        numericInput = null
         state.invalidate()
     }
 
     fun changeInterpolation(i: Interpolation) {
         interpolation = i
-        s?.floating?.setHasMipMap(i == Interpolation.BICUBIC)
+        s?.parts?.forEach { it.floating.setHasMipMap(i == Interpolation.BICUBIC) }
         state.invalidate()
     }
 
@@ -275,13 +431,18 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
 
     fun rotate45() = applyLocal { m, cx, cy, _ -> m.postRotate(45f, cx, cy) }
 
-    /** Inhalt proportional auf die Leinwand einpassen (zentriert, Drehung bleibt erhalten). */
+    /**
+     * Inhalt auf die Leinwand einpassen (zentriert, Drehung bleibt erhalten). Mit Magnetisch wird die
+     * Leinwand ganz gefüllt (Überstand wird beim Übernehmen abgeschnitten), sonst passt der Inhalt hinein.
+     */
     fun fitToCanvas() {
         val doc = state.document ?: return
         if (s == null) return
         val b = transformedBounds()
         if (b.width() <= 0f || b.height() <= 0f) return
-        val sc = min(doc.width / b.width(), doc.height / b.height())
+        val sx = doc.width / b.width()
+        val sy = doc.height / b.height()
+        val sc = if (magnetic) max(sx, sy) else min(sx, sy)
         val m = Matrix()
         m.postScale(sc, sc, b.centerX(), b.centerY())
         m.postTranslate(doc.width / 2f - b.centerX(), doc.height / 2f - b.centerY())
@@ -296,8 +457,48 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         fineDirty = true
         updateMatrix()
         if (mode == TransformMode.WARP) ensureMesh()
+        numericInput = null
         state.invalidate()
     }
+
+    /**
+     * Schwebenden Inhalt um ([dx], [dy]) Dokument-Pixel verschieben (Pfeiltasten: 1 px).
+     * Startet bei Bedarf eine Sitzung, wenn das Transform-Werkzeug aktiv ist.
+     */
+    fun nudge(dx: Float, dy: Float) {
+        if (s == null && state.tool == Tool.TRANSFORM) begin()
+        if (s == null || op != Op.NONE || pinching) return
+        applyMatrix(Matrix().apply { setTranslate(dx, dy) })
+        state.invalidate()
+    }
+
+    /** Zahlenfeld: exakte Größe in px setzen (um die Mitte, Drehung bleibt). */
+    fun applyNumericSize(width: Float, height: Float) {
+        if (s == null || width <= 0f || height <= 0f) return
+        val cw = hypot(corners[2] - corners[0], corners[3] - corners[1])
+        val ch = hypot(corners[6] - corners[0], corners[7] - corners[1])
+        if (cw < 1e-3f || ch < 1e-3f) return
+        val cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4f
+        val cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4f
+        val th = Math.toRadians(localAngleDeg(corners).toDouble())
+        scaleAbout(cx, cy, th, width / cw, height / ch)
+        numericInput = null
+        state.invalidate()
+    }
+
+    /** Zahlenfeld: absoluten Winkel setzen (Grad, positiv = gegen den Uhrzeigersinn). */
+    fun applyNumericAngle(deg: Float) {
+        if (s == null) return
+        val cur = displayAngle()
+        val delta = deg - cur
+        val cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4f
+        val cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4f
+        applyMatrix(Matrix().apply { setRotate(-delta, cx, cy) })
+        numericInput = null
+        state.invalidate()
+    }
+
+    fun dismissNumericInput() { numericInput = null }
 
     private inline fun applyLocal(block: (Matrix, Float, Float, Float) -> Unit) {
         if (s == null) return
@@ -310,13 +511,18 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         state.invalidate()
     }
 
-    // ================================================================= Eingabe
+    // ================================================================= Eingabe (ein Finger / Stift)
 
     override fun onStrokeStart(p: InputPoint) {
         syncSession()
-        if (s == null) return
+        if (s == null || pinching) return
+        numericInput = null
         downX = p.x; downY = p.y
         dragMoved = false
+        axisLocked = false
+        speedDp = 0f
+        lastMoveTime = p.time
+        mapToView(p.x, p.y).let { lastMoveViewX = tmp[0]; lastMoveViewY = tmp[1] }
         corners.copyInto(startCorners)
         if (mode == TransformMode.WARP) ensureMesh()
         mesh.copyInto(startMesh)
@@ -336,6 +542,7 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     override fun onStrokeMove(points: List<InputPoint>) {
         if (s == null || op == Op.NONE) return
         val p = points.last()
+        trackSpeed(p)
         if (!dragMoved && viewDist(downX, downY, p.x, p.y) > 8f * density) dragMoved = true
         if (!dragMoved) return
         if (op == Op.NUDGE) op = Op.MOVE
@@ -343,14 +550,28 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         startCorners.copyInto(corners)
         startMesh.copyInto(mesh)
         warped = startWarped
-        val dx = p.x - downX
-        val dy = p.y - downY
-        guideX = Float.NaN; guideY = Float.NaN
+        var dx = p.x - downX
+        var dy = p.y - downY
+        clearGuides()
+        showSize = op == Op.CORNER || op == Op.EDGE
+        showAngle = op == Op.ROTATE
         when (op) {
             Op.MOVE -> doMove(dx, dy)
             Op.ROTATE -> doRotate(p.x, p.y)
             Op.CORNER -> if (mode == TransformMode.DISTORT) doDistortCorner(opIndex, dx, dy) else doScaleCorner(opIndex, p.x, p.y)
             Op.EDGE -> if (mode == TransformMode.DISTORT) {
+                if (magnetic) {
+                    // Scheren nur entlang der Kante
+                    val j = (opIndex + 1) % 4
+                    var ex = startCorners[j * 2] - startCorners[opIndex * 2]
+                    var ey = startCorners[j * 2 + 1] - startCorners[opIndex * 2 + 1]
+                    val len = hypot(ex, ey)
+                    if (len > 1e-3f) {
+                        ex /= len; ey /= len
+                        val proj = dx * ex + dy * ey
+                        dx = proj * ex; dy = proj * ey
+                    }
+                }
                 doDistortCorner(opIndex, dx, dy)
                 doDistortCorner((opIndex + 1) % 4, dx, dy)
             } else doScaleEdge(opIndex, p.x, p.y)
@@ -372,24 +593,41 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         }
         fineDirty = true
         updateMatrix()
+        hapticOnGuide()
         state.canvasView?.postInvalidateOnAnimation()
     }
 
     override fun onStrokeEnd(p: InputPoint) {
         if (s == null) return
-        if (op == Op.NUDGE && !dragMoved) {
-            // Tippen außerhalb: 1 px in Richtung des Tippens verschieben
-            val cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4f
-            val cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4f
-            val ang = atan2(p.y - cy, p.x - cx)
-            val q = (ang / (Math.PI / 4)).roundToInt() * (Math.PI / 4)
-            val nx = cos(q).roundToInt().toFloat()
-            val ny = sin(q).roundToInt().toFloat()
-            val m = Matrix().apply { setTranslate(nx, ny) }
-            applyMatrix(m)
+        if (!dragMoved) {
+            when (op) {
+                Op.NUDGE -> {
+                    // Tippen außerhalb: in Richtung des Tippens schubsen (bei starkem Zoom feiner)
+                    val cx = (corners[0] + corners[2] + corners[4] + corners[6]) / 4f
+                    val cy = (corners[1] + corners[3] + corners[5] + corners[7]) / 4f
+                    val ang = atan2(p.y - cy, p.x - cx)
+                    val q = (ang / (Math.PI / 4)).roundToInt() * (Math.PI / 4)
+                    val step = max(1f, floor(2f * density / viewScale()))
+                    val nx = cos(q).roundToInt() * step
+                    val ny = sin(q).roundToInt() * step
+                    applyMatrix(Matrix().apply { setTranslate(nx, ny) })
+                }
+                Op.CORNER, Op.EDGE -> if (mode == TransformMode.FREEFORM || mode == TransformMode.UNIFORM) {
+                    numericInput = TransformNumericInput(TransformNumericKind.SIZE,
+                        hypot(corners[2] - corners[0], corners[3] - corners[1]),
+                        hypot(corners[6] - corners[0], corners[7] - corners[1]),
+                        displayAngle(), linked = mode == TransformMode.UNIFORM)
+                }
+                Op.ROTATE -> numericInput = TransformNumericInput(TransformNumericKind.ANGLE,
+                    hypot(corners[2] - corners[0], corners[3] - corners[1]),
+                    hypot(corners[6] - corners[0], corners[7] - corners[1]),
+                    displayAngle(), linked = mode == TransformMode.UNIFORM)
+                else -> {}
+            }
         }
         op = Op.NONE
-        guideX = Float.NaN; guideY = Float.NaN
+        showSize = false; showAngle = false
+        clearGuides()
         state.invalidate()
     }
 
@@ -403,7 +641,74 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
             updateMatrix()
         }
         op = Op.NONE
-        guideX = Float.NaN; guideY = Float.NaN
+        showSize = false; showAngle = false
+        clearGuides()
+        state.invalidate()
+    }
+
+    private fun trackSpeed(p: InputPoint) {
+        mapToView(p.x, p.y)
+        val vx = tmp[0]; val vy = tmp[1]
+        val dt = (p.time - lastMoveTime).coerceAtLeast(1L)
+        val inst = hypot(vx - lastMoveViewX, vy - lastMoveViewY) / density / dt
+        speedDp = if (speedDp == 0f) inst else speedDp * 0.7f + inst * 0.3f
+        lastMoveViewX = vx; lastMoveViewY = vy; lastMoveTime = p.time
+    }
+
+    // ================================================================= Zwei Finger (Kneifen innerhalb)
+
+    override fun handlesTwoFingerAt(docX: Float, docY: Float): Boolean {
+        syncSession()
+        if (s == null) return false
+        if (insideQuad(docX, docY)) return true
+        if (warped || mode == TransformMode.WARP) return boundsOfArray(mesh).contains(docX, docY)
+        return false
+    }
+
+    override fun onTwoFingerTransform(pivotX: Float, pivotY: Float, dx: Float, dy: Float, scale: Float, rotationDeg: Float) {
+        if (s == null) return
+        if (!pinching) {
+            // Laufenden Ein-Finger-Vorgang verwerfen und vom aktuellen Zustand aus beginnen
+            if (op != Op.NONE) onStrokeCancel()
+            pinching = true
+            numericInput = null
+            if (mode == TransformMode.WARP) ensureMesh()
+            corners.copyInto(startCorners)
+            mesh.copyInto(startMesh)
+            startWarped = warped
+            pinchDx = 0f; pinchDy = 0f; pinchScale = 1f; pinchRot = 0f
+        }
+        pinchDx += dx; pinchDy += dy
+        if (scale.isFinite() && scale > 0f) pinchScale *= scale
+        if (rotationDeg.isFinite()) pinchRot += rotationDeg
+        startCorners.copyInto(corners)
+        startMesh.copyInto(mesh)
+        warped = startWarped
+
+        val cx = (startCorners[0] + startCorners[2] + startCorners[4] + startCorners[6]) / 4f
+        val cy = (startCorners[1] + startCorners[3] + startCorners[5] + startCorners[7]) / 4f
+        var sc = pinchScale
+        var rot = pinchRot
+        if (magnetic) {
+            sc = snapScale(sc)
+            val a0 = localAngleDeg(startCorners)
+            rot = ((a0 + rot) / 15f).roundToInt() * 15f - a0
+        }
+        sc = clampScale(sc)
+        val m = Matrix()
+        m.postScale(sc, sc, cx, cy)
+        m.postRotate(rot, cx, cy)
+        m.postTranslate(pinchDx, pinchDy)
+        applyMatrix(m)
+        showSize = true
+        showAngle = true
+        state.canvasView?.postInvalidateOnAnimation()
+    }
+
+    override fun onTwoFingerEnd() {
+        if (!pinching) return
+        pinching = false
+        showSize = false; showAngle = false
         state.invalidate()
     }
 
@@ -413,31 +718,94 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         var dx = dx0
         var dy = dy0
         if (magnetic) {
-            val a = atan2(dy, dx)
-            val q = (a / (Math.PI / 4)).roundToInt() * (Math.PI / 4)
-            val len = hypot(dx, dy) * cos(a - q).toFloat()
+            // Achse aus der Zugrichtung in 15°-Schritten; nach kurzer Strecke fixiert
+            val q = if (axisLocked) axisAngle else ((atan2(dy, dx) / STEP15).roundToInt() * STEP15)
+            if (!axisLocked && hypot(dx, dy) * viewScale() > 28f * density) {
+                axisLocked = true
+                axisAngle = q
+                haptic()
+            }
+            val len = dx * cos(q).toFloat() + dy * sin(q).toFloat()
             dx = (len * cos(q)).toFloat()
             dy = (len * sin(q)).toFloat()
         }
-        if (snapping) {
-            val doc = state.document
-            if (doc != null) {
-                val b = boundsOf(startCorners, if (startWarped) startMesh else null)
-                val thr = snapDistance * density / viewScale()
-                val xs = floatArrayOf(b.left + dx, b.centerX() + dx, b.right + dx)
-                val ys = floatArrayOf(b.top + dy, b.centerY() + dy, b.bottom + dy)
-                val tx = floatArrayOf(0f, doc.width / 2f, doc.width.toFloat())
-                val ty = floatArrayOf(0f, doc.height / 2f, doc.height.toFloat())
-                var best = thr
-                var adj = 0f
-                for (x in xs) for (t in tx) if (abs(t - x) < best) { best = abs(t - x); adj = t - x; guideX = t }
-                dx += adj
-                best = thr; adj = 0f
-                for (y in ys) for (t in ty) if (abs(t - y) < best) { best = abs(t - y); adj = t - y; guideY = t }
-                dy += adj
+        if (snapping && snapAllowed()) {
+            val b = boundsOf(startCorners, if (startWarped) startMesh else null)
+            val thr = snapDistance * density / viewScale()
+            ensureSnapTargets()
+            val tx = snapXs; val txo = snapXObj; val ty = snapYs; val tyo = snapYObj
+            if (tx != null && txo != null) {
+                var best = thr; var adj = 0f
+                for (x in floatArrayOf(b.left + dx, b.centerX() + dx, b.right + dx)) {
+                    for (k in tx.indices) {
+                        val d = abs(tx[k] - x)
+                        if (d < best) { best = d; adj = tx[k] - x; guideX = tx[k]; guideXObject = txo[k] }
+                    }
+                }
+                // Magnetisch: Einrasten nur, wenn es die Achse nicht verlässt (waagrechte Achse)
+                if (!magnetic || abs(sin(axisAngle)) < 1e-3) dx += adj else guideX = Float.NaN
+            }
+            if (ty != null && tyo != null) {
+                var best = thr; var adj = 0f
+                for (y in floatArrayOf(b.top + dy, b.centerY() + dy, b.bottom + dy)) {
+                    for (k in ty.indices) {
+                        val d = abs(ty[k] - y)
+                        if (d < best) { best = d; adj = ty[k] - y; guideY = ty[k]; guideYObject = tyo[k] }
+                    }
+                }
+                if (!magnetic || abs(cos(axisAngle)) < 1e-3) dy += adj else guideY = Float.NaN
             }
         }
         applyMatrix(Matrix().apply { setTranslate(dx, dy) })
+    }
+
+    /** Hilfslinien greifen nur bis zur eingestellten Zieh-Geschwindigkeit. */
+    private fun snapAllowed(): Boolean {
+        val v = snapSpeed
+        if (v >= 0.99f) return true
+        return speedDp <= 0.08f + v * 2.4f
+    }
+
+    /**
+     * Einrastziele: Leinwandränder und -mitte (gelb) sowie Ränder und Mitten der Inhalte anderer sichtbarer
+     * Ebenen bzw. des Rests der eigenen Ebenen (blau). Einmal pro Sitzung berechnet.
+     */
+    private fun ensureSnapTargets() {
+        if (snapXs != null) return
+        val doc = state.document ?: return
+        val ss = s ?: return
+        val xs = ArrayList<Float>(); val xo = ArrayList<Boolean>()
+        val ys = ArrayList<Float>(); val yo = ArrayList<Boolean>()
+        fun add(r: Rect?, obj: Boolean) {
+            if (r == null) return
+            xs += r.left.toFloat(); xs += r.exactCenterX(); xs += r.right.toFloat()
+            repeat(3) { xo += obj }
+            ys += r.top.toFloat(); ys += r.exactCenterY(); ys += r.bottom.toFloat()
+            repeat(3) { yo += obj }
+        }
+        add(Rect(0, 0, doc.width, doc.height), false)
+        val sessionIds = ss.parts.mapTo(HashSet()) { it.layer.id }
+        for (l in doc.layers) {
+            if (!l.visible || l.id in sessionIds) continue
+            add(try { MaskUtils.alphaBounds(l.bitmap) } catch (t: Throwable) { null }, true)
+        }
+        for (p in ss.parts) p.base?.let { add(try { MaskUtils.alphaBounds(it) } catch (t: Throwable) { null }, true) }
+        snapXs = xs.toFloatArray(); snapXObj = xo.toBooleanArray()
+        snapYs = ys.toFloatArray(); snapYObj = yo.toBooleanArray()
+    }
+
+    private fun clearGuides() {
+        guideX = Float.NaN; guideY = Float.NaN
+    }
+
+    private fun hapticOnGuide() {
+        val has = !guideX.isNaN() || !guideY.isNaN()
+        if (has && !hadGuide) haptic()
+        hadGuide = has
+    }
+
+    private fun haptic() {
+        state.canvasView?.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
     }
 
     private fun doRotate(x: Float, y: Float) {
@@ -477,7 +845,11 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         scaleAbout(ax, ay, th, sx, sy)
     }
 
-    /** Kante skalieren: gegenüberliegende Kante bleibt fest. Kante i verbindet Ecke i und i+1. */
+    /**
+     * Kante skalieren. Freiform: gegenüberliegende Kante bleibt fest (eine Achse).
+     * Gleichmäßig: proportional vom gegenüberliegenden Punkt aus.
+     * Kante i verbindet Ecke i und i+1.
+     */
     private fun doScaleEdge(i: Int, x: Float, y: Float) {
         val i2 = (i + 1) % 4
         val o1 = (i + 2) % 4; val o2 = (i + 3) % 4
@@ -556,8 +928,8 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         val ss = s ?: return
         if (warped) return
         updateMatrix()
-        val fw = ss.floating.width.toFloat()
-        val fh = ss.floating.height.toFloat()
+        val fw = ss.srcRect.width().toFloat()
+        val fh = ss.srcRect.height().toFloat()
         for (j in 0 until GRID) for (i in 0 until GRID) {
             val idx = (j * GRID + i) * 2
             mesh[idx] = fw * i / (GRID - 1)
@@ -568,7 +940,7 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     }
 
     private fun syncCornersFromMesh() {
-        val ids = intArrayOf(0, GRID - 1, GRID * GRID - 1, GRID * (GRID - 1))
+        val ids = CORNER_IDS
         for (c in 0 until 4) {
             corners[c * 2] = mesh[ids[c] * 2]
             corners[c * 2 + 1] = mesh[ids[c] * 2 + 1]
@@ -647,6 +1019,14 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
     private fun localAngleDeg(c: FloatArray): Float =
         Math.toDegrees(atan2((c[3] - c[1]).toDouble(), (c[2] - c[0]).toDouble())).toFloat()
 
+    /** Anzeigewinkel: positiv = gegen den Uhrzeigersinn, Bereich (-180, 180]. */
+    private fun displayAngle(): Float {
+        var a = -localAngleDeg(corners)
+        while (a <= -180f) a += 360f
+        while (a > 180f) a -= 360f
+        return a
+    }
+
     private fun isUnchanged(): Boolean {
         if (warped) return false
         for (i in 0 until 8) if (abs(corners[i] - initCorners[i]) > 0.01f) return false
@@ -659,35 +1039,35 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
 
     // ================================================================= Zeichnen
 
-    /** drawOverride der Ebene: Rest + schwebender Inhalt mit Transformation. */
-    private fun drawSession(c: Canvas) {
-        val ss = s ?: return
-        ss.base?.let { c.drawBitmap(it, 0f, 0f, null) }
+    /** drawOverride einer Ebene: Rest + schwebender Inhalt mit Transformation. */
+    private fun drawPart(c: Canvas, p: Part) {
+        if (s == null) return
+        p.base?.let { c.drawBitmap(it, 0f, 0f, null) }
         previewPaint.isFilterBitmap = interpolation != Interpolation.NEAREST
         previewPaint.isAntiAlias = interpolation != Interpolation.NEAREST
-        drawFloating(c, ss, previewPaint)
+        drawFloating(c, p.floating, previewPaint)
     }
 
-    private fun drawFloating(c: Canvas, ss: Session, paint: Paint) {
+    private fun drawFloating(c: Canvas, floating: Bitmap, paint: Paint) {
         if (warped) {
             ensureFine()
-            c.drawBitmapMesh(ss.floating, FINE, FINE, fine, 0, null, 0, paint)
+            c.drawBitmapMesh(floating, FINE, FINE, fine, 0, null, 0, paint)
         } else {
             c.save()
             c.concat(matrix)
-            c.drawBitmap(ss.floating, 0f, 0f, paint)
+            c.drawBitmap(floating, 0f, 0f, paint)
             c.restore()
         }
     }
 
-    private fun drawFloatingFinal(c: Canvas, ss: Session) {
+    private fun drawFloatingFinal(c: Canvas, floating: Bitmap, layer: Layer) {
         if (!warped && interpolation == Interpolation.BICUBIC) {
             val b = transformedBounds()
             val r = Rect(floor(b.left).toInt(), floor(b.top).toInt(), b.right.toInt() + 1, b.bottom.toInt() + 1)
-            if (r.intersect(0, 0, ss.layer.width, ss.layer.height)) {
+            if (r.intersect(0, 0, layer.width, layer.height)) {
                 val inv = Matrix()
                 if (matrix.invert(inv)) {
-                    val out = Bicubic.resample(ss.floating, inv, r)
+                    val out = Bicubic.resample(floating, inv, r)
                     c.drawBitmap(out, r.left.toFloat(), r.top.toFloat(), null)
                     return
                 }
@@ -697,7 +1077,7 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
             isFilterBitmap = interpolation != Interpolation.NEAREST
             isAntiAlias = interpolation != Interpolation.NEAREST
         }
-        drawFloating(c, ss, p)
+        drawFloating(c, floating, p)
     }
 
     override fun drawOverlay(canvas: Canvas, docToView: Matrix) {
@@ -746,56 +1126,102 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         overlayPath.transform(docToView)
         canvas.drawPath(overlayPath, shadowPaint)
         canvas.drawPath(overlayPath, boxPaint)
+        if (showEdges) {
+            // Gestrichelter, laufender Rahmen (Verkrümmen: durchgezogen)
+            val dash = 6f * density
+            val phase = (SystemClock.uptimeMillis() % 100_000L) / 40f
+            boxDash.pathEffect = DashPathEffect(floatArrayOf(dash, dash), -(phase % (2 * dash)))
+            canvas.drawPath(overlayPath, boxDash)
+            state.canvasView?.postInvalidateDelayed(85)
+        }
 
-        // Einrast-Hilfslinien
+        // Einrast-Hilfslinien (blau = Objekt, gelb = Leinwand)
         if (!guideX.isNaN() || !guideY.isNaN()) {
             val doc = state.document
             if (doc != null) {
-                if (!guideX.isNaN()) drawDocLine(canvas, guideX, -doc.height.toFloat(), guideX, doc.height * 2f)
-                if (!guideY.isNaN()) drawDocLine(canvas, -doc.width.toFloat(), guideY, doc.width * 2f, guideY)
+                val big = max(doc.width, doc.height) * 4f
+                if (!guideX.isNaN()) drawDocLine(canvas, guideX, -big, guideX, big,
+                    if (guideXObject) objectGuidePaint else canvasGuidePaint)
+                if (!guideY.isNaN()) drawDocLine(canvas, -big, guideY, big, guideY,
+                    if (guideYObject) objectGuidePaint else canvasGuidePaint)
             }
         }
 
-        val hr = 8f * density
+        val hr = 7.5f * density
         if (mode == TransformMode.WARP) {
             for (k in 0 until GRID * GRID) {
                 tmp[0] = mesh[k * 2]; tmp[1] = mesh[k * 2 + 1]
                 docToView.mapPoints(tmp, 0, tmp, 0, 1)
-                canvas.drawCircle(tmp[0], tmp[1], hr * 0.8f, handleFill)
-                canvas.drawCircle(tmp[0], tmp[1], hr * 0.8f, handleStroke)
+                drawHandle(canvas, tmp[0], tmp[1], hr * 0.8f, handleFill)
             }
+            drawValueLabel(canvas)
             return
         }
-        // Drehgriff
+        // Drehgriff (grün) mit Verbindungslinie
         rotationHandle(tmp, 0)
-        val mid = FloatArray(2)
         mid[0] = (corners[0] + corners[2]) / 2f; mid[1] = (corners[1] + corners[3]) / 2f
         docToView.mapPoints(mid)
         canvas.drawLine(mid[0], mid[1], tmp[0], tmp[1], boxPaint)
-        canvas.drawCircle(tmp[0], tmp[1], hr, rotFill)
-        canvas.drawCircle(tmp[0], tmp[1], hr, handleStroke.apply { color = Color.WHITE })
-        handleStroke.color = 0xFF3D8BFF.toInt()
+        drawHandle(canvas, tmp[0], tmp[1], hr, rotFill)
         // Ecken
         for (i in 0 until 4) {
             tmp[0] = corners[i * 2]; tmp[1] = corners[i * 2 + 1]
             docToView.mapPoints(tmp, 0, tmp, 0, 1)
-            canvas.drawCircle(tmp[0], tmp[1], hr, handleFill)
-            canvas.drawCircle(tmp[0], tmp[1], hr, handleStroke)
+            drawHandle(canvas, tmp[0], tmp[1], hr, handleFill)
         }
-        // Kanten
-        if (showEdges) for (i in 0 until 4) {
+        // Seitenmitten
+        for (i in 0 until 4) {
             val j = (i + 1) % 4
             tmp[0] = (corners[i * 2] + corners[j * 2]) / 2f; tmp[1] = (corners[i * 2 + 1] + corners[j * 2 + 1]) / 2f
             docToView.mapPoints(tmp, 0, tmp, 0, 1)
-            canvas.drawCircle(tmp[0], tmp[1], hr * 0.7f, handleFill)
-            canvas.drawCircle(tmp[0], tmp[1], hr * 0.7f, handleStroke)
+            drawHandle(canvas, tmp[0], tmp[1], hr * 0.78f, handleFill)
         }
+        drawValueLabel(canvas)
     }
 
-    private fun drawDocLine(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float) {
+    private fun drawHandle(canvas: Canvas, x: Float, y: Float, r: Float, fill: Paint) {
+        canvas.drawCircle(x, y + 1f * density, r + 1.5f * density, handleShadow)
+        canvas.drawCircle(x, y, r, fill)
+        canvas.drawCircle(x, y, r, handleRing)
+    }
+
+    /** Größen- (B × H px) bzw. Winkelanzeige als Pille über dem Rahmen. */
+    private fun drawValueLabel(canvas: Canvas) {
+        if (!showSize && !showAngle) return
+        val w = hypot(corners[2] - corners[0], corners[3] - corners[1]).roundToInt()
+        val h = hypot(corners[6] - corners[0], corners[7] - corners[1]).roundToInt()
+        val size = "$w × $h px"
+        val angle = String.format(Locale.GERMANY, "%.1f°", displayAngle())
+        val text = when {
+            showSize && showAngle -> "$size   $angle"
+            showSize -> size
+            else -> angle
+        }
+        // Position: mittig über dem Rahmen (oberhalb des Drehgriffs), sonst darunter
+        for (i in 0 until 4) { tmp[i * 2] = corners[i * 2]; tmp[i * 2 + 1] = corners[i * 2 + 1] }
+        viewMatrix.mapPoints(tmp, 0, tmp, 0, 4)
+        var minX = Float.MAX_VALUE; var maxX = -Float.MAX_VALUE; var minY = Float.MAX_VALUE; var maxY = -Float.MAX_VALUE
+        for (i in 0 until 4) {
+            minX = min(minX, tmp[i * 2]); maxX = max(maxX, tmp[i * 2])
+            minY = min(minY, tmp[i * 2 + 1]); maxY = max(maxY, tmp[i * 2 + 1])
+        }
+        val tw = labelText.measureText(text)
+        val ph = 28f * density
+        val pw = tw + 24f * density
+        val cx = ((minX + maxX) / 2f).coerceIn(pw / 2f + 8f * density, canvas.width - pw / 2f - 8f * density)
+        var top = minY - 58f * density - ph
+        if (top < 8f * density) top = maxY + 30f * density
+        top = top.coerceAtMost(canvas.height - ph - 8f * density)
+        labelRect.set(cx - pw / 2f, top, cx + pw / 2f, top + ph)
+        canvas.drawRoundRect(labelRect, ph / 2f, ph / 2f, labelBg)
+        val fm = labelText.fontMetrics
+        canvas.drawText(text, cx, labelRect.centerY() - (fm.ascent + fm.descent) / 2f, labelText)
+    }
+
+    private fun drawDocLine(canvas: Canvas, x0: Float, y0: Float, x1: Float, y1: Float, paint: Paint) {
         tmp[0] = x0; tmp[1] = y0; tmp[2] = x1; tmp[3] = y1
         viewMatrix.mapPoints(tmp, 0, tmp, 0, 2)
-        canvas.drawLine(tmp[0], tmp[1], tmp[2], tmp[3], guidePaint)
+        canvas.drawLine(tmp[0], tmp[1], tmp[2], tmp[3], paint)
     }
 
     /** Position des Drehgriffs in View-Koordinaten → out[off], out[off+1]. */
@@ -860,10 +1286,15 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         return inside
     }
 
+    private val scaleVals = FloatArray(9)
     private fun viewScale(): Float {
-        val v = FloatArray(9)
-        viewMatrix.getValues(v)
-        return hypot(v[Matrix.MSCALE_X], v[Matrix.MSKEW_Y]).coerceAtLeast(1e-4f)
+        viewMatrix.getValues(scaleVals)
+        return hypot(scaleVals[Matrix.MSCALE_X], scaleVals[Matrix.MSKEW_Y]).coerceAtLeast(1e-4f)
+    }
+
+    private fun mapToView(x: Float, y: Float) {
+        tmp[0] = x; tmp[1] = y
+        viewMatrix.mapPoints(tmp, 0, tmp, 0, 1)
     }
 
     private fun viewDist(x0: Float, y0: Float, x1: Float, y1: Float): Float {
@@ -877,5 +1308,8 @@ class TransformTool(private val state: EditorState) : ToolInputHandler {
         const val GRID = 4
         /** Render-Gitter-Auflösung (Vielfaches von GRID-1). */
         const val FINE = 24
+        private val CORNER_IDS = intArrayOf(0, GRID - 1, GRID * GRID - 1, GRID * (GRID - 1))
+        private const val STEP15 = Math.PI / 12
+        private const val ACCENT = 0xFF2F7CF6.toInt()
     }
 }

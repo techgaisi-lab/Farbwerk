@@ -80,12 +80,14 @@ object PsdWriter {
         recs += Rec(null, BACKGROUND_NAME, fillColor = doc.backgroundColor or (0xFF shl 24), visible = doc.backgroundVisible)
         var i = 0
         var groupNo = 0
-        while (i < doc.layers.size) {
-            val g = doc.layers[i].groupId
-            if (g == null) { recs += Rec(doc.layers[i], doc.layers[i].name); i++; continue }
+        // Private Ebenen werden nicht exportiert
+        val layers = doc.layers.filter { !it.isPrivate }
+        while (i < layers.size) {
+            val g = layers[i].groupId
+            if (g == null) { recs += Rec(layers[i], layers[i].name); i++; continue }
             groupNo++
             recs += Rec(null, "</Layer group>", sectionType = 3)
-            while (i < doc.layers.size && doc.layers[i].groupId == g) { recs += Rec(doc.layers[i], doc.layers[i].name); i++ }
+            while (i < layers.size && layers[i].groupId == g) { recs += Rec(layers[i], layers[i].name); i++ }
             val meta = LayerGroups.find(doc, g)
             recs += Rec(null, meta?.name ?: "Gruppe $groupNo", sectionType = 1, visible = meta?.visible ?: true,
                 groupOpacity = meta?.opacity ?: 1f)
@@ -165,7 +167,8 @@ object PsdWriter {
         if (mask != null) {
             r.hasMask = true
             r.channelIds += -2
-            r.channelLens += enc.encodeBitmap(cd, mask, 0, 0, mask.width, mask.height, -1)
+            r.channelLens += enc.encodeBitmap(cd, mask, 0, 0, mask.width, mask.height,
+                if (mask.config == android.graphics.Bitmap.Config.ALPHA_8) -1 else 2 /* Graustufen: Helligkeit */)
         }
     }
 

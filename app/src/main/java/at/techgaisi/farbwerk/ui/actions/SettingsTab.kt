@@ -43,7 +43,11 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.prefs.Prefs
+import at.techgaisi.farbwerk.input.GestureFunction
+import at.techgaisi.farbwerk.input.GestureMap
+import at.techgaisi.farbwerk.input.GestureTrigger
 import at.techgaisi.farbwerk.stylus.StylusButtonAction
+import at.techgaisi.farbwerk.ui.icons.AppIcons
 import at.techgaisi.farbwerk.ui.theme.LocalUi
 import kotlin.math.hypot
 import kotlin.math.roundToInt
@@ -64,6 +68,29 @@ internal fun SettingsTab(state: EditorState) {
                 p.sidebarRight = it; p.save()
             }
             SwitchRow("Pinselcursor", p.brushCursor, subtitle = "Pinselumriss beim Malen anzeigen") { p.brushCursor = it; p.save() }
+            if (p.brushCursor) {
+                ChoiceRow("Cursor-Sichtbarkeit", null,
+                    listOf(0 to "Beim Schweben", 1 to "Beim Malen", 2 to "Beides"), p.cursorVisibility) {
+                    p.cursorVisibility = it; p.save()
+                }
+                ChoiceRow("Umrissstil", null,
+                    listOf(0 to "Hoher Kontrast", 1 to "Aktive Farbe", 2 to "Pro Pinsel"), p.cursorStyle) {
+                    p.cursorStyle = it; p.save()
+                }
+            }
+            SwitchRow("Seitenleiste Größe & Deckkraft", p.sidebarVisible, subtitle = "Regler am Bildschirmrand anzeigen") {
+                p.sidebarVisible = it; p.save()
+            }
+            if (p.sidebarOffset != 0f) {
+                ActionRow("Seitenleiste zentrieren") { p.sidebarOffset = 0f; p.save() }
+            }
+            SwitchRow("Automatisches Vollbild", p.autoFullscreen, subtitle = "Oberfläche beim Malen ausblenden") {
+                p.autoFullscreen = it; p.save()
+            }
+            if (p.autoFullscreen) {
+                SliderRow("Rückkehr nach", p.autoFullscreenDelayMs.toFloat(), 200f..3000f, { "%.1f s".format(it / 1000f) },
+                    onChange = { p.autoFullscreenDelayMs = it.roundToInt() }, onDone = { p.save() })
+            }
             SwitchRow("Dynamische Pinselskalierung", p.dynamicBrushScaling, subtitle = "Pinselgröße folgt dem Zoom") {
                 p.dynamicBrushScaling = it; p.save()
             }
@@ -79,6 +106,20 @@ internal fun SettingsTab(state: EditorState) {
             ActionRow("Gestensteuerung", chevron = true) { SettingsMemory.page = SettingsPage.GESTURES }
             FwDivider()
             StylusSection(p)
+            FwDivider()
+            SectionHeader("Auswahl & Transformieren")
+            SliderRow("Sichtbarkeit der Auswahlmaske", at.techgaisi.farbwerk.selection.SelectionPrefs.maskOpacity, 0f..1f,
+                { "${(it * 100).roundToInt()} %" },
+                onChange = { at.techgaisi.farbwerk.selection.SelectionPrefs.updateMaskOpacity(it); p.selectionMaskOpacity = it },
+                onDone = { p.save() })
+            SwitchRow("Vereinfachtes Rückgängig", p.simplifiedUndo, subtitle = "Alle Transformieren-Schritte als ein Schritt") {
+                p.simplifiedUndo = it; p.save()
+            }
+            FwDivider()
+            SectionHeader("Tastatur")
+            SwitchRow("Leertaste öffnet QuickMenu", p.spaceQuickMenu, subtitle = "Kurz tippen; halten und ziehen verschiebt die Leinwand") {
+                p.spaceQuickMenu = it; p.save()
+            }
             FwDivider()
             SectionHeader("Verlauf")
             SliderRow("Rückgängig-Schritte", p.undoLimit.toFloat(), 10f..500f, { it.roundToInt().toString() },
@@ -107,24 +148,7 @@ internal fun SettingsTab(state: EditorState) {
             }
         }
         SettingsPage.GESTURES -> SubPage(SettingsPage.GESTURES) {
-            SectionHeader("Gesten")
-            SwitchRow("Tippen zum Rückgängigmachen", p.gestureTapUndo, subtitle = "2 Finger: rückgängig · 3 Finger: wiederholen") {
-                p.gestureTapUndo = it; p.save()
-            }
-            SwitchRow("Wischen zum Leeren", p.gestureScrubClear, subtitle = "3 Finger hin und her") { p.gestureScrubClear = it; p.save() }
-            SwitchRow("Kopieren & Einfügen", p.gestureCopyPaste, subtitle = "3 Finger nach unten wischen") { p.gestureCopyPaste = it; p.save() }
-            SwitchRow("Vollbild", p.gestureFullscreen, subtitle = "4 Finger tippen") { p.gestureFullscreen = it; p.save() }
-            SwitchRow("Pipette", p.gestureHoldEyedropper, subtitle = "Berühren und halten") { p.gestureHoldEyedropper = it; p.save() }
-            SwitchRow("Schnellform", p.quickShapeEnabled, subtitle = "Zeichnen und halten") { p.quickShapeEnabled = it; p.save() }
-            FwDivider()
-            SectionHeader("Verzögerungen")
-            SliderRow("Pipette (Halten)", p.holdDelayMs.toFloat(), 100f..1500f, { "${(it / 10).roundToInt() * 10} ms" },
-                onChange = { p.holdDelayMs = it.roundToInt() }, onDone = { p.save() })
-            SliderRow("Schnellform", p.quickShapeDelayMs.toFloat(), 200f..1500f, { "${(it / 10).roundToInt() * 10} ms" },
-                onChange = { p.quickShapeDelayMs = it.roundToInt() }, onDone = { p.save() })
-            SliderRow("Schnelles Rückgängig", p.rapidUndoDelayMs.toFloat(), 200f..1500f, { "${(it / 10).roundToInt() * 10} ms" },
-                onChange = { p.rapidUndoDelayMs = it.roundToInt() }, onDone = { p.save() })
-            Spacer(Modifier.height(10.dp))
+            GestureControlPage(p)
         }
     }
 }
@@ -292,5 +316,82 @@ private fun PressureCurveEditor(p: Prefs) {
         }
         Text("Druck", color = ui.textMuted, fontSize = 10.sp, modifier = Modifier.align(Alignment.BottomEnd).padding(6.dp))
         Text("Ergebnis", color = ui.textMuted, fontSize = 10.sp, modifier = Modifier.align(Alignment.TopStart).padding(6.dp))
+    }
+}
+
+/**
+ * Gestensteuerung (Anleitung §2.4): je Funktion die möglichen Auslöser als Schalter. Ein Auslöser sollte nur
+ * einer Funktion gehören – Konflikte zeigen ein gelbes Warnsymbol (es gewinnt die weiter oben stehende
+ * Funktion). Halte-Auslöser haben einen Verzögerungsregler.
+ */
+@Composable
+private fun GestureControlPage(p: Prefs) {
+    @Suppress("UNUSED_VARIABLE") val raw = p.gestureTriggers
+    @Suppress("UNUSED_VARIABLE") val hold = p.gestureHoldEyedropper
+    for (f in GestureFunction.entries) {
+        SectionHeader(f.label)
+        Text(f.description, color = LocalUi.current.textMuted, fontSize = 12.sp,
+            modifier = Modifier.padding(start = 16.dp, end = 16.dp, bottom = 2.dp))
+        for (t in f.allowed) {
+            TriggerRow(t.label, GestureMap.isOn(p, f, t), GestureMap.conflicts(p, f, t)) { on -> GestureMap.set(p, f, t, on) }
+        }
+        if (GestureMap.isOn(p, f, GestureTrigger.TOUCH_HOLD)) {
+            if (f == GestureFunction.EYEDROPPER) {
+                SliderRow("Verzögerung", p.holdDelayMs.toFloat(), 0f..1500f, { "%.2f s".format(it / 1000f) },
+                    onChange = { p.holdDelayMs = it.roundToInt() }, onDone = { p.save() })
+            } else {
+                SliderRow("Verzögerung", p.holdMenuDelayMs.toFloat(), 0f..1500f, { "%.2f s".format(it / 1000f) },
+                    onChange = { p.holdMenuDelayMs = it.roundToInt() }, onDone = { p.save() })
+            }
+        }
+        FwDivider()
+    }
+    SectionHeader("QuickShape")
+    SwitchRow("Zeichnen & halten", p.quickShapeEnabled, subtitle = "Strich wird nach kurzem Halten zur Form") {
+        p.quickShapeEnabled = it; p.save()
+    }
+    SliderRow("Verzögerung", p.quickShapeDelayMs.toFloat(), 0f..1500f, { "%.2f s".format(it / 1000f) },
+        onChange = { p.quickShapeDelayMs = it.roundToInt() }, onDone = { p.save() })
+    FwDivider()
+    SectionHeader("Rückgängig & Wiederholen")
+    SwitchRow("Tippen zum Rückgängigmachen", p.gestureTapUndo, subtitle = "2 Finger: rückgängig · 3 Finger: wiederholen") {
+        p.gestureTapUndo = it; p.save()
+    }
+    SliderRow("Verzögerung schnelles Rückgängig", p.rapidUndoDelayMs.toFloat(), 0f..1500f, { "%.2f s".format(it / 1000f) },
+        onChange = { p.rapidUndoDelayMs = it.roundToInt() }, onDone = { p.save() })
+    FwDivider()
+    SectionHeader("Weitere Gesten")
+    SwitchRow("Ebene leeren", p.gestureScrubClear, subtitle = "3 Finger hin und her schrubben") { p.gestureScrubClear = it; p.save() }
+    SwitchRow("Kopieren & Einfügen", p.gestureCopyPaste, subtitle = "3 Finger nach unten wischen") { p.gestureCopyPaste = it; p.save() }
+    SwitchRow("Vollbild", p.gestureFullscreen, subtitle = "4 Finger tippen") { p.gestureFullscreen = it; p.save() }
+    FwDivider()
+    SectionHeader("Allgemein")
+    SwitchRow("Drehen beim Zoomen", p.rotateWithPinch, subtitle = "Zwei-Finger-Geste dreht die Leinwand mit") {
+        p.rotateWithPinch = it; p.save()
+    }
+    SwitchRow("Touch-Aktionen deaktivieren", !p.fingerPainting, subtitle = "Finger steuern nur Gesten, nur der Stift malt") {
+        p.fingerPainting = !it; p.save()
+    }
+    ActionRow("Gestensteuerung zurücksetzen") { GestureMap.reset(p) }
+    Spacer(Modifier.height(10.dp))
+}
+
+/** Schalterzeile für einen Auslöser, mit gelbem Warnsymbol bei Konflikt. */
+@Composable
+private fun TriggerRow(label: String, checked: Boolean, conflict: Boolean, onChange: (Boolean) -> Unit) {
+    val ui = LocalUi.current
+    Row(
+        Modifier.fillMaxWidth().heightIn(min = 44.dp).clickable { onChange(!checked) }.padding(horizontal = 16.dp, vertical = 2.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(label, color = ui.text, fontSize = 15.sp, modifier = Modifier.weight(1f))
+        if (conflict) {
+            Icon(AppIcons.Warning, "Auslöser auch anderer Funktion zugewiesen", tint = ui.warning,
+                modifier = Modifier.padding(end = 8.dp).size(20.dp))
+        }
+        androidx.compose.material3.Switch(
+            checked = checked, onCheckedChange = onChange,
+            colors = androidx.compose.material3.SwitchDefaults.colors(checkedTrackColor = ui.accent, checkedThumbColor = Color.White),
+        )
     }
 }
