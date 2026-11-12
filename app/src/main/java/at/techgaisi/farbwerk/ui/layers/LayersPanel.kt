@@ -1,6 +1,19 @@
 package at.techgaisi.farbwerk.ui.layers
 
 import android.os.SystemClock
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.foundation.Canvas
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.StrokeJoin
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.luminance
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.MutableTransitionState
@@ -123,13 +136,31 @@ import kotlin.math.roundToInt
 // Maße und Farben (Richtwerte laut Anleitung §30)
 // =============================================================================================
 
-private val ROW_HEIGHT = 60.dp
-private val MASK_ROW_HEIGHT = 52.dp
-private val THUMB = 44.dp
+// Maße laut UI_SPEC §5 (Ebenen-Panel)
+private val ROW_HEIGHT = 52.dp
+private val MASK_ROW_HEIGHT = 46.dp
+private val THUMB = 40.dp
+private val MASK_THUMB = 32.dp
+private val THUMB_RADIUS = 3.dp
+private val ROW_RADIUS = 6.dp
+/** Innenabstand der Zeilen (links/rechts). */
+private val ROW_PAD = 10.dp
+/** Abstand der ausgewählten (abgerundeten) Zeilenfläche zum Panelrand. */
+private val ROW_INSET = 4.dp
+/** Zusätzliche Einrückung von Gruppenmitgliedern. */
+private val GROUP_INDENT = 18.dp
+private val CHECKBOX = 20.dp
 private val ACTION_WIDTH = 66.dp
 
-/** Sekundärauswahl (dunkelblau). Primär = Akzent. */
-private val SECONDARY_BLUE = Color(0xFF1E3E78)
+// Farben laut UI_SPEC §0 (lokal, da nicht alle als gemeinsame Tokens existieren)
+/** Primär ausgewählte Ebene: helles Blau-Violett (heller als der Akzent). */
+private val PRIMARY_ROW = Color(0xFF5E7CFF)
+/** Sekundärauswahl (gedämpftes Blau). */
+private val SECONDARY_BLUE = Color(0xFF2E4C8F)
+/** Haarlinie zwischen Zeilen: Weiß @ 8 %. */
+private val SEPARATOR = Color(0x14FFFFFF)
+/** Mischmodus-Buchstabe: Weiß @ 85 %. */
+private val BLEND_LETTER = Color(0xD9FFFFFF)
 private val LOCK_GREY = Color(0xFF5A5A60)
 private val DESTRUCTIVE = Color(0xFFFF453A)
 
@@ -200,6 +231,9 @@ private class PanelController(val state: EditorState, val scroll: ScrollState) {
     var dragKey by mutableStateOf<String?>(null)
     /** Alle mitgezogenen Zeilen (Gruppenmitglieder, Maskenzeilen). */
     var draggedKeys: Set<String> = emptySet()
+
+    /** Wird die Zeile [key] gerade gezogen (angehoben)? */
+    fun isDragged(key: String): Boolean = dragKey != null && key in draggedKeys
     var dragIds: List<String> = emptyList()
     var dragGroupId: String? = null
     var dragBlockHeight = 0f
@@ -518,9 +552,9 @@ fun LayersPanel(state: EditorState, modifier: Modifier = Modifier) {
     val keys = rows.map { it.key }.toSet()
     c.bounds.keys.retainAll(keys + "bg")
 
+    // Panel-Farbe (transluzent #2A2A2C @ 96 %) kommt aus dem gemeinsamen Theme (ui.panel)
     PanelCard(modifier) {
         LayersHeader(c, doc, rev)
-        HorizontalDivider(color = ui.divider, thickness = 0.5.dp)
 
         // ---------- Liste ----------
         Box(
@@ -546,9 +580,9 @@ fun LayersPanel(state: EditorState, modifier: Modifier = Modifier) {
                             ) { BlendBar(state, item.layer, rev) }
                         }
                         is RowItem.MaskItem -> MaskRow(c, item, doc, thumbs, rev)
-                        is RowItem.GroupItem -> GroupRow(c, item, doc, rev)
+                        is RowItem.GroupItem -> GroupRow(c, item, doc, thumbs, rev)
                     }
-                    HorizontalDivider(color = ui.divider, thickness = 0.5.dp)
+                    RowSeparator()
                 }
                 BackgroundRow(c, doc, rev)
             }
@@ -582,19 +616,20 @@ fun LayersPanel(state: EditorState, modifier: Modifier = Modifier) {
 private fun LayersHeader(c: PanelController, doc: ArtDocument, rev: Int) {
     val ui = LocalUi.current
     val state = c.state
+    // Titel 22 sp / 700, links 20 dp; Titelzeile 52 dp; „+“ 22 dp dünn, rechts 18 dp (UI_SPEC §3)
     Row(
-        Modifier.fillMaxWidth().height(52.dp).padding(start = 8.dp, end = 6.dp),
+        Modifier.fillMaxWidth().height(52.dp).padding(start = 12.dp, end = 7.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         Box {
             Row(
                 Modifier
-                    .clip(RoundedCornerShape(8.dp))
+                    .clip(RoundedCornerShape(ROW_RADIUS))
                     .clickable { c.closeTransient(); c.layerMenu = true }
-                    .padding(horizontal = 8.dp, vertical = 6.dp),
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Ebenen", color = ui.text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold)
+                Text("Ebenen", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold)
                 val n = LayerOps.selectedLayers(doc).size
                 if (n > 1) {
                     Spacer(Modifier.width(8.dp))
@@ -604,14 +639,44 @@ private fun LayersHeader(c: PanelController, doc: ArtDocument, rev: Int) {
             if (c.layerMenu) LayerMenu(c, doc) { c.layerMenu = false }
         }
         Spacer(Modifier.weight(1f))
+        // Trefferfläche 44 dp, Symbol 22 dp mittig → sichtbarer rechter Abstand 7 + 11 = 18 dp
         Box(
-            Modifier.size(44.dp).clip(RoundedCornerShape(8.dp)).clickable {
+            Modifier.size(44.dp).clip(RoundedCornerShape(ROW_RADIUS)).clickable {
                 c.closeTransient(); LayerOps.addLayer(state)
-            },
+            }.semantics { contentDescription = "Neue Ebene" },
             contentAlignment = Alignment.Center,
-        ) { Icon(Icons.Filled.Add, "Neue Ebene", tint = ui.icon, modifier = Modifier.size(28.dp)) }
+        ) { ThinPlus(Modifier.size(22.dp), Color.White) }
     }
 }
+
+/** Dünnes „+“ (Strich 1.5 dp), selbst gezeichnet. */
+@Composable
+private fun ThinPlus(modifier: Modifier, color: Color) {
+    Canvas(modifier) {
+        val s = 1.5.dp.toPx()
+        val m = size.minDimension / 2f
+        drawLine(color, Offset(center.x - m, center.y), Offset(center.x + m, center.y), s, StrokeCap.Round)
+        drawLine(color, Offset(center.x, center.y - m), Offset(center.x, center.y + m), s, StrokeCap.Round)
+    }
+}
+
+/** Haarlinie zwischen zwei Zeilen (0.5 dp, Weiß @ 8 %). */
+@Composable
+private fun RowSeparator() {
+    val ui = LocalUi.current
+    val c = if (ui.text.luminance() > 0.5f) SEPARATOR else ui.divider
+    HorizontalDivider(color = c, thickness = 0.5.dp, modifier = Modifier.padding(horizontal = ROW_PAD))
+}
+
+/**
+ * Hintergrund einer Zeile: ausgewählte Zeilen erhalten eine abgerundete Fläche (6 dp, leicht eingerückt),
+ * unausgewählte Zeilen bleiben durchsichtig – nur während des Wischens deckend, damit die Aktionen
+ * dahinter nicht durchscheinen.
+ */
+private fun Modifier.rowBackground(color: Color?, covering: Boolean, panel: Color): Modifier =
+    if (color != null) this.padding(horizontal = ROW_INSET).clip(RoundedCornerShape(ROW_RADIUS)).background(color)
+    else if (covering) this.background(panel.copy(alpha = 1f)).padding(horizontal = ROW_INSET)
+    else this.padding(horizontal = ROW_INSET)
 
 /**
  * Zwei-Finger-Gesten über der Liste. Läuft im Initial-Pass, damit die Zeilen-Gesten (Tippen, Wischen,
@@ -807,11 +872,11 @@ private fun LayerRow(c: PanelController, item: RowItem.LayerItem, doc: ArtDocume
     val groupVisible = LayerGroups.isVisible(doc, l.groupId)
     val solo = LayerOps.soloLayerId(doc) == l.id
 
-    val bg = when {
-        isPrimary -> ui.accent
+    val bg: Color? = when {
+        isPrimary -> PRIMARY_ROW
         isSecondary -> SECONDARY_BLUE
-        pinched -> ui.accent.copy(alpha = 0.25f)
-        else -> ui.panel
+        pinched -> PRIMARY_ROW.copy(alpha = 0.25f)
+        else -> null
     }
     val selected = isPrimary || isSecondary
     val fg = if (selected) Color.White else ui.text
@@ -829,6 +894,8 @@ private fun LayerRow(c: PanelController, item: RowItem.LayerItem, doc: ArtDocume
                 ) { change, amount -> change.consume(); c.dragBy(amount.y) }
             })
     ) {
+        // Deckend, solange gewischt oder (angehoben) gezogen wird
+        val swiping = offset.value != 0f || c.revealedKey == item.key || c.isDragged(item.key)
         // Aktionen hinter der Zeile (nach links wischen)
         if (offset.value < 0f || c.revealedKey == item.key) {
             Row(Modifier.align(Alignment.CenterEnd).fillMaxHeight()) {
@@ -850,32 +917,33 @@ private fun LayerRow(c: PanelController, item: RowItem.LayerItem, doc: ArtDocume
             Modifier
                 .fillMaxSize()
                 .graphicsLayer { translationX = offset.value }
-                .background(bg)
-                .then(if (onto) Modifier.border(2.dp, ui.accent) else Modifier)
+                .rowBackground(bg, swiping, ui.panel)
+                .then(if (onto) Modifier.border(2.dp, ui.accent, RoundedCornerShape(ROW_RADIUS)) else Modifier)
                 .alpha(if (groupVisible) 1f else 0.5f)
-                .padding(start = if (item.inGroup) 24.dp else 10.dp, end = 4.dp),
+                .padding(start = if (item.inGroup) ROW_PAD - ROW_INSET + GROUP_INDENT else ROW_PAD - ROW_INSET, end = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (l.clipping) {
+                // Schnittmaske: kleiner Pfeil nach unten vor der Miniatur
                 Icon(Icons.Filled.ArrowDownward, "Schnittmaske", tint = fgMuted,
-                    modifier = Modifier.size(14.dp))
+                    modifier = Modifier.size(12.dp))
                 Spacer(Modifier.width(4.dp))
             }
-            // Miniatur
+            // Miniatur 40 × 40 dp mit Schachbrett (Transparenz)
             Box(Modifier.size(THUMB)) {
+                val thumbShape = RoundedCornerShape(THUMB_RADIUS)
                 ThumbnailImage(
                     thumbs.image(l.id), thumbs.version, doc.width.toFloat() / doc.height,
                     Modifier
                         .size(THUMB)
-                        .clip(RoundedCornerShape(4.dp))
-                        .border(if (isPrimary) 1.5.dp else 0.5.dp, if (isPrimary) Color.White else ui.divider, RoundedCornerShape(4.dp)),
-                    checker = l.alphaLock,
-                    background = Color.White,
+                        .clip(thumbShape)
+                        .border(0.5.dp, if (l.alphaLock) fg else SEPARATOR, thumbShape),
+                    checker = true,
                 )
                 if (l.text != null) {
                     // Textebene: „A“-Markierung
                     Box(
-                        Modifier.align(Alignment.BottomEnd).padding(2.dp).size(14.dp)
+                        Modifier.align(Alignment.BottomEnd).padding(2.dp).size(13.dp)
                             .clip(RoundedCornerShape(3.dp)).background(Color(0xCC000000)),
                         contentAlignment = Alignment.Center,
                     ) { Text("A", color = Color.White, fontSize = 9.sp, fontWeight = FontWeight.Bold) }
@@ -884,36 +952,42 @@ private fun LayerRow(c: PanelController, item: RowItem.LayerItem, doc: ArtDocume
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                Text(l.name, color = fg, fontSize = 15.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(l.name, color = fg, fontSize = 14.sp, fontWeight = FontWeight.Normal,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis)
                 val flags = buildList {
                     if (l.locked) add("Gesperrt")
+                    if (l.alphaLock) add("Alpha-Sperre")
                     if (l.isReference) add("Referenz")
                     if (l.assisted) add("Assistiert")
                     if (l.isPrivate) add("Privat")
                     if (solo) add("Solo")
                 }
                 if (flags.isNotEmpty()) {
-                    Text(flags.joinToString(" · "), color = fgMuted, fontSize = 12.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    Text(flags.joinToString(" · "), color = fgMuted, fontSize = 11.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
                 }
             }
             if (l.locked) {
-                Icon(Icons.Filled.Lock, null, tint = fgMuted, modifier = Modifier.size(14.dp))
+                Icon(Icons.Filled.Lock, null, tint = fgMuted, modifier = Modifier.size(13.dp))
                 Spacer(Modifier.width(2.dp))
             }
-            // Mischmodus-Kürzel
+            // Mischmodus-Buchstabe (14 sp, Weiß @ 85 %) – antippen öffnet Deckkraft/Mischmodus
             Box(
                 Modifier
-                    .size(width = 38.dp, height = 40.dp)
-                    .clip(RoundedCornerShape(6.dp))
+                    .size(width = 30.dp, height = 40.dp)
+                    .clip(RoundedCornerShape(ROW_RADIUS))
                     .clickable { c.revealedKey = null; c.blendFor = if (c.blendFor == l.id) null else l.id },
                 contentAlignment = Alignment.Center,
             ) {
-                Text(l.blend.short, color = fg, fontSize = 15.sp, fontWeight = FontWeight.SemiBold)
+                Text(l.blend.short, color = if (selected) Color.White else blendLetterColor(ui), fontSize = 14.sp,
+                    fontWeight = FontWeight.Normal)
             }
-            VisibilityBox(l.visible, selected, onLongPress = { LayerOps.toggleSolo(state, l) }) { LayerOps.toggleVisible(state, l) }
+            VisibilityBox(l.visible, onLongPress = { LayerOps.toggleSolo(state, l) }) { LayerOps.toggleVisible(state, l) }
         }
     }
 }
+
+/** Farbe des Mischmodus-Buchstabens / Gruppenpfeils (dunkel: Weiß @ 85 %). */
+private fun blendLetterColor(ui: UiColors): Color = if (ui.text.luminance() > 0.5f) BLEND_LETTER else ui.text.copy(alpha = 0.85f)
 
 /** Maskenzeile: eingerückt über ihrer Ebene, wählbar (dann bemalbar) und mit eigenen Optionen. */
 @Composable
@@ -927,10 +1001,10 @@ private fun MaskRow(c: PanelController, item: RowItem.MaskItem, doc: ArtDocument
     val coupled = isActive && !editing
     val actionsPx = with(density) { (ACTION_WIDTH * 2).toPx() }
     val offset = remember("m" + l.id) { Animatable(0f) }
-    val bg = when {
-        editing -> ui.accent
+    val bg: Color? = when {
+        editing -> PRIMARY_ROW
         coupled -> SECONDARY_BLUE
-        else -> ui.panel
+        else -> null
     }
     val selected = editing || coupled
     val fg = if (selected) Color.White else ui.text
@@ -941,6 +1015,8 @@ private fun MaskRow(c: PanelController, item: RowItem.MaskItem, doc: ArtDocument
             .pointerInput(l.id) { detectTapGestures(onTap = { c.onMaskTap(l) }) }
             .then(swipeModifier(c, item.key, actionsPx, onRight = null, offset)))
     ) {
+        // Deckend, solange gewischt oder (angehoben) gezogen wird
+        val swiping = offset.value != 0f || c.revealedKey == item.key || c.isDragged(item.key)
         if (offset.value < 0f || c.revealedKey == item.key) {
             Row(Modifier.align(Alignment.CenterEnd).fillMaxHeight()) {
                 SwipeAction(if (l.locked) "Entsperren" else "Sperren", if (l.locked) Icons.Filled.LockOpen else Icons.Filled.Lock, LOCK_GREY) {
@@ -956,15 +1032,16 @@ private fun MaskRow(c: PanelController, item: RowItem.MaskItem, doc: ArtDocument
             Modifier
                 .fillMaxSize()
                 .graphicsLayer { translationX = offset.value }
-                .background(bg)
-                .padding(start = if (item.inGroup) 40.dp else 26.dp, end = 4.dp),
+                .rowBackground(bg, swiping, ui.panel)
+                // Maske sitzt eingerückt (eine Miniaturbreite tiefer) über ihrer Ebene
+                .padding(start = ROW_PAD - ROW_INSET + (if (item.inGroup) GROUP_INDENT else 0.dp) + 16.dp, end = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box(Modifier.size(36.dp)) {
+            Box(Modifier.size(MASK_THUMB)) {
+                val shape = RoundedCornerShape(THUMB_RADIUS)
                 ThumbnailImage(
                     thumbs.maskImage(l.id), thumbs.version, doc.width.toFloat() / doc.height,
-                    Modifier.size(36.dp).clip(RoundedCornerShape(4.dp))
-                        .border(if (editing) 1.5.dp else 0.5.dp, if (editing) Color.White else ui.divider, RoundedCornerShape(4.dp)),
+                    Modifier.size(MASK_THUMB).clip(shape).border(0.5.dp, if (editing) Color.White else SEPARATOR, shape),
                     checker = false,
                 )
                 if (c.maskMenuFor == l.id) SideMenu(onDismiss = { c.maskMenuFor = null }) { MaskOptionsContent(c, l) }
@@ -972,29 +1049,36 @@ private fun MaskRow(c: PanelController, item: RowItem.MaskItem, doc: ArtDocument
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
                 Text("Ebenenmaske", color = fg, fontSize = 14.sp, maxLines = 1)
-                if (editing) Text("Malen bearbeitet die Maske", color = fgMuted, fontSize = 12.sp, maxLines = 1)
+                if (editing) Text("Malen bearbeitet die Maske", color = fgMuted, fontSize = 11.sp, maxLines = 1)
             }
-            if (l.locked) Icon(Icons.Filled.Lock, null, tint = fgMuted, modifier = Modifier.size(14.dp).padding(end = 6.dp))
+            if (l.locked) Icon(Icons.Filled.Lock, null, tint = fgMuted, modifier = Modifier.size(13.dp))
+            Spacer(Modifier.width(12.dp))
         }
     }
 }
 
+/**
+ * Gruppenzeile wie eine Ebenenzeile: Miniatur (Mitglieder übereinandergelegt), Name, rechts „>“-Pfeil statt
+ * Mischmodus-Buchstabe (antippen = auf-/zuklappen, ausgeklappt zeigt er nach unten) und Sichtbarkeits-Kästchen.
+ * Antippen der Miniatur/Zeile wählt die Gruppe bzw. öffnet die Gruppenoptionen.
+ */
 @Composable
-private fun GroupRow(c: PanelController, item: RowItem.GroupItem, doc: ArtDocument, rev: Int) {
+private fun GroupRow(c: PanelController, item: RowItem.GroupItem, doc: ArtDocument, thumbs: LayerThumbnailCache, rev: Int) {
     val ui = LocalUi.current
     val state = c.state
     val g = item.group
     val activeInGroup = doc.activeLayer?.groupId == g.id
     val allSelected = activeInGroup && item.members.all { it === doc.activeLayer || it.id in doc.secondarySelection }
     val pinched = c.inPinch(item.key)
-    val bg = when {
-        allSelected -> ui.accent
+    val bg: Color? = when {
+        allSelected -> PRIMARY_ROW
         activeInGroup -> SECONDARY_BLUE
-        pinched -> ui.accent.copy(alpha = 0.25f)
-        else -> ui.panelElevated
+        pinched -> PRIMARY_ROW.copy(alpha = 0.25f)
+        else -> null
     }
     val selected = allSelected || activeInGroup
     val fg = if (selected) Color.White else ui.text
+    val fgMuted = if (selected) Color.White.copy(alpha = 0.75f) else ui.textMuted
     Box(
         rowShell(c, item.key, ROW_HEIGHT, Modifier
             .pointerInput(g.id) { detectTapGestures(onTap = { c.onGroupTap(item.key) }) }
@@ -1004,42 +1088,71 @@ private fun GroupRow(c: PanelController, item: RowItem.GroupItem, doc: ArtDocume
                     onDragEnd = { c.endDrag() },
                     onDragCancel = { c.cancelDrag() },
                 ) { change, amount -> change.consume(); c.dragBy(amount.y) }
-            }).background(bg)
+            })
     ) {
         Row(
-            Modifier.fillMaxSize().alpha(if (g.visible) 1f else 0.5f).padding(start = 2.dp, end = 4.dp),
+            Modifier
+                .fillMaxSize()
+                .rowBackground(bg, c.isDragged(item.key), ui.panel)
+                .alpha(if (g.visible) 1f else 0.5f)
+                .padding(start = ROW_PAD - ROW_INSET, end = 2.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
+            // Miniatur: Inhalte der Mitglieder (unten → oben) auf Schachbrett
+            Box(Modifier.size(THUMB)) {
+                val shape = RoundedCornerShape(THUMB_RADIUS)
+                val images = item.members.asReversed().filter { it.visible }.map { thumbs.image(it.id) }
+                StackedThumbnail(
+                    images, thumbs.version, doc.width.toFloat() / doc.height,
+                    Modifier.size(THUMB).clip(shape).border(0.5.dp, SEPARATOR, shape),
+                )
+                if (c.groupMenuFor == g.id) SideMenu(onDismiss = { c.groupMenuFor = null }) { GroupOptionsContent(c, item) }
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(Modifier.weight(1f)) {
+                Text(g.name, color = fg, fontSize = 14.sp, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                val n = item.members.size
+                Text(
+                    (if (n == 1) "1 Ebene" else "$n Ebenen") + if (g.opacity < 1f) " · ${(g.opacity * 100).roundToInt()} %" else "",
+                    color = fgMuted, fontSize = 11.sp, maxLines = 1,
+                )
+            }
+            // „>“-Pfeil statt Mischmodus: auf-/zuklappen (dreht sich 150 ms)
             Box(
-                Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)).clickable { LayerOps.toggleGroupCollapsed(state, g.id) },
+                Modifier.size(width = 30.dp, height = 40.dp).clip(RoundedCornerShape(ROW_RADIUS))
+                    .clickable { c.revealedKey = null; LayerOps.toggleGroupCollapsed(state, g.id) }
+                    .semantics { contentDescription = if (g.collapsed) "Ausklappen" else "Einklappen" },
                 contentAlignment = Alignment.Center,
             ) {
                 val rot = remember { Animatable(if (g.collapsed) 0f else 90f) }
                 LaunchedEffect(g.collapsed) { rot.animateTo(if (g.collapsed) 0f else 90f, tween(150)) }
-                Icon(
-                    Icons.AutoMirrored.Filled.KeyboardArrowRight,
-                    if (g.collapsed) "Ausklappen" else "Einklappen", tint = fg,
-                    modifier = Modifier.graphicsLayer { rotationZ = rot.value },
+                Chevron(
+                    Modifier.size(12.dp).graphicsLayer { rotationZ = rot.value },
+                    if (selected) Color.White else blendLetterColor(ui),
                 )
             }
-            Box {
-                Icon(Icons.Outlined.Folder, null, tint = fg, modifier = Modifier.size(26.dp))
-                if (c.groupMenuFor == g.id) SideMenu(onDismiss = { c.groupMenuFor = null }) { GroupOptionsContent(c, item) }
-            }
-            Spacer(Modifier.width(10.dp))
-            Column(Modifier.weight(1f)) {
-                Text(g.name, color = fg, fontSize = 15.sp, fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                val n = item.members.size
-                Text(
-                    (if (n == 1) "1 Ebene" else "$n Ebenen") + if (g.opacity < 1f) " · ${(g.opacity * 100).roundToInt()} %" else "",
-                    color = if (selected) Color.White.copy(alpha = 0.75f) else ui.textMuted, fontSize = 12.sp,
-                )
-            }
-            VisibilityBox(g.visible, selected) { LayerOps.toggleGroupVisible(state, g.id) }
+            VisibilityBox(g.visible) { LayerOps.toggleGroupVisible(state, g.id) }
         }
     }
 }
 
+/** Selbst gezeichneter „>“-Pfeil (Strich 1.6 dp). */
+@Composable
+private fun Chevron(modifier: Modifier, color: Color) {
+    Canvas(modifier) {
+        val s = 1.6.dp.toPx()
+        val w = size.width
+        val h = size.height
+        val p = Path().apply {
+            moveTo(w * 0.32f, h * 0.12f)
+            lineTo(w * 0.72f, h * 0.5f)
+            lineTo(w * 0.32f, h * 0.88f)
+        }
+        drawPath(p, color, style = Stroke(width = s, cap = StrokeCap.Round, join = StrokeJoin.Round))
+    }
+}
+
+/** Unterste Zeile „Hintergrundfarbe“: Farbfläche als Miniatur, antippen = Farbwahl. */
 @Composable
 private fun BackgroundRow(c: PanelController, doc: ArtDocument, rev: Int) {
     val ui = LocalUi.current
@@ -1048,19 +1161,21 @@ private fun BackgroundRow(c: PanelController, doc: ArtDocument, rev: Int) {
             .fillMaxWidth()
             .height(ROW_HEIGHT)
             .clickable { c.closeTransient(); c.bgDialog = true }
-            .padding(start = 10.dp, end = 4.dp),
+            .padding(start = ROW_PAD, end = ROW_INSET + 2.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
+        val shape = RoundedCornerShape(THUMB_RADIUS)
         Box(
             Modifier
                 .size(THUMB)
-                .clip(RoundedCornerShape(4.dp))
+                .clip(shape)
                 .background(Color(doc.backgroundColor))
-                .border(0.5.dp, ui.divider, RoundedCornerShape(4.dp))
+                .border(0.5.dp, SEPARATOR, shape)
         )
         Spacer(Modifier.width(12.dp))
-        Text("Hintergrundfarbe", color = ui.text, fontSize = 15.sp, modifier = Modifier.weight(1f))
-        VisibilityBox(doc.backgroundVisible, false) { LayerOps.toggleBackgroundVisible(c.state) }
+        Text("Hintergrundfarbe", color = ui.text, fontSize = 14.sp, modifier = Modifier.weight(1f),
+            maxLines = 1, overflow = TextOverflow.Ellipsis)
+        VisibilityBox(doc.backgroundVisible) { LayerOps.toggleBackgroundVisible(c.state) }
     }
 }
 
@@ -1068,34 +1183,52 @@ private fun BackgroundRow(c: PanelController, doc: ArtDocument, rev: Int) {
 // Bausteine
 // =============================================================================================
 
-/** Sichtbarkeits-Kästchen (22 dp). Halten = [onLongPress] (Solo-Sichtbarkeit). */
+/**
+ * Sichtbarkeits-Kästchen 20 × 20 dp, Radius 4 dp, 1.2 dp weißer Rand; angehakt = weißes Häkchen auf weißer
+ * Kontur (keine Füllung, kein Blau). Trefferfläche 40 dp. Halten = [onLongPress] (Solo-Sichtbarkeit).
+ * Das Häkchen blendet in 150 ms ein/aus.
+ */
 @Composable
-private fun VisibilityBox(checked: Boolean, onSelectedRow: Boolean, onLongPress: (() -> Unit)? = null, onToggle: () -> Unit) {
+private fun VisibilityBox(checked: Boolean, onLongPress: (() -> Unit)? = null, onToggle: () -> Unit) {
     val ui = LocalUi.current
-    val fill = if (onSelectedRow) Color.White else ui.accent
-    val mark = if (onSelectedRow) ui.accent else Color.White
-    val outline = if (onSelectedRow) Color.White.copy(alpha = 0.8f) else ui.textMuted
+    val stroke = if (ui.text.luminance() > 0.5f) Color.White else ui.text
+    val progress by animateFloatAsState(if (checked) 1f else 0f, tween(150), label = "check")
     Box(
         Modifier
-            .size(44.dp)
-            .clip(RoundedCornerShape(6.dp))
+            .size(40.dp)
+            .clip(RoundedCornerShape(ROW_RADIUS))
             .pointerInput(onLongPress != null) {
                 detectTapGestures(
                     onTap = { onToggle() },
                     onLongPress = if (onLongPress != null) { _ -> onLongPress() } else null,
                 )
+            }
+            .semantics {
+                contentDescription = if (checked) "Sichtbar" else "Ausgeblendet"
             },
         contentAlignment = Alignment.Center,
     ) {
-        Box(
-            Modifier
-                .size(22.dp)
-                .clip(RoundedCornerShape(5.dp))
-                .background(if (checked) fill else Color.Transparent)
-                .border(1.5.dp, if (checked) fill else outline, RoundedCornerShape(5.dp)),
-            contentAlignment = Alignment.Center,
-        ) {
-            if (checked) Icon(Icons.Filled.Check, "Sichtbar", tint = mark, modifier = Modifier.size(16.dp))
+        Canvas(Modifier.size(CHECKBOX)) {
+            val bw = 1.2.dp.toPx()
+            val r = 4.dp.toPx()
+            drawRoundRect(
+                stroke.copy(alpha = 0.6f + 0.4f * progress),
+                topLeft = Offset(bw / 2f, bw / 2f),
+                size = Size(size.width - bw, size.height - bw),
+                cornerRadius = CornerRadius(r, r),
+                style = Stroke(bw),
+            )
+            if (progress > 0f) {
+                val w = size.width
+                val h = size.height
+                val p = Path().apply {
+                    moveTo(w * 0.26f, h * 0.52f)
+                    lineTo(w * 0.43f, h * 0.68f)
+                    lineTo(w * 0.75f, h * 0.33f)
+                }
+                drawPath(p, stroke.copy(alpha = progress),
+                    style = Stroke(width = 1.6.dp.toPx(), cap = StrokeCap.Round, join = StrokeJoin.Round))
+            }
         }
     }
 }

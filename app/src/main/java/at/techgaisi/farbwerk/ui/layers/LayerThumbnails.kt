@@ -86,13 +86,35 @@ class LayerThumbnailCache {
     }
 }
 
+
+/** Helles Schachbrett der Miniaturen (Transparenz), wie im Vorbild: Weiß / Hellgrau. */
+private val CHECKER_LIGHT = ComposeColor(0xFFFFFFFF)
+private val CHECKER_DARK = ComposeColor(0xFFCFCFD3)
+
+/** Kantenlänge eines Schachbrettfelds in dp (40-dp-Miniatur → 8 × 8 Felder). */
+private const val CHECKER_CELL_DP = 5f
+
 /**
- * Zeichnet eine Miniatur seitenverhältnistreu. [checker] = Schachbrett (Transparenz, z. B. Alpha-Sperre),
+ * Zeichnet eine Miniatur seitenverhältnistreu und mittig in die verfügbare Fläche.
+ *
+ * [checker] = Schachbrett unter dem Inhalt (transparente Bereiche sichtbar, Standard im Ebenen-Panel),
  * sonst [background] (null = transparent).
  */
 @Composable
 fun ThumbnailImage(
     image: ImageBitmap?, version: Int, docAspect: Float, modifier: Modifier, checker: Boolean = true,
+    background: ComposeColor? = null,
+) {
+    StackedThumbnail(listOf(image), version, docAspect, modifier, checker, background)
+}
+
+/**
+ * Miniatur aus mehreren übereinandergelegten Ebenenbildern ([images] von unten nach oben),
+ * z. B. die Vorschau einer Gruppe. Nicht vorhandene Bilder (null) werden übersprungen.
+ */
+@Composable
+fun StackedThumbnail(
+    images: List<ImageBitmap?>, version: Int, docAspect: Float, modifier: Modifier, checker: Boolean = true,
     background: ComposeColor? = null,
 ) {
     Canvas(modifier) {
@@ -103,10 +125,9 @@ fun ThumbnailImage(
         if (docAspect > boxAspect) { w = size.width; h = size.width / docAspect } else { h = size.height; w = size.height * docAspect }
         val left = (size.width - w) / 2f
         val top = (size.height - h) / 2f
-        if (!checker && background != null) drawRect(background, Offset(left, top), Size(w, h))
         if (checker) {
-            drawRect(ComposeColor.White, Offset(left, top), Size(w, h))
-            val cell = 5f * density
+            drawRect(CHECKER_LIGHT, Offset(left, top), Size(w, h))
+            val cell = CHECKER_CELL_DP * density
             var y = 0
             while (y * cell < h) {
                 var x = 0
@@ -114,20 +135,25 @@ fun ThumbnailImage(
                     if ((x + y) % 2 == 1) {
                         val cw = minOf(cell, w - x * cell)
                         val ch = minOf(cell, h - y * cell)
-                        drawRect(ComposeColor(0xFFD6D6D6), Offset(left + x * cell, top + y * cell), Size(cw, ch))
+                        drawRect(CHECKER_DARK, Offset(left + x * cell, top + y * cell), Size(cw, ch))
                     }
                     x++
                 }
                 y++
             }
+        } else if (background != null) {
+            drawRect(background, Offset(left, top), Size(w, h))
         }
-        if (image != null) {
+        val dstOffset = IntOffset(left.roundToInt(), top.roundToInt())
+        val dstSize = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1))
+        for (image in images) {
+            if (image == null) continue
             drawImage(
                 image,
                 srcOffset = IntOffset.Zero,
                 srcSize = IntSize(image.width, image.height),
-                dstOffset = IntOffset(left.roundToInt(), top.roundToInt()),
-                dstSize = IntSize(w.roundToInt().coerceAtLeast(1), h.roundToInt().coerceAtLeast(1)),
+                dstOffset = dstOffset,
+                dstSize = dstSize,
             )
         }
     }

@@ -70,6 +70,7 @@ class UndoManager(private val state: EditorState) {
         trim()
         state.markDirty()
         version++
+        try { at.techgaisi.farbwerk.timelapse.Timelapse.onChange(state) } catch (_: Throwable) {}
     }
 
     fun undo(): Boolean {

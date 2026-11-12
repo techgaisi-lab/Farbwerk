@@ -1,11 +1,13 @@
 package at.techgaisi.farbwerk.ui.selection
 
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
@@ -20,58 +22,84 @@ import androidx.compose.material.icons.outlined.Layers
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.selection.ClipboardOps
-import at.techgaisi.farbwerk.ui.common.PanelCard
-import at.techgaisi.farbwerk.ui.theme.LocalUi
+import at.techgaisi.farbwerk.ui.reference.FloatingTokens
+import at.techgaisi.farbwerk.ui.reference.FloatingWindowCard
+import at.techgaisi.farbwerk.ui.reference.FloatingWindowHeader
+import kotlin.math.roundToInt
 
-/** Schwebendes Kopieren-&-Einfügen-Menü (wenn state.copyPasteMenuVisible). */
+/**
+ * Verschiebung des Fensters gegenüber seiner Ausgangslage (px). Bleibt erhalten, solange die App läuft,
+ * damit das Fenster beim erneuten Öffnen dort erscheint, wo es zuletzt lag.
+ */
+private var windowOffset by mutableStateOf(Offset.Zero)
+
+/**
+ * Schwebendes Fenster „Kopieren & Einfügen“ (wenn state.copyPasteMenuVisible), UI_SPEC §8:
+ * Greifleiste (Ziehen verschiebt), Titel 18 sp / 700, Schließen-Kreis, darunter eine Reihe aus
+ * 6 Aktionen (Symbol 18 dp + Beschriftung 10 sp), gleich verteilt.
+ *
+ * [modifier] enthält die Ausgangslage (vom Editor: mittig); das Ziehen verschiebt relativ dazu.
+ */
 @Composable
 fun CopyPasteMenu(state: EditorState, modifier: Modifier = Modifier) {
     fun run(op: (EditorState) -> Unit) {
         state.copyPasteMenuVisible = false
         op(state)
     }
-    PanelCard(modifier.width(300.dp), title = "Kopieren & Einfügen") {
-        Column(Modifier.padding(start = 8.dp, end = 8.dp, bottom = 10.dp)) {
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                MenuTile(Icons.Outlined.ContentCut, "Ausschneiden", Modifier.weight(1f)) { run(ClipboardOps::cut) }
-                MenuTile(Icons.Outlined.ContentCopy, "Kopieren", Modifier.weight(1f)) { run(ClipboardOps::copy) }
-                MenuTile(Icons.Outlined.FilterNone, "Alles kopieren", Modifier.weight(1f)) { run(ClipboardOps::copyAll) }
-            }
-            Spacer(Modifier.size(6.dp))
-            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-                MenuTile(Icons.Outlined.Layers, "Duplizieren", Modifier.weight(1f)) { run(ClipboardOps::duplicate) }
-                MenuTile(Icons.Outlined.ContentPasteGo, "Ausschneiden & Einfügen", Modifier.weight(1f)) {
-                    run(ClipboardOps::cutAndPaste)
-                }
-                MenuTile(Icons.Outlined.ContentPaste, "Einfügen", Modifier.weight(1f), enabled = ClipboardOps.hasClip) {
-                    run(ClipboardOps::paste)
-                }
-            }
+    FloatingWindowCard(
+        modifier
+            .offset { IntOffset(windowOffset.x.roundToInt(), windowOffset.y.roundToInt()) }
+            .width(372.dp)
+    ) {
+        FloatingWindowHeader(
+            title = "Kopieren & Einfügen",
+            onClose = { state.copyPasteMenuVisible = false },
+            onDrag = { d -> windowOffset += d },
+        )
+        Row(Modifier.fillMaxWidth().padding(start = 6.dp, end = 6.dp, top = 2.dp, bottom = 12.dp)) {
+            val m = Modifier.weight(1f)
+            ActionItem(Icons.Outlined.ContentCut, "Ausschneiden", m) { run(ClipboardOps::cut) }
+            ActionItem(Icons.Outlined.ContentCopy, "Kopieren", m) { run(ClipboardOps::copy) }
+            ActionItem(Icons.Outlined.FilterNone, "Alles kopieren", m) { run(ClipboardOps::copyAll) }
+            ActionItem(Icons.Outlined.Layers, "Duplizieren", m) { run(ClipboardOps::duplicate) }
+            ActionItem(Icons.Outlined.ContentPasteGo, "Ausschneiden & Einfügen", m) { run(ClipboardOps::cutAndPaste) }
+            ActionItem(Icons.Outlined.ContentPaste, "Einfügen", m, enabled = ClipboardOps.hasClip) { run(ClipboardOps::paste) }
         }
     }
 }
 
+/** Aktion: Symbol 18 dp (weiß @ 85 %) über Beschriftung 10 sp (@ 55 %), höchstens zwei Zeilen. */
 @Composable
-private fun MenuTile(icon: ImageVector, label: String, modifier: Modifier, enabled: Boolean = true, onClick: () -> Unit) {
-    val ui = LocalUi.current
+private fun ActionItem(icon: ImageVector, label: String, modifier: Modifier, enabled: Boolean = true, onClick: () -> Unit) {
     Column(
         modifier
-            .clip(RoundedCornerShape(10.dp))
-            .clickable(enabled = enabled, onClick = onClick)
-            .padding(vertical = 10.dp, horizontal = 4.dp),
+            .clip(RoundedCornerShape(6.dp))
+            .clickable(remember { MutableInteractionSource() }, indication = null, enabled = enabled, onClick = onClick)
+            .alpha(if (enabled) 1f else 0.35f)
+            .padding(vertical = 6.dp, horizontal = 1.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
-        Icon(icon, label, tint = if (enabled) ui.icon else ui.iconMuted.copy(alpha = 0.5f), modifier = Modifier.size(26.dp))
-        Spacer(Modifier.size(4.dp))
-        Text(label, color = if (enabled) ui.text else ui.textMuted, fontSize = 11.sp,
-            textAlign = androidx.compose.ui.text.style.TextAlign.Center, lineHeight = 13.sp)
+        Icon(icon, null, tint = FloatingTokens.iconIdle, modifier = Modifier.size(18.dp))
+        Spacer(Modifier.height(5.dp))
+        Text(
+            label, color = FloatingTokens.textSecondary, fontSize = 10.sp, lineHeight = 12.sp,
+            textAlign = TextAlign.Center, maxLines = 2,
+        )
     }
 }

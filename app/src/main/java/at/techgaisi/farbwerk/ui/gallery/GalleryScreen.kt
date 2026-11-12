@@ -7,12 +7,21 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
-import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.BoxScope
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.foundation.layout.ColumnScope
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.ui.graphics.TransformOrigin
+import kotlin.math.max
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.Orientation
 import androidx.compose.foundation.gestures.draggable
 import androidx.compose.foundation.gestures.rememberDraggableState
@@ -105,7 +114,11 @@ private sealed class GalleryItem {
     }
 }
 
-/** Galerie (Startbildschirm): Werke, Stapel, Import, Neue Leinwand. */
+/**
+ * Galerie (Startbildschirm, UI_SPEC §9): schwarzer Hintergrund, Kopfzeile mit „Farbwerk“ und Textknöpfen,
+ * Raster mit unten ausgerichteten Miniaturen, Stapel als gedrehte Karten, „Neue Leinwand“ als Popover am „+“.
+ * Halten & Ziehen stapelt/sortiert, Halten öffnet das Kontextmenü, Aufziehen mit zwei Fingern zeigt die Vorschau.
+ */
 @Composable
 fun GalleryScreen(state: EditorState) {
     val ui = LocalUi.current
@@ -238,28 +251,45 @@ fun GalleryScreen(state: EditorState) {
         }
     }
 
-    val bg = ui.bar.copy(alpha = 1f)
+    /** Neue Leinwand aus dem Popover anlegen und öffnen (im geöffneten Stapel direkt dort einsortieren). */
+    fun createCanvas(spec: CanvasSpec) {
+        showNew = false
+        val doc = ArtDocument.create(spec.name, spec.width, spec.height)
+        doc.dpi = spec.dpi
+        doc.backgroundColor = spec.background
+        openStackId?.let { sid -> scope.launch(Dispatchers.IO) { store.moveToStack(listOf(doc.id), sid) } }
+        state.openDocument(doc)
+    }
+
+    val bg = GalleryTokens.galleryBg
+    // Die Kopfzeile schwebt (leicht transluzent) über dem Raster, die Werke scrollen darunter durch.
+    val headerTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
+    val headerHeight = headerTop + HeaderHeight
     Box(Modifier.fillMaxSize().background(bg)) {
-        Column(Modifier.fillMaxSize()) {
-            // ------------------------------------------------------- Kopfzeile
+        Box(Modifier.fillMaxSize()) {
+            // ------------------------------------------------------- Kopfzeile (64 dp)
             Row(
-                Modifier.fillMaxWidth().statusBarsPadding().height(60.dp).padding(horizontal = 20.dp),
+                Modifier.zIndex(2f).fillMaxWidth()
+                    .background(Brush.verticalGradient(0f to bg.copy(alpha = 0.94f), 1f to bg.copy(alpha = 0.80f)))
+                    .onGloballyPositioned { drag.headerBottom = it.size.height.toFloat() }
+                    .statusBarsPadding().height(HeaderHeight).padding(start = 28.dp, end = 14.dp),
                 verticalAlignment = Alignment.CenterVertically
             ) {
                 if (openStack != null) {
-                    Row(Modifier.clip(RoundedCornerShape(8.dp))
-                        .background(if (drag.overHeader) ui.accent.copy(alpha = 0.25f) else Color.Transparent)
+                    // Im Stapel: „‹ Galerie“ (auch Ablageziel zum Herausziehen) + Stapelname
+                    Row(Modifier.offset(x = (-8).dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (drag.overHeader) GalleryTokens.accent.copy(alpha = 0.25f) else Color.Transparent)
                         .clickable { openStackId = null; selectMode = false; selected.clear() }
-                        .padding(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                        Icon(ActionIcons.Back, "Zurück", tint = ui.accent, modifier = Modifier.size(22.dp))
-                        Text("Galerie", color = ui.accent, fontSize = 16.sp)
+                        .padding(horizontal = 4.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Icon(ActionIcons.Back, "Zurück", tint = GalleryTokens.textPrimary, modifier = Modifier.size(22.dp))
+                        Text("Galerie", color = GalleryTokens.textPrimary, fontSize = 15.sp)
                     }
-                    Spacer(Modifier.width(12.dp))
-                    Text(openStack.name, color = ui.text, fontSize = 24.sp, fontWeight = FontWeight.Bold,
+                    Spacer(Modifier.width(10.dp))
+                    Text(openStack.name, color = GalleryTokens.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.Bold,
                         maxLines = 1, overflow = TextOverflow.Ellipsis,
-                        modifier = Modifier.clickable { renameStack = openStack })
+                        modifier = Modifier.weight(1f, fill = false).clickable { renameStack = openStack })
                 } else {
-                    Text("Galerie", color = ui.text, fontSize = 26.sp, fontWeight = FontWeight.Bold)
+                    Text("Farbwerk", color = GalleryTokens.textPrimary, fontSize = 28.sp, fontWeight = FontWeight.Bold)
                 }
                 Spacer(Modifier.weight(1f))
                 if (selectMode) {
@@ -291,29 +321,38 @@ fun GalleryScreen(state: EditorState) {
                     HeaderButton("Foto") {
                         photoLauncher.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
                     }
+                    // Dünnes „+“: Anker des Popovers „Neue Leinwand“
                     Box(
-                        Modifier.padding(start = 6.dp).size(36.dp).clip(CircleShape).clickable { showNew = true },
+                        Modifier.padding(start = 6.dp).size(44.dp).clip(CircleShape).clickable { showNew = true },
                         contentAlignment = Alignment.Center
-                    ) { Icon(ActionIcons.Plus, "Neue Leinwand", tint = ui.icon, modifier = Modifier.size(26.dp)) }
+                    ) {
+                        ThinPlus(26.dp)
+                        if (showNew) NewCanvasDialog(onDismiss = { showNew = false }, onCreate = ::createCanvas)
+                    }
                 }
             }
 
             // ------------------------------------------------------- Raster
             if (loaded && items.isEmpty()) {
-                Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+                Box(Modifier.fillMaxSize().padding(top = headerHeight), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text("Noch keine Werke", color = ui.text, fontSize = 18.sp, fontWeight = FontWeight.Medium)
+                        Text("Noch keine Werke", color = GalleryTokens.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
                         Spacer(Modifier.height(6.dp))
-                        Text("Tippe auf + für eine neue Leinwand oder importiere ein Bild.", color = ui.textMuted, fontSize = 14.sp)
+                        Text("Tippe auf + für eine neue Leinwand oder importiere ein Bild.", color = GalleryTokens.textSecondary, fontSize = 14.sp)
                     }
                 }
-            } else {
+            } else BoxWithConstraints(Modifier.fillMaxSize()) {
+                // Querformat-Tablet: 4 Spalten (sehr breite Bildschirme: mehr), sonst adaptiv mit ~150 dp Kacheln
+                val landscapeTablet = maxWidth > maxHeight && maxWidth >= 700.dp
+                val colGap = if (landscapeTablet) 46.dp else 28.dp
+                val columns = if (landscapeTablet) GridCells.Fixed(max(4, ((maxWidth.value - 56f + 46f) / 276f).toInt()))
+                else GridCells.Adaptive(150.dp)
                 LazyVerticalGrid(
                     state = gridState,
-                    columns = GridCells.Adaptive(210.dp),
-                    contentPadding = PaddingValues(start = 20.dp, end = 20.dp, top = 8.dp, bottom = 32.dp),
-                    horizontalArrangement = Arrangement.spacedBy(22.dp),
-                    verticalArrangement = Arrangement.spacedBy(22.dp),
+                    columns = columns,
+                    contentPadding = PaddingValues(start = 28.dp, end = 28.dp, top = headerHeight + 10.dp, bottom = 32.dp),
+                    horizontalArrangement = Arrangement.spacedBy(colGap),
+                    verticalArrangement = Arrangement.spacedBy(34.dp),
                     modifier = Modifier.fillMaxSize().navigationBarsPadding()
                         .onGloballyPositioned { drag.gridOrigin = it.positionInRoot() },
                 ) {
@@ -336,41 +375,44 @@ fun GalleryScreen(state: EditorState) {
                                     preview = projectsHere to projectsHere.indexOfFirst { it.id == item.info.id }.coerceAtLeast(0)
                                 } else Modifier)
                         ) {
-                        // Einfügemarke links neben der Kachel
-                        if (drag.dragKey != null && drag.insertBefore == item.key) {
-                            Box(Modifier.align(Alignment.CenterStart).offset(x = (-12).dp).width(3.dp).height(150.dp)
-                                .clip(RoundedCornerShape(2.dp)).background(ui.accent))
-                        }
-                        val highlight = drag.stackTarget == item.key
-                        when (item) {
-                            is GalleryItem.Project -> ProjectTile(
-                                state, item.info, bg,
-                                selectMode = selectMode, selected = item.info.id in selected,
-                                inStack = item.info.stackId != null,
-                                onOpen = {
-                                    if (selectMode) {
-                                        if (item.info.id in selected) selected.remove(item.info.id) else selected.add(item.info.id)
-                                    } else open(item.info)
-                                },
-                                onRename = { renameTarget = item.info },
-                                onShare = { shareTarget = item.info },
-                                onDuplicate = { duplicate(listOf(item.info.id)) },
-                                onDelete = { deleteTargets = listOf(item.info) },
-                                onUnstack = { scope.launch(Dispatchers.IO) { store.moveToStack(listOf(item.info.id), null) } },
-                                menu = drag.menuKey == item.key,
-                                onMenuDismiss = { drag.menuKey = null },
-                                highlight = highlight,
-                            )
-                            is GalleryItem.Stack -> StackTile(
-                                state, item,
-                                onOpen = { if (!selectMode) openStackId = item.stack.id },
-                                onRename = { renameStack = item.stack },
-                                onDissolve = { scope.launch(Dispatchers.IO) { store.dissolveStack(item.stack.id) } },
-                                menu = drag.menuKey == item.key,
-                                onMenuDismiss = { drag.menuKey = null },
-                                highlight = highlight,
-                            )
-                        }
+                            val highlight = drag.stackTarget == item.key
+                            when (item) {
+                                is GalleryItem.Project -> ProjectTile(
+                                    state, item.info, bg,
+                                    selectMode = selectMode, selected = item.info.id in selected,
+                                    inStack = item.info.stackId != null,
+                                    onOpen = {
+                                        if (selectMode) {
+                                            if (item.info.id in selected) selected.remove(item.info.id) else selected.add(item.info.id)
+                                        } else open(item.info)
+                                    },
+                                    onRename = { renameTarget = item.info },
+                                    onShare = { shareTarget = item.info },
+                                    onDuplicate = { duplicate(listOf(item.info.id)) },
+                                    onDelete = { deleteTargets = listOf(item.info) },
+                                    onUnstack = { scope.launch(Dispatchers.IO) { store.moveToStack(listOf(item.info.id), null) } },
+                                    menu = drag.menuKey == item.key,
+                                    onMenuDismiss = { drag.menuKey = null },
+                                    highlight = highlight,
+                                )
+                                is GalleryItem.Stack -> StackTile(
+                                    state, item,
+                                    onOpen = { if (!selectMode) openStackId = item.stack.id },
+                                    onRename = { renameStack = item.stack },
+                                    onDissolve = { scope.launch(Dispatchers.IO) { store.dissolveStack(item.stack.id) } },
+                                    menu = drag.menuKey == item.key,
+                                    onMenuDismiss = { drag.menuKey = null },
+                                    highlight = highlight,
+                                )
+                            }
+                            // Einfügemarke mittig in der Spaltenlücke links neben der Kachel (Höhe der Miniatur)
+                            if (drag.dragKey != null && drag.insertBefore == item.key) {
+                                BoxWithConstraints(Modifier.matchParentSize()) {
+                                    Box(Modifier.align(Alignment.TopStart).offset(x = -(colGap / 2) - 1.5.dp)
+                                        .width(3.dp).height(maxWidth)
+                                        .clip(RoundedCornerShape(2.dp)).background(GalleryTokens.accent))
+                                }
+                            }
                         }
                     }
                 }
@@ -388,15 +430,6 @@ fun GalleryScreen(state: EditorState) {
     }
 
     // ----------------------------------------------------------- Dialoge
-    if (showNew) NewCanvasDialog(onDismiss = { showNew = false }) { spec ->
-        showNew = false
-        val doc = ArtDocument.create(spec.name, spec.width, spec.height)
-        doc.dpi = spec.dpi
-        doc.backgroundColor = spec.background
-        openStackId?.let { sid -> scope.launch(Dispatchers.IO) { store.moveToStack(listOf(doc.id), sid) } }
-        state.openDocument(doc)
-    }
-
     renameTarget?.let { info ->
         var name by remember(info.id) { mutableStateOf(info.name) }
         FwDialog("Umbenennen", onDismiss = { renameTarget = null }, confirmLabel = "Sichern", onConfirm = {
@@ -456,16 +489,42 @@ fun GalleryScreen(state: EditorState) {
     BusyDialog()
 }
 
+
+/** Höhe der Galerie-Kopfzeile (UI_SPEC §9), ohne Statusleiste. */
+private val HeaderHeight = 64.dp
+
+/** Textknopf der Kopfzeile: 15 sp weiß, sichtbarer Abstand 22 dp (je 11 dp Innenabstand). */
 @Composable
 private fun HeaderButton(label: String, enabled: Boolean = true, destructive: Boolean = false, bold: Boolean = false,
                          onClick: () -> Unit) {
-    val ui = LocalUi.current
     Text(
         label,
-        color = when { !enabled -> ui.textMuted.copy(alpha = 0.5f); destructive -> Color(0xFFFF5A52); else -> ui.accent },
-        fontSize = 16.sp, fontWeight = if (bold) FontWeight.SemiBold else FontWeight.Normal,
-        modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable(enabled = enabled, onClick = onClick)
-            .padding(horizontal = 10.dp, vertical = 8.dp)
+        color = when {
+            !enabled -> GalleryTokens.textPrimary.copy(alpha = 0.35f)
+            destructive -> GalleryTokens.destructive
+            else -> GalleryTokens.textPrimary
+        },
+        fontSize = 15.sp, fontWeight = if (bold) FontWeight.SemiBold else FontWeight.Normal,
+        modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable(enabled = enabled, onClick = onClick)
+            .padding(horizontal = 11.dp, vertical = 8.dp)
+    )
+}
+
+/** Kontextmenü im Panel-Stil (dunkel, Radius 13 dp). */
+@Composable
+private fun TileMenu(expanded: Boolean, onDismiss: () -> Unit, content: @Composable ColumnScope.() -> Unit) {
+    DropdownMenu(
+        expanded = expanded, onDismissRequest = onDismiss,
+        containerColor = GalleryTokens.panel, shape = RoundedCornerShape(GalleryTokens.panelRadius),
+        content = content,
+    )
+}
+
+@Composable
+private fun TileMenuItem(label: String, destructive: Boolean = false, onClick: () -> Unit) {
+    DropdownMenuItem(
+        text = { Text(label, color = if (destructive) GalleryTokens.destructive else GalleryTokens.textPrimary, fontSize = 15.sp) },
+        onClick = onClick,
     )
 }
 
@@ -478,27 +537,46 @@ private fun rememberThumb(state: EditorState, id: String, modified: Long): Bitma
     return b
 }
 
-/** Vorschau mit gewahrtem Seitenverhältnis, mittig in einer festen Fläche. */
+/**
+ * Miniatur mit gewahrtem Seitenverhältnis, unten mittig in der Fläche ausgerichtet; Ecken 2 dp, leichter Schatten.
+ * [overlay] liegt exakt über der Miniatur (z. B. Auswahlhaken).
+ */
 @Composable
-private fun Thumbnail(bmp: Bitmap?, w: Int, h: Int, modifier: Modifier = Modifier, highlight: Boolean = false) {
-    val ui = LocalUi.current
+private fun Thumbnail(
+    bmp: Bitmap?, w: Int, h: Int, modifier: Modifier = Modifier, highlight: Boolean = false,
+    overlay: @Composable BoxScope.() -> Unit = {},
+) {
     BoxWithConstraints(modifier, contentAlignment = Alignment.BottomCenter) {
         val ratio = if (h > 0) w / h.toFloat() else 1f
         val boxRatio = maxWidth / maxHeight
         val (tw, th) = if (ratio > boxRatio) maxWidth to maxWidth / ratio else maxHeight * ratio to maxHeight
+        val shape = RoundedCornerShape(2.dp)
         Box(
-            Modifier.size(tw, th).shadow(6.dp, RoundedCornerShape(3.dp)).clip(RoundedCornerShape(3.dp))
+            Modifier.size(tw, th).shadow(4.dp, shape, ambientColor = Color.Black, spotColor = Color.Black).clip(shape)
                 .background(Color.White)
-                .border(if (highlight) 3.dp else 0.dp, if (highlight) LocalUi.current.accent else Color.Transparent, RoundedCornerShape(3.dp))
         ) {
             if (bmp != null) {
                 Image(bmp.asImageBitmap(), null, contentScale = ContentScale.FillBounds, modifier = Modifier.fillMaxSize())
-            } else Box(Modifier.fillMaxSize().background(ui.panelElevated))
+            } else Box(Modifier.fillMaxSize().background(GalleryTokens.panelInset))
+            if (highlight) Box(Modifier.fillMaxSize().border(3.dp, GalleryTokens.accent, shape))
+            overlay()
         }
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+/** Name (12 sp, 600) und Untertitel (10 sp @ 55 %) linksbündig unter der Miniatur. */
+@Composable
+private fun TileCaption(title: String, subtitle: String, onTitleClick: (() -> Unit)? = null) {
+    Spacer(Modifier.height(6.dp))
+    Text(
+        title, color = GalleryTokens.textPrimary, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+        overflow = TextOverflow.Ellipsis,
+        modifier = if (onTitleClick != null) Modifier.clip(RoundedCornerShape(3.dp)).clickable(onClick = onTitleClick) else Modifier
+    )
+    Spacer(Modifier.height(1.dp))
+    Text(subtitle, color = GalleryTokens.textSecondary, fontSize = 10.sp, maxLines = 1)
+}
+
 @Composable
 private fun ProjectTile(
     state: EditorState,
@@ -517,22 +595,23 @@ private fun ProjectTile(
     onMenuDismiss: () -> Unit,
     highlight: Boolean,
 ) {
-    val ui = LocalUi.current
     val thumb = rememberThumb(state, info.id, info.modified)
     val density = LocalDensity.current
     val revealPx = with(density) { 186.dp.toPx() }
     val offset = remember { Animatable(0f) }
     val scope = rememberCoroutineScope()
-    fun closeSwipe() { scope.launch { offset.animateTo(0f) } }
+    fun closeSwipe() { scope.launch { offset.animateTo(0f, spring(dampingRatio = 0.8f)) } }
 
     Box(Modifier.fillMaxWidth()) {
-        // Hinter der Kachel: Wisch-Aktionen
+        // Hinter der Kachel: Wisch-Aktionen (Höhe der Miniaturfläche)
         if (offset.value < -1f) {
-            Row(Modifier.align(Alignment.CenterEnd).height(160.dp).padding(bottom = 0.dp),
-                horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
-                SwipeButton("Teilen", ActionIcons.Share, ui.accent) { closeSwipe(); onShare() }
-                SwipeButton("Duplizieren", ActionIcons.Duplicate, Color(0xFF6E6E78)) { closeSwipe(); onDuplicate() }
-                SwipeButton("Löschen", ActionIcons.Trash, Color(0xFFE5483F)) { closeSwipe(); onDelete() }
+            BoxWithConstraints(Modifier.matchParentSize()) {
+                Row(Modifier.align(Alignment.TopEnd).height(maxWidth),
+                    horizontalArrangement = Arrangement.spacedBy(4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    SwipeButton("Teilen", ActionIcons.Share, GalleryTokens.accent) { closeSwipe(); onShare() }
+                    SwipeButton("Duplizieren", ActionIcons.Duplicate, Color(0xFF636366)) { closeSwipe(); onDuplicate() }
+                    SwipeButton("Löschen", ActionIcons.Trash, GalleryTokens.destructive) { closeSwipe(); onDelete() }
+                }
             }
         }
         Column(
@@ -544,41 +623,38 @@ private fun ProjectTile(
                     enabled = !selectMode,
                     state = rememberDraggableState { d -> scope.launch { offset.snapTo((offset.value + d).coerceIn(-revealPx, 0f)) } },
                     onDragStopped = { v ->
+                        // federnd einrasten
                         val open = offset.value < -revealPx / 2 || v < -800f
-                        offset.animateTo(if (open) -revealPx else 0f)
+                        offset.animateTo(if (open) -revealPx else 0f, spring(dampingRatio = 0.8f), initialVelocity = v)
                     },
                 )
         ) {
             Box(
-                Modifier.fillMaxWidth().height(160.dp)
-                    .clickable { if (offset.value < -1f) closeSwipe() else onOpen() }
+                Modifier.fillMaxWidth().aspectRatio(1f)
+                    .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+                        if (offset.value < -1f) closeSwipe() else onOpen()
+                    }
             ) {
-                Thumbnail(thumb, info.width, info.height, Modifier.fillMaxSize(), highlight)
-                if (selectMode) {
-                    Box(
-                        Modifier.align(Alignment.TopEnd).padding(6.dp).size(24.dp).clip(CircleShape)
-                            .background(if (selected) ui.accent else Color(0x66000000))
-                            .border(1.5.dp, Color.White, CircleShape),
-                        contentAlignment = Alignment.Center
-                    ) { if (selected) Icon(ActionIcons.Check, null, tint = Color.White, modifier = Modifier.size(16.dp)) }
+                Thumbnail(thumb, info.width, info.height, Modifier.fillMaxSize(), highlight) {
+                    if (selectMode) {
+                        if (selected) Box(Modifier.fillMaxSize().background(Color(0x33000000)))
+                        Box(
+                            Modifier.align(Alignment.BottomEnd).padding(6.dp).size(22.dp).clip(CircleShape)
+                                .background(if (selected) GalleryTokens.accent else Color(0x66000000))
+                                .border(1.5.dp, Color.White, CircleShape),
+                            contentAlignment = Alignment.Center
+                        ) { if (selected) Icon(ActionIcons.Check, null, tint = Color.White, modifier = Modifier.size(14.dp)) }
+                    }
                 }
-                DropdownMenu(expanded = menu, onDismissRequest = onMenuDismiss) {
-                    DropdownMenuItem(text = { Text("Teilen") }, onClick = { onMenuDismiss(); onShare() })
-                    DropdownMenuItem(text = { Text("Duplizieren") }, onClick = { onMenuDismiss(); onDuplicate() })
-                    DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { onMenuDismiss(); onRename() })
-                    if (inStack) DropdownMenuItem(text = { Text("Aus Stapel entfernen") }, onClick = { onMenuDismiss(); onUnstack() })
-                    DropdownMenuItem(text = { Text("Löschen", color = Color(0xFFFF5A52)) }, onClick = { onMenuDismiss(); onDelete() })
+                TileMenu(menu, onMenuDismiss) {
+                    TileMenuItem("Teilen") { onMenuDismiss(); onShare() }
+                    TileMenuItem("Duplizieren") { onMenuDismiss(); onDuplicate() }
+                    TileMenuItem("Umbenennen") { onMenuDismiss(); onRename() }
+                    if (inStack) TileMenuItem("Aus Stapel entfernen") { onMenuDismiss(); onUnstack() }
+                    TileMenuItem("Löschen", destructive = true) { onMenuDismiss(); onDelete() }
                 }
             }
-            Spacer(Modifier.height(8.dp))
-            Text(
-                info.name, color = ui.text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-                modifier = Modifier.align(Alignment.CenterHorizontally).clip(RoundedCornerShape(4.dp))
-                    .clickable(enabled = !selectMode, onClick = onRename).padding(horizontal = 4.dp, vertical = 1.dp)
-            )
-            Text("${info.width} × ${info.height} px", color = ui.textMuted, fontSize = 12.sp,
-                modifier = Modifier.align(Alignment.CenterHorizontally))
+            TileCaption(info.name, "${info.width} × ${info.height}px", onTitleClick = if (selectMode) null else onRename)
         }
     }
 }
@@ -586,7 +662,7 @@ private fun ProjectTile(
 @Composable
 private fun SwipeButton(label: String, icon: ImageVector, color: Color, onClick: () -> Unit) {
     Column(
-        Modifier.width(58.dp).fillMaxHeight().clip(RoundedCornerShape(10.dp)).background(color).clickable(onClick = onClick),
+        Modifier.width(58.dp).fillMaxHeight().clip(RoundedCornerShape(6.dp)).background(color).clickable(onClick = onClick),
         horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Center
     ) {
         Icon(icon, null, tint = Color.White, modifier = Modifier.size(20.dp))
@@ -595,36 +671,44 @@ private fun SwipeButton(label: String, icon: ImageVector, color: Color, onClick:
     }
 }
 
-@OptIn(ExperimentalFoundationApi::class)
+/** Lage der Karten im Stapel (von vorne nach hinten): Drehung in Grad und Versatz in dp. */
+private val stackCardPose = listOf(
+    Triple(-2.5f, 0f, 0f),
+    Triple(5f, 7f, -5f),
+    Triple(-7.5f, -6f, -8f),
+)
+
 @Composable
 private fun StackTile(state: EditorState, item: GalleryItem.Stack, onOpen: () -> Unit, onRename: () -> Unit, onDissolve: () -> Unit,
                       menu: Boolean, onMenuDismiss: () -> Unit, highlight: Boolean) {
-    val ui = LocalUi.current
     val top = item.members.sortedByDescending { it.modified }.take(3)
+    val density = LocalDensity.current
     Column(Modifier.fillMaxWidth()) {
         Box(
-            Modifier.fillMaxWidth().height(160.dp).clip(RoundedCornerShape(6.dp))
-                .border(if (highlight) 3.dp else 0.dp, if (highlight) ui.accent else Color.Transparent, RoundedCornerShape(6.dp))
-                .clickable(onClick = onOpen),
-            contentAlignment = Alignment.Center
+            Modifier.fillMaxWidth().aspectRatio(1f)
+                .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null, onClick = onOpen),
         ) {
-            // Gestapelte Vorschauen, hinterste zuerst
-            top.reversed().forEachIndexed { i, p ->
-                val depth = top.size - 1 - i
+            // Leicht gedrehte, versetzte Karten – hinterste zuerst; Ursprung unten mittig, damit sie unten bündig bleiben
+            for (depth in top.indices.reversed()) {
+                val p = top[depth]
+                val (rot, dx, dy) = stackCardPose[depth]
                 val thumb = rememberThumb(state, p.id, p.modified)
-                Thumbnail(thumb, p.width, p.height,
-                    Modifier.fillMaxSize().padding(start = (depth * 10).dp, end = (20 - depth * 10).dp,
-                        top = (20 - depth * 10).dp, bottom = (depth * 10).dp))
+                Thumbnail(
+                    thumb, p.width, p.height,
+                    Modifier.fillMaxSize().padding(start = 8.dp, end = 8.dp, top = 10.dp, bottom = 4.dp).graphicsLayer {
+                        rotationZ = rot
+                        translationX = with(density) { dx.dp.toPx() }
+                        translationY = with(density) { dy.dp.toPx() }
+                        transformOrigin = TransformOrigin(0.5f, 0.9f)
+                    },
+                    highlight = highlight && depth == 0,
+                )
             }
-            DropdownMenu(expanded = menu, onDismissRequest = onMenuDismiss) {
-                DropdownMenuItem(text = { Text("Umbenennen") }, onClick = { onMenuDismiss(); onRename() })
-                DropdownMenuItem(text = { Text("Stapel auflösen") }, onClick = { onMenuDismiss(); onDissolve() })
+            TileMenu(menu, onMenuDismiss) {
+                TileMenuItem("Umbenennen") { onMenuDismiss(); onRename() }
+                TileMenuItem("Stapel auflösen") { onMenuDismiss(); onDissolve() }
             }
         }
-        Spacer(Modifier.height(8.dp))
-        Text(item.stack.name, color = ui.text, fontSize = 14.sp, fontWeight = FontWeight.Medium, maxLines = 1,
-            overflow = TextOverflow.Ellipsis, modifier = Modifier.align(Alignment.CenterHorizontally))
-        Text(if (item.members.size == 1) "1 Werk" else "${item.members.size} Werke", color = ui.textMuted, fontSize = 12.sp,
-            modifier = Modifier.align(Alignment.CenterHorizontally))
+        TileCaption(item.stack.name, if (item.members.size == 1) "1 Werk" else "${item.members.size} Werke")
     }
 }

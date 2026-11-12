@@ -68,14 +68,23 @@ class PopoverAnchors {
 fun Modifier.popoverAnchor(anchors: PopoverAnchors, key: String): Modifier =
     onGloballyPositioned { anchors.rects[key] = it.boundsInWindow() }
 
-/** Breite je Panel (Anleitung §30.3). */
+/** Breite je Panel (UI_SPEC §3). Die Pinselbibliothek nutzt [popoverWidth] mit Bildschirmbreite (400–470 dp). */
 fun popoverWidth(panel: Panel): Dp = when (panel) {
-    Panel.BRUSHES -> 480.dp
-    Panel.LAYERS -> 320.dp
-    Panel.COLORS -> 332.dp
-    Panel.ACTIONS -> 340.dp
-    Panel.ADJUSTMENTS -> 280.dp
+    Panel.BRUSHES -> UiMetrics.brushPanelMin
+    Panel.LAYERS -> UiMetrics.layersPanel
+    Panel.COLORS -> UiMetrics.colorsPanel
+    Panel.ACTIONS -> UiMetrics.actionsPanel
+    Panel.ADJUSTMENTS -> UiMetrics.adjustPanel
     Panel.NONE -> 0.dp
+}
+
+/**
+ * Breite je Panel abhängig von der Bildschirmbreite: Die Pinselbibliothek wächst auf großen Bildschirmen
+ * von 400 dp bis 470 dp (≈ 40 % der Breite), alle anderen Panels haben feste Breiten.
+ */
+fun popoverWidth(panel: Panel, screenWidth: Dp): Dp = when (panel) {
+    Panel.BRUSHES -> (screenWidth * 0.4f).coerceIn(UiMetrics.brushPanelMin, UiMetrics.brushPanelMax)
+    else -> popoverWidth(panel)
 }
 
 /** Anker-Symbol eines Panels. Die Pinselbibliothek hängt am gerade aktiven Malwerkzeug. */
@@ -95,10 +104,10 @@ fun anchorKeyFor(state: EditorState, panel: Panel): String = when (panel) {
 /**
  * Gemeinsamer Popover-Host für alle Panels der oberen Leiste.
  *
- *  - Verankert das Panel unter seinem Symbol, mit kleinem Pfeil (16 × 8 dp), der auf das Symbol zeigt;
- *    das Panel wird horizontal am Symbol zentriert und an den Bildschirmrändern eingepasst.
- *  - Öffnen: Einblenden + Skalieren 0,92 → 1,0 ausgehend von der Pfeilspitze, gefedert (~200 ms).
- *  - Schließen: Ausblenden + Skalieren auf 0,95 (130 ms).
+ *  - UI_SPEC §3: Kartenoberkante 6 dp unter der oberen Leiste, Pfeil (Dreieck 18 × 9 dp, Panelfarbe) zeigt
+ *    mittig auf das auslösende Symbol. Das Panel wird am Symbol zentriert und bleibt ≥ 8 dp vom Bildschirmrand.
+ *  - Farbe `panel`, Radius 13 dp, Schatten 0 8 24 @ 45 % (PanelCard); der Pfeil teilt den Schatten.
+ *  - Öffnen: Skalierung 0,94 → 1 + Einblenden, Ursprung = Pfeilspitze, 180 ms ease-out. Schließen 120 ms.
  *  - Wechsel: altes Panel sofort weg, neues mit Öffnen-Animation.
  *  - Tippen daneben schließt: die Leinwand schließt Popovers beim ersten Kontakt (malt dabei nicht).
  *
@@ -153,12 +162,13 @@ fun PopoverHost(
 
             val anchor = anchors[anchorKeyFor(state, panel)]?.translate(-hostOrigin)
             val bar = anchors[PopoverAnchors.Keys.BAR]?.translate(-hostOrigin)
-            val widthPx = popoverWidth(panel).toPx().coerceAtMost(screenW - 2 * margin)
+            val widthPx = popoverWidth(panel, screenW.toDp()).toPx().coerceAtMost(screenW - 2 * margin)
             val anchorCx = anchor?.center?.x ?: (screenW - margin - widthPx / 2)
-            val anchorBottom = maxOf(anchor?.bottom ?: 0f, bar?.bottom ?: 0f)
+            val anchorBottom = bar?.bottom ?: anchor?.bottom ?: 0f
             val left = (anchorCx - widthPx / 2).coerceIn(margin, (screenW - margin - widthPx).coerceAtLeast(margin))
-            val top = anchorBottom + gap
-            val cardTop = top + arrowH
+            // Kartenoberkante 6 dp unter der Leiste; der Pfeil (9 dp) ragt darüber hinaus Richtung Symbol
+            val cardTop = anchorBottom + gap
+            val top = cardTop - arrowH.roundToInt()
             val maxH = minOf(screenH * UiMetrics.popoverMaxHeightFraction, screenH - cardTop - margin).coerceAtLeast(120.dp.toPx())
             // Pfeil innerhalb der abgerundeten Ecken halten
             val radius = UiMetrics.popoverRadius.toPx()
@@ -179,21 +189,20 @@ fun PopoverHost(
                     }
             ) {
                 Column {
-                    // Pfeil zum Symbol (gleiche Farbe wie die Karte, überlappt sie um 1 px gegen Nahtlinien)
-                    Canvas(Modifier.width(widthPx.toDp()).size(width = widthPx.toDp(), height = UiMetrics.popoverArrowH + 1.dp)) {
+                    // Pfeil zum Symbol (gleiche Farbe wie die Karte). Ohne Überlappung, da das Panel transluzent ist –
+                    // eine Überdeckung würde als dunklere Naht sichtbar. Höhe auf ganze Pixel gerundet.
+                    Canvas(Modifier.size(width = widthPx.toDp(), height = arrowH.roundToInt().toFloat().toDp())) {
                         val path = Path().apply {
                             moveTo(arrowX - arrowW / 2, size.height)
                             // weich abgerundete Spitze
-                            lineTo(arrowX - 2.dp.toPx(), 1.5.dp.toPx())
-                            quadraticBezierTo(arrowX, 0f, arrowX + 2.dp.toPx(), 1.5.dp.toPx())
+                            lineTo(arrowX - 1.6.dp.toPx(), 1.4.dp.toPx())
+                            quadraticBezierTo(arrowX, 0f, arrowX + 1.6.dp.toPx(), 1.4.dp.toPx())
                             lineTo(arrowX + arrowW / 2, size.height)
                             close()
                         }
                         drawPath(path, ui.panel)
                     }
-                    Box(Modifier.offset { IntOffset(0, -1.dp.roundToPx()) }) {
-                        content(panel, Modifier.width(widthPx.toDp()).heightIn(max = maxH.toDp()))
-                    }
+                    content(panel, Modifier.width(widthPx.toDp()).heightIn(max = maxH.toDp()))
                 }
             }
         }

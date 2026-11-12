@@ -13,8 +13,15 @@ import androidx.compose.animation.fadeOut
 import androidx.compose.animation.scaleIn
 import androidx.compose.animation.scaleOut
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Size
+import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -45,7 +52,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -80,8 +86,8 @@ class ReferenceWindowState {
     var image by mutableStateOf<Bitmap?>(null)
     var x by mutableFloatStateOf(-1f)
     var y by mutableFloatStateOf(-1f)
-    var w by mutableFloatStateOf(300f)
-    var h by mutableFloatStateOf(240f)
+    var w by mutableFloatStateOf(270f)
+    var h by mutableFloatStateOf(236f)
     var zoom by mutableFloatStateOf(1f)
     var panX by mutableFloatStateOf(0f)
     var panY by mutableFloatStateOf(0f)
@@ -99,6 +105,8 @@ class ReferenceWindowState {
 @Composable
 fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
     val ui = LocalUi.current
+    // Schwebendes Farben-Panel (Ersatz-Einhängung, solange der Editor keinen eigenen Host einbindet)
+    at.techgaisi.farbwerk.ui.color.FloatingColorPanelFallback(state)
     val doc = state.document ?: return
     val ctx = state.context
     val scope = rememberCoroutineScope()
@@ -135,26 +143,16 @@ fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
             }
             val content: Bitmap? = if (rs.mode == ReferenceMode.CANVAS) live else rs.image
 
-            Column(
+            FloatingWindowCard(
                 Modifier.offset { IntOffset(with(density) { rs.x.dp.roundToPx() }, with(density) { rs.y.dp.roundToPx() }) }
                     .size(rs.w.dp, rs.h.dp)
-                    .shadow(16.dp, RoundedCornerShape(12.dp)).clip(RoundedCornerShape(12.dp))
-                    .background(ui.panel).border(0.5.dp, ui.divider, RoundedCornerShape(12.dp))
             ) {
-                // Griff
-                Box(
-                    Modifier.fillMaxWidth().height(24.dp).pointerInput(Unit) {
-                        detectDragGestures { ch, d ->
-                            ch.consume()
-                            rs.x += d.x / density.density; rs.y += d.y / density.density
-                        }
-                    },
-                    contentAlignment = Alignment.Center,
-                ) {
-                    Box(Modifier.width(36.dp).height(4.dp).clip(CircleShape).background(ui.iconMuted))
-                    Text("✕", color = ui.textMuted, fontSize = 13.sp,
-                        modifier = Modifier.align(Alignment.CenterEnd).clickable { rs.visible = false }.padding(horizontal = 10.dp))
-                }
+                // Kopf: Greifleiste + Titel + Schließen-Kreis; Ziehen verschiebt das Fenster
+                FloatingWindowHeader(
+                    title = "Referenz",
+                    onClose = { rs.visible = false },
+                    onDrag = { d -> rs.x += d.x / density.density; rs.y += d.y / density.density },
+                )
                 // Inhalt
                 Box(
                     Modifier.weight(1f).fillMaxWidth().clip(RoundedCornerShape(0.dp)).background(Color(0xFF1E1E20))
@@ -181,29 +179,47 @@ fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
                             }
                         )
                     } else if (rs.mode == ReferenceMode.IMAGE) {
-                        Text("Kein Bild", color = ui.textMuted, fontSize = 13.sp)
+                        Text("Kein Bild", color = FloatingTokens.textSecondary, fontSize = 13.sp)
                     }
                     // Größe ändern: untere Ecken
                     ResizeCorner(Modifier.align(Alignment.BottomEnd)) { dx, dy ->
-                        rs.w = (rs.w + dx / density.density).coerceIn(160f, maxW); rs.h = (rs.h + dy / density.density).coerceIn(140f, maxH)
+                        rs.w = (rs.w + dx / density.density).coerceIn(200f, maxW); rs.h = (rs.h + dy / density.density).coerceIn(160f, maxH)
                     }
                     ResizeCorner(Modifier.align(Alignment.BottomStart)) { dx, dy ->
-                        val nw = (rs.w - dx / density.density).coerceIn(160f, maxW)
+                        val nw = (rs.w - dx / density.density).coerceIn(200f, maxW)
                         rs.x += rs.w - nw; rs.w = nw
-                        rs.h = (rs.h + dy / density.density).coerceIn(140f, maxH)
+                        rs.h = (rs.h + dy / density.density).coerceIn(160f, maxH)
                     }
                 }
+                // Segment-Leiste unten (panelInset, Radius 8 dp): Leinwand | Bild
                 AnimatedVisibility(rs.controls) {
-                    Row(Modifier.fillMaxWidth().padding(4.dp), horizontalArrangement = Arrangement.SpaceEvenly) {
-                        RefButton("Leinwand", rs.mode == ReferenceMode.CANVAS) { rs.mode = ReferenceMode.CANVAS; rs.resetView() }
-                        RefButton("Bild", rs.mode == ReferenceMode.IMAGE) {
-                            if (rs.image == null) picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
-                            else { rs.mode = ReferenceMode.IMAGE; rs.resetView() }
+                    Row(
+                        Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp)
+                            .clip(RoundedCornerShape(8.dp)).background(FloatingTokens.panelInset).padding(3.dp),
+                        horizontalArrangement = Arrangement.spacedBy(3.dp),
+                    ) {
+                        Segment(SegmentIcon.CANVAS, "Leinwand", rs.mode == ReferenceMode.CANVAS, Modifier.weight(1f)) {
+                            rs.mode = ReferenceMode.CANVAS; rs.resetView()
                         }
-                        if (rs.mode == ReferenceMode.IMAGE && rs.image != null) {
-                            RefButton("Neues Bild", false) { picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)) }
-                            RefButton("Bild löschen", false, destructive = true) {
-                                rs.image = null; rs.mode = ReferenceMode.CANVAS
+                        Box(Modifier.weight(1f)) {
+                            var menu by remember { mutableStateOf(false) }
+                            Segment(SegmentIcon.IMAGE, "Bild", rs.mode == ReferenceMode.IMAGE, Modifier.fillMaxWidth()) {
+                                when {
+                                    rs.image == null -> picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                    // erneutes Tippen auf das aktive „Bild“: Bild ersetzen oder entfernen
+                                    rs.mode == ReferenceMode.IMAGE -> menu = true
+                                    else -> { rs.mode = ReferenceMode.IMAGE; rs.resetView() }
+                                }
+                            }
+                            DropdownMenu(menu, onDismissRequest = { menu = false }) {
+                                DropdownMenuItem(text = { Text("Neues Bild") }, onClick = {
+                                    menu = false
+                                    picker.launch(PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly))
+                                })
+                                DropdownMenuItem(text = { Text("Bild löschen", color = ui.destructive) }, onClick = {
+                                    menu = false
+                                    rs.image = null; rs.mode = ReferenceMode.CANVAS; rs.resetView()
+                                })
                             }
                         }
                     }
@@ -240,13 +256,45 @@ private fun ResizeCorner(modifier: Modifier, onDrag: (Float, Float) -> Unit) {
     ) { Box(Modifier.size(8.dp).clip(CircleShape).background(Color(0x99FFFFFF))) }
 }
 
+private enum class SegmentIcon { CANVAS, IMAGE }
+
+/**
+ * Segment der unteren Leiste: eigenes Symbol (14 dp) + Beschriftung 12 sp; aktiv = `accent`-Kachel (Radius 6 dp).
+ */
 @Composable
-private fun RefButton(label: String, active: Boolean, destructive: Boolean = false, onClick: () -> Unit) {
-    val ui = LocalUi.current
-    Text(
-        label, fontSize = 12.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal,
-        color = when { destructive -> Color(0xFFFF453A); active -> ui.accent; else -> ui.text },
-        modifier = Modifier.clip(RoundedCornerShape(7.dp)).background(if (active) ui.panelElevated else Color.Transparent)
-            .clickable(onClick = onClick).padding(horizontal = 10.dp, vertical = 6.dp)
-    )
+private fun Segment(icon: SegmentIcon, label: String, active: Boolean, modifier: Modifier, onClick: () -> Unit) {
+    val tint = if (active) Color.White else FloatingTokens.iconIdle
+    Row(
+        modifier
+            .height(28.dp)
+            .clip(RoundedCornerShape(6.dp))
+            .background(if (active) FloatingTokens.accent else Color.Transparent)
+            .clickable(remember { MutableInteractionSource() }, indication = null, onClick = onClick),
+        horizontalArrangement = Arrangement.Center,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        androidx.compose.foundation.Canvas(Modifier.size(14.dp)) {
+            val sw = 1.4.dp.toPx()
+            val s = size.minDimension
+            when (icon) {
+                // Leinwand: Rahmen mit gefüllter linker Hälfte (Ansicht des eigenen Werks)
+                SegmentIcon.CANVAS -> {
+                    drawRoundRect(tint, Offset(sw / 2, s * 0.2f), Size(s - sw, s * 0.6f), CornerRadius(3.dp.toPx()), style = Stroke(sw))
+                    drawRoundRect(tint, Offset(sw * 1.8f, s * 0.2f + sw * 1.3f), Size(s * 0.42f, s * 0.6f - sw * 2.6f), CornerRadius(1.5.dp.toPx()))
+                }
+                // Bild: Rahmen mit Berg und Sonne
+                SegmentIcon.IMAGE -> {
+                    drawRoundRect(tint, Offset(sw / 2, s * 0.16f), Size(s - sw, s * 0.68f), CornerRadius(2.dp.toPx()), style = Stroke(sw))
+                    val path = Path().apply {
+                        moveTo(s * 0.18f, s * 0.74f); lineTo(s * 0.42f, s * 0.46f); lineTo(s * 0.58f, s * 0.62f)
+                        lineTo(s * 0.68f, s * 0.52f); lineTo(s * 0.84f, s * 0.74f); close()
+                    }
+                    drawPath(path, tint)
+                    drawCircle(tint, s * 0.07f, Offset(s * 0.7f, s * 0.34f))
+                }
+            }
+        }
+        Spacer(Modifier.width(5.dp))
+        Text(label, color = tint, fontSize = 12.sp, fontWeight = if (active) FontWeight.SemiBold else FontWeight.Normal, maxLines = 1)
+    }
 }

@@ -1,16 +1,13 @@
 package at.techgaisi.farbwerk.ui.brush
 
-import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material3.AlertDialog
@@ -22,22 +19,16 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
-import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.TextFieldValue
-import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import at.techgaisi.farbwerk.ui.theme.LocalUi
@@ -49,6 +40,18 @@ internal object BrushUiColors {
     val neutralAction = Color(0xFF5A5A60)
     val secondarySelection = Color(0xFF1E3E78)
     val handleGreen = Color(0xFF34C759)
+
+    // Tokens der Pinselbibliothek laut UI_SPEC §0/§4 (lokal, solange Theme.kt sie nicht führt)
+    /** `panelInset`: Hintergrund der Set-Kacheln. */
+    val tile = Color(0xFF3A3A3C)
+    /** `rowPressed`: Kachel/Zeile gedrückt. */
+    val tilePressed = Color(0xFF48484A)
+    /** `accent` / `selectRow` (Pinsel): ausgewählte Kachel und Pinselzeile. */
+    val selection = Color(0xFF0A84FF)
+    /** Set-Symbole inaktiv (weiß @ 80 %). */
+    val tileIcon = Color(0xCCFFFFFF)
+    /** `textSecondary`: weiß @ 55 %. */
+    val textSecondary = Color(0x8CFFFFFF)
 }
 
 /** Texteingabe-Dialog (Umbenennen, Neues Set, Symbol). */
@@ -120,34 +123,6 @@ internal fun ConfirmDialog(
         },
         dismissButton = { TextButton(onClick = onDismiss) { Text("Abbrechen", color = ui.text) } },
     )
-}
-
-/**
- * Eigenes Set-Symbol (wenn kein Emoji gesetzt ist): stilisierter Pinselstrich in einem abgerundeten Quadrat.
- */
-@Composable
-internal fun SetGlyph(icon: String?, selected: Boolean, size: Dp = 28.dp) {
-    val ui = LocalUi.current
-    Box(
-        Modifier.size(size).clip(RoundedCornerShape(7.dp))
-            .background(if (selected) Color(0x33FFFFFF) else ui.panelElevated),
-        contentAlignment = Alignment.Center,
-    ) {
-        if (icon != null) {
-            Text(icon, fontSize = 15.sp)
-        } else {
-            val col = if (selected) Color.White else ui.textMuted
-            Canvas(Modifier.size(size * 0.62f)) {
-                val w = this.size.width; val h = this.size.height
-                val p = Path().apply {
-                    moveTo(w * 0.1f, h * 0.8f)
-                    cubicTo(w * 0.35f, h * 0.2f, w * 0.55f, h * 1.0f, w * 0.9f, h * 0.2f)
-                }
-                drawPath(p, col, style = Stroke(width = w * 0.16f, cap = StrokeCap.Round))
-                drawCircle(col, radius = w * 0.07f, center = Offset(w * 0.9f, h * 0.2f))
-            }
-        }
-    }
 }
 
 /** Einfache Menüzeile für eigene Popup-Menüs. */

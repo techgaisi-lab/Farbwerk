@@ -3,16 +3,16 @@ package at.techgaisi.farbwerk.ui.color
 import android.graphics.Bitmap
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Text
@@ -23,23 +23,25 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.DrawScope
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import at.techgaisi.farbwerk.color.ColorMath
-import at.techgaisi.farbwerk.ui.theme.LocalUi
 import kotlin.math.atan2
 import kotlin.math.cos
 import kotlin.math.hypot
+import androidx.compose.ui.unit.min
 import kotlin.math.roundToInt
 import kotlin.math.sin
 
@@ -52,48 +54,58 @@ enum class HarmonyMode(val label: String, val offsets: List<Float>) {
     TETRADIC("Tetradisch", listOf(60f, 180f, 240f)),
 }
 
-/** Zuletzt gewählter Modus (bleibt erhalten, solange die App läuft). */
-private var lastHarmonyMode = HarmonyMode.COMPLEMENTARY
+/** Gewählter Harmonie-Modus (bleibt erhalten, solange die App läuft; Kopfzeile zeigt/ändert ihn). */
+object HarmonySettings {
+    var mode by mutableStateOf(HarmonyMode.COMPLEMENTARY)
+}
 
 /**
- * Harmonie: Farbrad (Winkel = Farbton, Radius = Sättigung) mit Hauptgriff und Harmoniegriffen.
- * Ziehen bewegt die Hauptfarbe; Tippen auf einen Harmoniegriff (oder ein Feld darunter) wählt diese Farbe.
+ * Antippbarer Modusname für die Kopfzeile des Farben-Panels (Untertitel, 12 sp @ 55 %): öffnet die
+ * Liste der Harmonie-Modi.
  */
 @Composable
-fun HarmonyTab(model: HsvModel) {
-    val ui = LocalUi.current
-    var mode by remember { mutableStateOf(lastHarmonyMode) }
+fun HarmonyModeSubtitle(color: Color) {
     var menu by remember { mutableStateOf(false) }
-    val renderer = remember { WheelRenderer() }
-    // true, wenn die Geste auf einem Harmoniegriff begann (dann Tippen = Farbe wählen)
-    var tappedHarmony by remember { mutableStateOf<Int?>(null) }
-
-    fun harmonyColors(): List<Int> = mode.offsets.map { ColorMath.hsvToArgb(model.h + it, model.s, model.v) }
-
-    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
-        Box {
-            Text(
-                mode.label + "  ▾", color = ui.accent, fontSize = 14.sp, fontWeight = FontWeight.Medium,
-                modifier = Modifier.clip(RoundedCornerShape(6.dp)).clickable { menu = true }.padding(6.dp)
-            )
-            DropdownMenu(menu, onDismissRequest = { menu = false }) {
-                HarmonyMode.entries.forEach { m ->
-                    DropdownMenuItem(
-                        text = { Text(m.label, fontWeight = if (m == mode) FontWeight.SemiBold else FontWeight.Normal) },
-                        onClick = { mode = m; lastHarmonyMode = m; menu = false }
-                    )
-                }
+    Box {
+        Text(
+            HarmonySettings.mode.label, color = color, fontSize = 12.sp, maxLines = 1,
+            modifier = Modifier.clickable(remember { MutableInteractionSource() }, indication = null) { menu = true }
+        )
+        DropdownMenu(menu, onDismissRequest = { menu = false }) {
+            HarmonyMode.entries.forEach { m ->
+                DropdownMenuItem(
+                    text = { Text(m.label, fontWeight = if (m == HarmonySettings.mode) FontWeight.SemiBold else FontWeight.Normal) },
+                    onClick = { HarmonySettings.mode = m; menu = false }
+                )
             }
         }
-        Box(Modifier.fillMaxWidth().padding(horizontal = 16.dp), contentAlignment = Alignment.Center) {
+    }
+}
+
+/**
+ * Harmonie: Farbrad (Winkel = Farbton, Sättigung nach innen zu Weiß) mit Hauptgriff (Ø 22 dp) und
+ * Harmoniegriffen (Ø 12 dp), beide mit 2 dp weißem Rand; darunter die dünne Helligkeitslinie.
+ * Ziehen bewegt die Hauptfarbe; Tippen auf einen Harmoniegriff wählt diese Farbe.
+ * Der Modus wird über den Untertitel der Kopfzeile gewählt ([HarmonyModeSubtitle]).
+ */
+@Composable
+fun HarmonyTab(model: HsvModel, modifier: Modifier = Modifier) {
+    val mode = HarmonySettings.mode
+    val renderer = remember { WheelRenderer() }
+    // Index des Harmoniegriffs, auf dem die Geste begann (dann Tippen = Farbe wählen)
+    var tappedHarmony by remember { mutableStateOf<Int?>(null) }
+
+    Column(modifier.fillMaxSize().padding(start = 18.dp, end = 18.dp, top = 4.dp, bottom = 2.dp)) {
+        BoxWithConstraints(Modifier.weight(1f).fillMaxWidth(), contentAlignment = Alignment.Center) {
+            val d = min(maxWidth, maxHeight).coerceAtLeast(120.dp)
             Canvas(
                 Modifier
-                    .fillMaxWidth()
-                    .aspectRatio(1f)
+                    .size(d)
                     .colorGestures(
                         onPress = { p, s ->
                             val g = WheelGeometry(s)
-                            val hit = mode.offsets.indexOfFirst { off ->
+                            val m = HarmonySettings.mode
+                            val hit = m.offsets.indexOfFirst { off ->
                                 (g.point(model.h + off, model.s) - p).getDistance() < g.hitRadius
                             }
                             if (hit >= 0 && (g.point(model.h, model.s) - p).getDistance() > g.hitRadius) {
@@ -110,44 +122,62 @@ fun HarmonyTab(model: HsvModel) {
                             val hit = tappedHarmony
                             tappedHarmony = null
                             if (hit != null) {
-                                model.pick(ColorMath.hsvToArgb(model.h + mode.offsets[hit], model.s, model.v))
+                                val off = HarmonySettings.mode.offsets.getOrNull(hit)
+                                if (off != null) model.pick(ColorMath.hsvToArgb(model.h + off, model.s, model.v))
                             } else model.release()
                         },
                     )
             ) {
                 val g = WheelGeometry(IntSize(size.width.toInt(), size.height.toInt()))
-                val d = (g.radius * 2).roundToInt().coerceAtLeast(2)
+                val dp = (g.radius * 2).roundToInt().coerceAtLeast(2)
                 // Rad mit voller Helligkeit einmal pro Größe rendern; Helligkeit als schwarze Überlagerung
-                // (HSB: V · Farbe) – dadurch kostet das Ziehen am Helligkeitsregler keine Pixelrechnung.
-                drawImage(renderer.image(d), IntOffset((g.center.x - d / 2f).roundToInt(), (g.center.y - d / 2f).roundToInt()))
+                // (HSB: V · Farbe) – dadurch kostet das Ziehen an der Helligkeitslinie keine Pixelrechnung.
+                drawImage(renderer.image(dp), IntOffset((g.center.x - dp / 2f).roundToInt(), (g.center.y - dp / 2f).roundToInt()))
                 if (model.v < 1f) drawCircle(Color.Black.copy(alpha = 1f - model.v), g.radius, g.center)
-                drawCircle(ui.divider, g.radius, g.center, style = Stroke(1.dp.toPx()))
-                // Verbindungslinien
-                val main = g.point(model.h, model.s)
                 mode.offsets.forEach { off ->
-                    drawLine(Color.White.copy(alpha = 0.7f), main, g.point(model.h + off, model.s), 1.5.dp.toPx())
+                    drawHandle(g.point(model.h + off, model.s), 6.dp.toPx(), ColorMath.hsvToArgb(model.h + off, model.s, model.v).toUiColor())
                 }
-                mode.offsets.forEach { off ->
-                    drawKnob(g.point(model.h + off, model.s), 9.dp.toPx(), ColorMath.hsvToArgb(model.h + off, model.s, model.v).toUiColor())
-                }
-                drawKnob(main, 13.dp.toPx(), model.argb.toUiColor())
+                drawHandle(g.point(model.h, model.s), 11.dp.toPx(), model.argb.toUiColor())
             }
         }
-        Spacer(Modifier.height(10.dp))
-        // Harmoniefarben als Felder
-        Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Swatch(model.argb, 40.dp, Modifier.weight(1f), selected = true, corner = 6.dp) {}
-            harmonyColors().forEach { c ->
-                Swatch(c, 40.dp, Modifier.weight(1f), corner = 6.dp) { model.pick(c) }
-            }
-        }
-        Spacer(Modifier.height(10.dp))
-        LabeledSlider(
-            "Helligkeit", "${(model.v * 100).roundToInt()} %", model.v,
-            Brush.horizontalGradient(listOf(Color.Black, ColorMath.hsvToArgb(model.h, model.s, 1f).toUiColor())),
-            model.argb.toUiColor(),
-            onChange = { model.set(v = it) }, onRelease = { model.release() }
+        Spacer(Modifier.height(8.dp))
+        BrightnessLine(model.v, onChange = { model.set(v = it) }, onRelease = { model.release() })
+    }
+}
+
+/** Griff: Kreis mit 2 dp weißem Rand und zarter dunkler Kontur (auf hellem Grund sichtbar). */
+private fun DrawScope.drawHandle(c: Offset, radius: Float, fill: Color) {
+    val sw = 2.dp.toPx()
+    drawCircle(Color(0x40000000), radius + 1.dp.toPx(), c)
+    drawCircle(fill, radius - sw / 2f, c)
+    drawCircle(Color.White, radius - sw / 2f, c, style = Stroke(sw))
+}
+
+/**
+ * Helligkeitsregler im Stil des Vorbilds: dünne Linie (2 dp, dunkel → hell), Daumen Ø 12 dp weiß.
+ * Trefferhöhe 28 dp.
+ */
+@Composable
+fun BrightnessLine(value: Float, onChange: (Float) -> Unit, onRelease: () -> Unit, modifier: Modifier = Modifier) {
+    val thumbR = with(LocalDensity.current) { 6.dp.toPx() }
+    Canvas(
+        modifier
+            .fillMaxWidth()
+            .height(28.dp)
+            .colorGestures(
+                onPress = { p, s -> onChange(((p.x - thumbR) / (s.width - 2 * thumbR)).coerceIn(0f, 1f)) },
+                onRelease = onRelease,
+            )
+    ) {
+        val y = size.height / 2f
+        val sw = 2.dp.toPx()
+        drawLine(
+            Brush.horizontalGradient(listOf(Color(0xFF111111), Color(0xFFEDEDED)), startX = thumbR, endX = size.width - thumbR),
+            Offset(thumbR, y), Offset(size.width - thumbR, y), sw, StrokeCap.Round,
         )
+        val x = thumbR + value.coerceIn(0f, 1f) * (size.width - 2 * thumbR)
+        drawCircle(Color(0x55000000), thumbR + 1.dp.toPx(), Offset(x, y))
+        drawCircle(Color.White, thumbR, Offset(x, y))
     }
 }
 

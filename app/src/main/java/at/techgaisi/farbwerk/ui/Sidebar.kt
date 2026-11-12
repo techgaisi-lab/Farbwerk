@@ -71,6 +71,7 @@ import at.techgaisi.farbwerk.input.GestureMap
 import at.techgaisi.farbwerk.input.GestureTrigger
 import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.prefs.Prefs
+import at.techgaisi.farbwerk.ui.common.panelShadow
 import at.techgaisi.farbwerk.ui.icons.AppIcons
 import at.techgaisi.farbwerk.ui.quickmenu.QuickMenuController
 import at.techgaisi.farbwerk.ui.shell.FloatingEyedropper
@@ -128,19 +129,32 @@ private fun sidebarValues(state: EditorState): SidebarValues {
     )
 }
 
-/** Höhe eines Reglers so wählen, dass die ganze Leiste in [available] passt. */
+/** Trefferhöhe der Rückgängig-/Wiederholen-Knöpfe (Symbol 18 dp, je 5 dp Luft oben/unten). */
+private val UndoRowHeight = 28.dp
+/** Senkrechte Luft um das Symbol in einer Rückgängig-Zeile. */
+private val UndoRowSlack = (UndoRowHeight - UiMetrics.undoIcon) / 2
+
+/**
+ * Feste Höhe aller Elemente außer den beiden Rillen (UI_SPEC §2):
+ * Rand oben · 16 · Modifizierer 13 · 16 · 18 · Rückgängig 18 · 10 · Wiederholen 18 · Rand unten.
+ */
+private val SidebarFixedHeight: Dp =
+    UiMetrics.sidebarPadTop + UiMetrics.sidebarGapModifier * 2 + UiMetrics.modifierSize +
+        UiMetrics.sidebarGapUndo + UiMetrics.undoIcon * 2 + UiMetrics.sidebarGapRedo + UiMetrics.sidebarPadBottom
+
+/** Höhe einer Rille so wählen, dass die ganze Leiste in [available] passt (max. 120 dp laut Spec). */
 fun sidebarSliderHeight(available: Dp): Dp {
-    // Ränder 16 + Abstände 3·10 + Modifizierer 26 + 2 Pfeile à 34 ≈ 140 dp
-    val free = (available - 140.dp - 24.dp) / 2
+    val free = (available - SidebarFixedHeight) / 2
     return free.coerceIn(UiMetrics.sidebarSliderMin, UiMetrics.sidebarSlider)
 }
 
-/** Gesamthöhe der Seitenleiste bei gegebener Reglerhöhe. */
-fun sidebarTotalHeight(slider: Dp): Dp = slider * 2 + 140.dp
+/** Gesamthöhe der Seitenleiste bei gegebener Rillenhöhe. */
+fun sidebarTotalHeight(slider: Dp): Dp = slider * 2 + SidebarFixedHeight
 
 /**
- * Seitenleiste (Anleitung §3, §30.3): abgerundete Kapsel (Breite 38 dp, Radius = halbe Breite) mit
- * Größenregler (oben), Modifizierer-Taste (Mitte), Deckkraftregler (unten), Rückgängig und Wiederholen.
+ * Seitenleiste (UI_SPEC §2): bündig am Bildschirmrand, 34 dp breit, Farbe #2C2C2E, nur die zur Bildmitte
+ * zeigenden Ecken 7 dp gerundet. Inhalt: Größen-Rille (oben), Modifizierer-Quadrat, Deckkraft-Rille,
+ * Rückgängig und Wiederholen.
  *
  *  - Regler: Tippen springt, Ziehen mit seitlichem Abstand = feiner; Marken rasten ein.
  *  - Vorschaublase mit Pinselabdruck in aktueller Größe bzw. Deckkraft und Prozentwert (+ / − für Marken).
@@ -159,25 +173,30 @@ fun Sidebar(state: EditorState, modifier: Modifier = Modifier, sliderHeight: Dp 
     val marksKey = values.marksKey
     val sizeMarks = marksKey?.let { state.prefs.sliderMarks(it, false) } ?: emptyList()
     val opacityMarks = marksKey?.let { state.prefs.sliderMarks(it, true) } ?: emptyList()
-    val shape = RoundedCornerShape(50)
+    val corner = UiMetrics.sidebarCorner
+    // Rechtshändige Oberfläche: Leiste am rechten Rand, dann sind die linken Ecken rund
+    val shape = if (state.prefs.sidebarRight) RoundedCornerShape(topStart = corner, bottomStart = corner)
+    else RoundedCornerShape(topEnd = corner, bottomEnd = corner)
 
     Column(
         modifier
             .width(UiMetrics.sidebarWidth)
             .onGloballyPositioned { SidebarBubbleState.sidebarBounds = it.boundsInWindow() }
             .clip(shape)
-            .background(ui.bar)
-            .padding(vertical = 8.dp),
+            .background(ui.sidebar)
+            // Berührungen zwischen den Elementen nicht zur Leinwand durchlassen
+            .pointerInput(Unit) { awaitEachGesture { awaitFirstDown().consume() } }
+            .padding(top = UiMetrics.sidebarPadTop, bottom = UiMetrics.sidebarPadBottom - UndoRowSlack),
         horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         SidebarSlider(values.top, sizeMarks, true, sliderHeight, values.setTop)
-        Spacer(Modifier.height(10.dp))
+        // Modifizierer-Zeile umfasst die beiden 16-dp-Abstände (größere Trefferfläche)
         ModifierButton(state)
-        Spacer(Modifier.height(10.dp))
         SidebarSlider(values.bottom, opacityMarks, false, sliderHeight, values.setBottom)
-        Spacer(Modifier.height(10.dp))
+        Spacer(Modifier.height(UiMetrics.sidebarGapUndo - UndoRowSlack))
         @Suppress("UNUSED_VARIABLE") val hv = state.undo.version
         RepeatButton(state, AppIcons.Undo, "Rückgängig", state.undo.canUndo) { state.undo.undo() }
+        Spacer(Modifier.height((UiMetrics.sidebarGapRedo - UndoRowSlack * 2).coerceAtLeast(0.dp)))
         RepeatButton(state, AppIcons.Redo, "Wiederholen", state.undo.canRedo) { state.undo.redo() }
     }
 }
@@ -202,7 +221,7 @@ private fun SidebarSlider(
     val change by rememberUpdatedState(onChange)
     val marksNow by rememberUpdatedState(marks)
     val coords = remember { arrayOfNulls<LayoutCoordinates>(1) }
-    val thumbScale by animateFloatAsState(if (dragging) 1.12f else 1f, UiMotion.quick(), label = "thumb")
+    val thumbScale by animateFloatAsState(if (dragging) 1.06f else 1f, UiMotion.quick(), label = "thumb")
     val thumbColor by animateColorAsState(if (dragging) Color.White else ui.sliderThumb, UiMotion.quick(), label = "thumbC")
 
     fun publish(v: Float, thumbY: Float) {
@@ -220,7 +239,7 @@ private fun SidebarSlider(
             .height(height)
             .onGloballyPositioned { coords[0] = it }
             .pointerInput(forSize) {
-                val thumbH = 13.dp.toPx()
+                val thumbH = UiMetrics.sidebarThumbH.toPx()
                 val snapPx = 7.dp.toPx()
                 fun yFor(v: Float) = (1f - v) * (size.height - thumbH) + thumbH / 2
                 fun vFor(y: Float) = (1f - (y - thumbH / 2) / (size.height - thumbH)).coerceIn(0f, 1f)
@@ -265,28 +284,32 @@ private fun SidebarSlider(
                 }
             }
     ) {
-        val thumbH = 13.dp.toPx()
-        val trackW = 4.dp.toPx()
+        val thumbH = UiMetrics.sidebarThumbH.toPx()
+        val grooveW = UiMetrics.sidebarGrooveWidth.toPx()
         val cx = size.width / 2
-        // Rinne
-        drawRoundRect(ui.sliderTrack, Offset(cx - trackW / 2, thumbH / 2), Size(trackW, size.height - thumbH), CornerRadius(trackW / 2))
-        // Marken
-        val markW = 12.dp.toPx()
+        // Rille: 12 dp breit, volle Reglerhöhe, Radius 6 dp
+        val grooveR = UiMetrics.sidebarGrooveRadius.toPx()
+        drawRoundRect(ui.sliderTrack, Offset(cx - grooveW / 2, 0f), Size(grooveW, size.height), CornerRadius(grooveR))
+        // Marken: feine Querstriche in der Rille
         for (m in marks) {
             val y = (1f - m) * (size.height - thumbH) + thumbH / 2
-            drawRoundRect(ui.icon.copy(alpha = 0.55f), Offset(cx - markW / 2, y - 1.dp.toPx()), Size(markW, 2.dp.toPx()), CornerRadius(1.dp.toPx()))
+            drawRoundRect(ui.icon.copy(alpha = 0.5f), Offset(cx - grooveW / 2 + 2.dp.toPx(), y - 0.75.dp.toPx()),
+                Size(grooveW - 4.dp.toPx(), 1.5.dp.toPx()), CornerRadius(0.75.dp.toPx()))
         }
-        // Griff
+        // Daumen: Rechteck 20 × 11 dp, Radius 3 dp, ragt seitlich über die Rille hinaus
         val cy = (1f - current) * (size.height - thumbH) + thumbH / 2
-        val tw = 24.dp.toPx() * thumbScale
+        val tw = UiMetrics.sidebarThumbW.toPx() * thumbScale
         val th = thumbH * thumbScale
-        drawRoundRect(Color.Black.copy(alpha = 0.25f), Offset(cx - tw / 2, cy - th / 2 + 1.dp.toPx()), Size(tw, th), CornerRadius(4.dp.toPx()))
-        drawRoundRect(thumbColor, Offset(cx - tw / 2, cy - th / 2), Size(tw, th), CornerRadius(4.dp.toPx()))
+        val tr = CornerRadius(UiMetrics.sidebarThumbRadius.toPx())
+        drawRoundRect(Color.Black.copy(alpha = 0.3f), Offset(cx - tw / 2, cy - th / 2 + 1.dp.toPx()), Size(tw, th), tr)
+        drawRoundRect(thumbColor, Offset(cx - tw / 2, cy - th / 2), Size(tw, th), tr)
     }
 }
 
 /**
- * Modifizierer-Taste (kleines Quadrat, 26 dp, Radius 6 dp).
+ * Modifizierer-Taste (UI_SPEC §2): Quadrat 13 × 13 dp, 1,2 dp Kontur Weiß @ 70 %, Radius 2,5 dp, keine Füllung.
+ * Aktiv (gehalten / Pipette bereit) wird es in `accent` gefüllt. Trefferfläche: volle Leistenbreite inkl.
+ * der 16-dp-Abstände darüber und darunter.
  *  - Tippen: Funktion aus „Modifizierer tippen“ (Standard: schwebende Pipette an der zuletzt bemalten Stelle).
  *  - Halten + Leinwand berühren: Funktion aus „Modifizierer halten + Berühren“ (Standard: Pipette).
  *  - Waagrecht vom Rand über die Taste ziehen, dann senkrecht: ganze Leiste verschieben.
@@ -296,11 +319,12 @@ private fun ModifierButton(state: EditorState) {
     val ui = LocalUi.current
     var held by remember { mutableStateOf(false) }
     val active = held || state.eyedropperArmed || FloatingEyedropper.active
-    val bg by animateColorAsState(if (active) ui.accent else ui.panelElevated, UiMotion.quick(), label = "mod")
+    val bg = if (active) ui.accent else Color.Transparent
+    val stroke = if (active) ui.accent else ui.modifierStroke
     val shape = RoundedCornerShape(UiMetrics.modifierRadius)
     Box(
         Modifier
-            .size(UiMetrics.sidebarWidth, UiMetrics.modifierSize + 8.dp)
+            .size(UiMetrics.sidebarWidth, UiMetrics.modifierSize + UiMetrics.sidebarGapModifier * 2)
             .pointerInput(Unit) {
                 awaitEachGesture {
                     val down = awaitFirstDown()
@@ -355,10 +379,10 @@ private fun ModifierButton(state: EditorState) {
         Box(
             Modifier
                 .size(UiMetrics.modifierSize)
-                .graphicsLayer { val s = if (held) 0.92f else 1f; scaleX = s; scaleY = s }
+                .graphicsLayer { val s = if (held) 0.9f else 1f; scaleX = s; scaleY = s }
                 .clip(shape)
                 .background(bg)
-                .border(0.5.dp, ui.divider, shape)
+                .border(UiMetrics.modifierStroke, stroke, shape)
         )
     }
 }
@@ -393,11 +417,12 @@ private fun RepeatButton(
 ) {
     val ui = LocalUi.current
     var pressed by remember { mutableStateOf(false) }
-    val tint by animateColorAsState(if (enabled) ui.icon else ui.iconMuted, UiMotion.quick(), label = "rep")
+    // inaktiv: Symbolfarbe @ 30 % (UI_SPEC §2)
+    val tint = if (enabled) ui.icon else ui.icon.copy(alpha = 0.3f)
     val act by rememberUpdatedState(action)
     Box(
         Modifier
-            .size(UiMetrics.undoButton)
+            .size(UiMetrics.sidebarWidth, UndoRowHeight)
             .pointerInput(Unit) {
                 awaitEachGesture {
                     awaitFirstDown().consume()
@@ -424,7 +449,7 @@ private fun RepeatButton(
             },
         contentAlignment = Alignment.Center,
     ) {
-        Icon(icon, label, tint = tint, modifier = Modifier.size(22.dp).graphicsLayer {
+        Icon(icon, label, tint = tint, modifier = Modifier.size(UiMetrics.undoIcon).graphicsLayer {
             val s = if (pressed) 0.88f else 1f; scaleX = s; scaleY = s; alpha = if (pressed) 0.6f else 1f
         })
     }
@@ -460,7 +485,7 @@ fun SidebarBubble(state: EditorState) {
     val gapPx = with(density) { 10.dp.toPx() }
     val x = if (right) bounds.left - gapPx - sizePx else bounds.right + gapPx
     val y = b.centerY - sizePx / 2
-    val shape = RoundedCornerShape(16.dp)
+    val shape = RoundedCornerShape(UiMetrics.bubbleRadius)
     val value = b.value
     val marksKey = values.marksKey
 
@@ -469,7 +494,7 @@ fun SidebarBubble(state: EditorState) {
             .offset { IntOffset(x.roundToInt(), y.roundToInt()) }
             .size(UiMetrics.bubbleSize)
             .graphicsLayer { this.alpha = alpha }
-            .shadow(14.dp, shape, ambientColor = ui.shadow, spotColor = ui.shadow)
+            .panelShadow(ui.shadow, radius = UiMetrics.bubbleRadius)
             .clip(shape)
             .background(ui.panel)
     ) {
@@ -555,7 +580,7 @@ private fun BrushStamp(state: EditorState, forSize: Boolean, value: Float, modif
 }
 
 /**
- * Farbkreis (aktuelle Farbe) oben rechts.
+ * Farbkreis (aktuelle Farbe) oben rechts: Ø 28 dp, gefüllt mit der aktuellen Farbe, 1,5 dp weißer Rand @ 90 %.
  *
  *  - Kurzes Tippen → [onClick] (Farben-Panel öffnen/schließen). Ausgelöst beim Loslassen, damit ein
  *    Ziehen nicht zusätzlich das Panel umschaltet.
@@ -568,7 +593,7 @@ private fun BrushStamp(state: EditorState, forSize: Boolean, value: Float, modif
 @Composable
 fun ColorDot(
     argb: Int,
-    size: Int = 28,
+    size: Int = UiMetrics.colorDot.value.toInt(),
     modifier: Modifier = Modifier,
     onDragStart: ((Offset) -> Unit)? = null,
     onDrag: ((Offset) -> Unit)? = null,
@@ -624,6 +649,7 @@ fun ColorDot(
             }
             .clip(CircleShape)
             .background(Color(argb))
-            .border(2.dp, ui.icon.copy(alpha = 0.85f), CircleShape)
+            // 1,5 dp weißer Rand @ 90 % (UI_SPEC §1)
+            .border(UiMetrics.colorDotBorder, Color.White.copy(alpha = 0.9f), CircleShape)
     )
 }

@@ -27,6 +27,7 @@ import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxHeight
@@ -315,20 +316,29 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
     }
 
     BoxWithConstraints(modifier) {
-        val setsW = if (maxWidth >= 440.dp) 150.dp else 118.dp
+        // Set-Spalte 118 dp (UI_SPEC §4); auf breiteren Popovers etwas mehr Platz für längere Set-Namen.
+        val setsW = if (maxWidth >= 440.dp) 132.dp else 118.dp
         PanelCard(Modifier.fillMaxSize().onGloballyPositioned { panelBounds = it.boundsInRoot() }) {
-            // ---- Kopfzeile
+            // ---- Titelzeile: 52 dp, Titel 22 sp fett (links 20 dp), dünnes „+“ rechts (18 dp Rand)
             Row(
-                Modifier.fillMaxWidth().height(50.dp).padding(start = 16.dp, end = 6.dp),
+                Modifier.fillMaxWidth().height(52.dp).padding(start = 20.dp, end = 10.dp),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                Text("Pinselbibliothek", color = ui.text, fontSize = 17.sp, fontWeight = FontWeight.SemiBold,
-                    modifier = Modifier.weight(1f))
-                HeaderIcon(Icons.Outlined.Search, "Suchen", if (searchOpen) ui.accent else ui.icon) {
-                    searchOpen = !searchOpen; if (!searchOpen) query = ""
+                Row(Modifier.weight(1f), verticalAlignment = Alignment.CenterVertically) {
+                    Text("Pinselbibliothek", color = Color.White, fontSize = 22.sp, fontWeight = FontWeight.Bold,
+                        maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f, fill = false))
+                    // Kleine Lupe direkt am Titel (Suche; alternativ Liste nach unten ziehen)
+                    Box(
+                        Modifier.padding(start = 4.dp).size(28.dp).clip(RoundedCornerShape(14.dp))
+                            .clickable { searchOpen = !searchOpen; if (!searchOpen) query = "" },
+                        contentAlignment = Alignment.Center,
+                    ) { SmallSearchGlyph(if (searchOpen) BrushUiColors.selection else BrushUiColors.textSecondary) }
                 }
                 Box {
-                    HeaderIcon(Icons.Filled.Add, "Hinzufügen", ui.accent) { addMenu = true }
+                    Box(
+                        Modifier.size(38.dp).clip(RoundedCornerShape(8.dp)).clickable { addMenu = true },
+                        contentAlignment = Alignment.Center,
+                    ) { ThinPlus(Color.White) }
                     DropdownMenu(addMenu, onDismissRequest = { addMenu = false }, containerColor = ui.panelElevated) {
                         MenuRow("Neuer Pinsel") {
                             addMenu = false
@@ -336,6 +346,7 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
                             studio = StudioRequest(lib.newBrush(target), isNew = true)
                         }
                         MenuRow("Neues Set") { addMenu = false; newSetDialog = true }
+                        MenuRow("Pinsel suchen") { addMenu = false; searchOpen = true }
                         MenuRow("Aus Dateien importieren") { addMenu = false; importLauncher.launch("*/*") }
                         MenuRow("Aus Zwischenablage einfügen") {
                             addMenu = false
@@ -347,33 +358,36 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
                     }
                 }
             }
-            // ---- Suchfeld
+            // ---- Suchfeld (Lupe am Titel oder Liste nach unten ziehen)
             AnimatedVisibility(searchOpen, enter = expandVertically(tween(180)) + fadeIn(tween(180)),
                 exit = shrinkVertically(tween(140)) + fadeOut(tween(120))) {
                 Row(
                     Modifier.fillMaxWidth().padding(horizontal = 12.dp).padding(bottom = 8.dp)
-                        .clip(RoundedCornerShape(10.dp)).background(ui.panelElevated).padding(horizontal = 10.dp, vertical = 8.dp),
+                        .height(34.dp).clip(RoundedCornerShape(7.dp)).background(BrushUiColors.tile).padding(horizontal = 10.dp),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
-                    Icon(Icons.Outlined.Search, null, tint = ui.textMuted, modifier = Modifier.size(18.dp))
+                    SmallSearchGlyph(BrushUiColors.textSecondary, 14.dp)
                     Spacer(Modifier.width(8.dp))
                     Box(Modifier.weight(1f)) {
-                        if (query.isEmpty()) Text("Pinsel suchen", color = ui.textMuted, fontSize = 15.sp)
+                        if (query.isEmpty()) Text("Pinsel suchen", color = BrushUiColors.textSecondary, fontSize = 14.sp)
                         BasicTextField(query, { query = it.take(40) }, singleLine = true,
-                            textStyle = TextStyle(color = ui.text, fontSize = 15.sp), cursorBrush = SolidColor(ui.accent),
+                            textStyle = TextStyle(color = Color.White, fontSize = 14.sp), cursorBrush = SolidColor(BrushUiColors.selection),
                             modifier = Modifier.fillMaxWidth())
                     }
-                    if (query.isNotEmpty()) Icon(Icons.Outlined.Close, "Leeren", tint = ui.textMuted,
+                    if (query.isNotEmpty()) Icon(Icons.Outlined.Close, "Leeren", tint = BrushUiColors.textSecondary,
                         modifier = Modifier.size(18.dp).clickable { query = "" })
+                    else Text("Fertig", color = BrushUiColors.selection, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+                        modifier = Modifier.clickable { searchOpen = false })
                 }
             }
-            Box(Modifier.fillMaxWidth().height(0.5.dp).background(ui.divider))
 
             Row(Modifier.fillMaxSize()) {
                 // ---- Sets
                 if (!searching) {
+                    // Linke Spalte: Set-Kacheln (links 12 dp, Abstand 6 dp), scrollt unabhängig, ohne Scrollbalken
                     LazyColumn(Modifier.width(setsW).fillMaxHeight(), state = setListState,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 6.dp)) {
+                        contentPadding = PaddingValues(start = 12.dp, end = 8.dp, top = 4.dp, bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)) {
                         items(localSets, key = { it.id }) { s ->
                             val sel = s.id == selectedSet
                             val isDragged = drag?.isSet == true && drag?.id == s.id
@@ -408,7 +422,6 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
                             )
                         }
                     }
-                    Box(Modifier.width(0.5.dp).fillMaxHeight().background(ui.divider))
                 }
 
                 // ---- Pinsel
@@ -438,16 +451,18 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
                     LazyColumn(
                         Modifier.fillMaxSize().nestedScroll(pullConnection).onGloballyPositioned { listBounds = it.boundsInRoot() },
                         state = listState,
-                        contentPadding = androidx.compose.foundation.layout.PaddingValues(vertical = 4.dp),
+                        // Rechte Spalte: Innenabstand rechts 12 dp, Zeilenabstand 2 dp
+                        contentPadding = PaddingValues(start = if (searching) 12.dp else 0.dp, end = 12.dp, top = 4.dp, bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(2.dp),
                     ) {
                         if (localBrushes.isEmpty()) item(key = "_empty") {
                             Text(if (searching) "Keine Treffer" else "Keine Pinsel in diesem Set",
-                                color = ui.textMuted, fontSize = 13.sp, modifier = Modifier.padding(20.dp))
+                                color = BrushUiColors.textSecondary, fontSize = 13.sp, modifier = Modifier.padding(20.dp))
                         }
                         items(localBrushes, key = { it.id }) { b ->
                             val lifted = drag?.isSet == false && drag?.id == b.id
                             BrushRow(
-                                lib = lib, brush = b, selected = b.id == activeId, lifted = lifted,
+                                lib = lib, brush = b, selected = b.id == activeId, lifted = lifted, rowBg = ui.panel,
                                 custom = lib.isCustom(b.id), favorite = lib.isFavorite(b.id), pinned = inRecent && lib.isPinned(b.id),
                                 subtitle = if (searching) lib.setName(lib.setOf(b.id)) else null,
                                 version = libVersion,
@@ -531,26 +546,27 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
             }
         }
 
-        // ---- gezogene Zeile (schwebt über allem)
+        // ---- gezogene Zeile (schwebt über allem): gleiche Optik wie eine ausgewählte Pinselzeile
         drag?.let { d ->
             if (!d.isSet && d.moved && d.brush != null) {
-                val w = with(density) { 220.dp.toPx() }
-                val h = with(density) { 64.dp.toPx() }
+                val w = with(density) { 240.dp.toPx() }
+                val h = with(density) { 62.dp.toPx() }
                 Box(
                     Modifier
                         .offset { IntOffset((d.pos.x - panelBounds.left - w * 0.5f).roundToInt(), (d.pos.y - panelBounds.top - h * 0.6f).roundToInt()) }
-                        .width(220.dp).height(64.dp)
+                        .width(240.dp).height(62.dp)
                         .graphicsLayer { scaleX = 1.03f; scaleY = 1.03f; alpha = 0.95f }
-                        .shadow(16.dp, RoundedCornerShape(10.dp))
-                        .clip(RoundedCornerShape(10.dp)).background(ui.selectedRow)
-                        .padding(horizontal = 10.dp, vertical = 6.dp),
+                        .shadow(16.dp, RoundedCornerShape(6.dp))
+                        .clip(RoundedCornerShape(6.dp)).background(BrushUiColors.selection),
                 ) {
-                    Column {
-                        Text(d.brush.name, color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium, maxLines = 1)
-                        PreviewImage(lib, d.brush, Color.White, libVersion, Modifier.fillMaxWidth().height(34.dp))
+                    Column(Modifier.fillMaxSize()) {
+                        Text(d.brush.name, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+                            modifier = Modifier.padding(start = 10.dp, top = 6.dp, end = 24.dp))
+                        PreviewImage(lib, d.brush, libVersion, Modifier.fillMaxWidth().weight(1f).padding(horizontal = 4.dp, vertical = 2.dp))
                     }
-                    if (d.hoverSet != null) Text("+", color = Color.White, fontSize = 16.sp, fontWeight = FontWeight.Bold,
-                        modifier = Modifier.align(Alignment.TopEnd))
+                    if (d.hoverSet != null) Box(Modifier.align(Alignment.TopEnd).padding(top = 5.dp, end = 6.dp)) {
+                        ThinPlus(Color.White, 12.dp, 1.4.dp)
+                    }
                 }
             }
         }
@@ -636,20 +652,13 @@ fun BrushLibraryPanel(state: EditorState, modifier: Modifier = Modifier) {
     }
 }
 
-@Composable
-private fun HeaderIcon(icon: ImageVector, desc: String, tint: Color, onClick: () -> Unit) {
-    Box(Modifier.size(40.dp).clip(RoundedCornerShape(8.dp)).clickable(onClick = onClick), contentAlignment = Alignment.Center) {
-        Icon(icon, desc, tint = tint, modifier = Modifier.size(24.dp))
-    }
-}
-
 /** Kontextmenü als kleines Dialogfenster (zentriert, wie die Popover-Karten gestaltet). */
 @Composable
 private fun BrushContextMenu(title: String, onDismiss: () -> Unit, entries: List<Pair<String, () -> Unit>>) {
     val ui = LocalUi.current
     androidx.compose.ui.window.Dialog(onDismissRequest = onDismiss) {
         Column(
-            Modifier.width(260.dp).shadow(24.dp, RoundedCornerShape(14.dp)).clip(RoundedCornerShape(14.dp))
+            Modifier.width(260.dp).shadow(24.dp, RoundedCornerShape(13.dp)).clip(RoundedCornerShape(13.dp))
                 .background(ui.panel).padding(vertical = 6.dp),
         ) {
             Text(title, color = ui.textMuted, fontSize = 13.sp, maxLines = 1, overflow = TextOverflow.Ellipsis,
@@ -664,6 +673,18 @@ private fun BrushContextMenu(title: String, onDismiss: () -> Unit, entries: List
     }
 }
 
+
+/** Angezeigter Kachel-Name eines Sets (virtuelle Sets in Kurzform, damit sie in die 32-dp-Kachel passen). */
+private fun tileLabel(set: BrushSet): String = when (set.id) {
+    BrushLibrary.SET_RECENT -> "Zuletzt"
+    else -> set.name
+}
+
+/**
+ * Set-Kachel der linken Spalte (UI_SPEC §4): 32 dp hoch, Radius 7 dp, Hintergrund `panelInset`,
+ * Symbol 14 dp bei x = 10 dp, Name 13 sp / 500 mit 8 dp Abstand. Ausgewählt: ganze Kachel `accent`.
+ * Beim Ziehen eines Pinsels über eine Kachel wird sie als Ablageziel dunkelblau markiert.
+ */
 @Composable
 private fun SetRow(
     set: BrushSet,
@@ -673,24 +694,24 @@ private fun SetRow(
     modifier: Modifier,
     gestures: RowGestures,
 ) {
-    val ui = LocalUi.current
     var origin by remember { mutableStateOf(Offset.Zero) }
     val gRef = rememberUpdatedState(gestures)
-    val bg by animateColorAsState(
-        when {
-            dropTarget -> BrushUiColors.secondarySelection
-            selected -> ui.selectedRow
-            else -> Color.Transparent
-        }, tween(120), label = "setBg",
-    )
-    val scale by animateFloatAsState(if (lifted) 1.03f else 1f, tween(150), label = "setLift")
+    val shape = RoundedCornerShape(7.dp)
+    // Auswahl wechselt sofort (UI_SPEC §11), nur das Anheben beim Ziehen ist animiert
+    val bg = when {
+        dropTarget -> BrushUiColors.secondarySelection
+        selected -> BrushUiColors.selection
+        else -> BrushUiColors.tile
+    }
+    val highlighted = selected || dropTarget
+    val scale by animateFloatAsState(if (lifted) 1.05f else 1f, tween(150), label = "setLift")
     Row(
         modifier
             .fillMaxWidth()
-            .padding(horizontal = 6.dp, vertical = 1.dp)
+            .height(32.dp)
             .graphicsLayer { scaleX = scale; scaleY = scale }
-            .then(if (lifted) Modifier.shadow(10.dp, RoundedCornerShape(10.dp)) else Modifier)
-            .clip(RoundedCornerShape(10.dp))
+            .then(if (lifted) Modifier.shadow(10.dp, shape) else Modifier)
+            .clip(shape)
             .background(bg)
             .onGloballyPositioned { origin = it.boundsInRoot().topLeft }
             .pointerInput(set.id) {
@@ -701,20 +722,14 @@ private fun SetRow(
                     override fun onDragEnd(moved: Boolean) = gRef.value.onDragEnd(moved)
                 })
             }
-            .padding(horizontal = 8.dp, vertical = 8.dp),
+            .padding(start = 10.dp, end = 6.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        if (set.virtual) {
-            Box(Modifier.size(28.dp).clip(RoundedCornerShape(7.dp)).background(if (selected) Color(0x33FFFFFF) else ui.panelElevated),
-                contentAlignment = Alignment.Center) {
-                Icon(if (set.id == BrushLibrary.SET_FAVORITES) Icons.Filled.Star else Icons.Outlined.MyLocation, null,
-                    tint = if (selected) Color.White else ui.textMuted, modifier = Modifier.size(16.dp))
-            }
-        } else SetGlyph(set.icon, selected)
+        SetIcon(set.id, if (set.virtual) null else set.icon, if (highlighted) Color.White else BrushUiColors.tileIcon)
         Spacer(Modifier.width(8.dp))
         Text(
-            set.name, color = if (selected || dropTarget) Color.White else ui.text, fontSize = 13.sp,
-            fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal, maxLines = 2, overflow = TextOverflow.Ellipsis,
+            tileLabel(set), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.Medium,
+            maxLines = 1, overflow = TextOverflow.Ellipsis,
         )
     }
 }
@@ -722,26 +737,42 @@ private fun SetRow(
 /** Eine Wisch-Aktion hinter einer Pinselzeile. */
 private class SwipeActionSpec(val icon: ImageVector, val label: String, val color: Color, val action: () -> Unit)
 
+/** Seitenverhältnis der Strichvorschau (Zeilenbreite ≈ 340 dp × ~30 dp). */
+private const val PREVIEW_W = 704
+private const val PREVIEW_H = 64
+
+/**
+ * Strichvorschau eines Pinsels: weißer Strich auf transparentem Grund (unabhängig von der Malfarbe),
+ * über die volle Zeilenbreite. Wird im Hintergrund gerendert und gecacht.
+ */
 @Composable
-private fun PreviewImage(lib: BrushLibrary, brush: Brush, tint: Color, version: Int, modifier: Modifier) {
+private fun PreviewImage(lib: BrushLibrary, brush: Brush, version: Int, modifier: Modifier) {
     val preview by produceState<ImageBitmap?>(
-        lib.cachedPreview(brush)?.asImageBitmap(), brush.id, brush.rev, version,
+        lib.cachedPreview(brush, PREVIEW_W, PREVIEW_H)?.asImageBitmap(), brush.id, brush.rev, version,
     ) {
-        value = withContext(Dispatchers.Default) { lib.preview(brush).asImageBitmap() }
+        value = withContext(Dispatchers.Default) { lib.preview(brush, PREVIEW_W, PREVIEW_H).asImageBitmap() }
     }
     Box(modifier) {
         preview?.let {
-            Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds, colorFilter = ColorFilter.tint(tint))
+            Image(it, null, Modifier.fillMaxSize(), contentScale = ContentScale.FillBounds,
+                colorFilter = ColorFilter.tint(Color.White))
         }
     }
 }
 
+/**
+ * Pinselzeile der rechten Spalte (UI_SPEC §4): 62 dp hoch, Name oben links (11 sp / 600, 6 dp oben, 10 dp links),
+ * darunter die weiße Strichvorschau über die volle Breite. Ausgewählt: ganze Zeile `accent`, Radius 6 dp.
+ * Rechts oben kleine 12-dp-Symbole (angeheftet, Favorit, eigener Pinsel). Nach links wischen legt die
+ * Aktionen frei (federndes Einrasten), Halten öffnet Menü bzw. startet das Ziehen.
+ */
 @Composable
 private fun BrushRow(
     lib: BrushLibrary,
     brush: Brush,
     selected: Boolean,
     lifted: Boolean,
+    rowBg: Color,
     custom: Boolean,
     favorite: Boolean,
     pinned: Boolean,
@@ -751,27 +782,28 @@ private fun BrushRow(
     actions: List<SwipeActionSpec>,
     gestures: (origin: () -> Offset) -> RowGestures,
 ) {
-    val ui = LocalUi.current
     val density = LocalDensity.current
     val scope = rememberCoroutineScope()
     val offset = remember { Animatable(0f) }
     val actionW = 64.dp
     val maxShift = with(density) { (actionW * actions.size).toPx() }
     var origin by remember { mutableStateOf(Offset.Zero) }
-    val snap = spring<Float>(dampingRatio = 0.85f, stiffness = 600f)
+    val snap = spring<Float>(dampingRatio = 0.75f, stiffness = 500f)
     fun close() { scope.launch { offset.animateTo(0f, snap) } }
 
-    val bg by animateColorAsState(if (selected) ui.selectedRow else Color.Transparent, tween(120), label = "rowBg")
+    val shape = RoundedCornerShape(6.dp)
     val scale by animateFloatAsState(if (lifted) 1.03f else 1f, tween(150), label = "rowLift")
     val gRef = rememberUpdatedState(gestures { origin })
+    val secondary = if (selected) Color(0xCCFFFFFF) else BrushUiColors.textSecondary
 
     Box(
-        modifier.fillMaxWidth().height(if (subtitle != null) 86.dp else 76.dp)
-            .graphicsLayer { scaleX = scale; scaleY = scale; alpha = if (lifted) 0.4f else 1f },
+        modifier.fillMaxWidth().height(if (subtitle != null) 74.dp else 62.dp)
+            .graphicsLayer { scaleX = scale; scaleY = scale; alpha = if (lifted) 0.4f else 1f }
+            .clip(shape),
     ) {
         // Aktionen hinter der Zeile
         if (actions.isNotEmpty() && offset.value < -0.5f) {
-            Row(Modifier.align(Alignment.CenterEnd).fillMaxHeight().padding(vertical = 3.dp)) {
+            Row(Modifier.align(Alignment.CenterEnd).fillMaxHeight()) {
                 for (a in actions) {
                     Column(
                         Modifier.width(actionW).fillMaxHeight().background(a.color).clickable { close(); a.action() },
@@ -784,15 +816,13 @@ private fun BrushRow(
                 }
             }
         }
-        // Vordergrund
+        // Vordergrund (deckend, damit die Aktionen beim Wischen nur rechts sichtbar werden)
         Column(
             Modifier
                 .offset { IntOffset(offset.value.roundToInt(), 0) }
                 .fillMaxSize()
-                .background(ui.panel)
-                .padding(horizontal = 6.dp, vertical = 3.dp)
-                .clip(RoundedCornerShape(10.dp))
-                .background(bg)
+                .clip(shape)
+                .background(if (selected) BrushUiColors.selection else rowBg)
                 .onGloballyPositioned { origin = it.boundsInRoot().topLeft - Offset(offset.value, 0f) }
                 .pointerInput(brush.id, maxShift) {
                     rowGestures({ origin }, swipe = actions.isNotEmpty(), g = object : RowGestures {
@@ -807,31 +837,34 @@ private fun BrushRow(
                         override fun onDrag(rootPos: Offset) = gRef.value.onDrag(rootPos)
                         override fun onDragEnd(moved: Boolean) = gRef.value.onDragEnd(moved)
                     })
-                }
-                .padding(start = 12.dp, end = 10.dp, top = 7.dp, bottom = 4.dp),
+                },
         ) {
-            Row(verticalAlignment = Alignment.CenterVertically) {
+            Row(
+                Modifier.fillMaxWidth().padding(start = 10.dp, top = 6.dp, end = 7.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
                 Text(
-                    brush.name, color = if (selected) Color.White else ui.text, fontSize = 13.sp,
-                    fontWeight = FontWeight.Medium, maxLines = 1, overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f, fill = false),
+                    brush.name, color = Color.White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold,
+                    maxLines = 1, overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f),
                 )
                 if (pinned) {
                     Spacer(Modifier.width(4.dp))
-                    Icon(Icons.Filled.PushPin, null, tint = if (selected) Color.White else ui.textMuted, modifier = Modifier.size(12.dp))
+                    Icon(Icons.Filled.PushPin, "Angeheftet", tint = secondary, modifier = Modifier.size(12.dp))
                 }
                 if (favorite) {
                     Spacer(Modifier.width(4.dp))
-                    Icon(Icons.Filled.Star, null, tint = Color(0xFFFFC94D), modifier = Modifier.size(12.dp))
+                    Icon(Icons.Filled.Star, "Favorit", tint = if (selected) Color.White else Color(0xFFFFC94D),
+                        modifier = Modifier.size(12.dp))
                 }
                 if (custom) {
-                    Spacer(Modifier.width(5.dp))
-                    Text("eigen", color = if (selected) Color(0xCCFFFFFF) else ui.textMuted, fontSize = 10.sp)
+                    Spacer(Modifier.width(4.dp))
+                    RowCheckMark(if (selected) Color.White else BrushUiColors.textSecondary)
                 }
             }
-            if (subtitle != null) Text(subtitle, color = if (selected) Color(0xCCFFFFFF) else ui.textMuted, fontSize = 11.sp, maxLines = 1)
-            Spacer(Modifier.height(2.dp))
-            PreviewImage(lib, brush, if (selected) Color.White else ui.text, version, Modifier.fillMaxWidth().weight(1f))
+            if (subtitle != null) Text(subtitle, color = secondary, fontSize = 10.sp, maxLines = 1,
+                modifier = Modifier.padding(start = 10.dp))
+            PreviewImage(lib, brush, version,
+                Modifier.fillMaxWidth().weight(1f).padding(start = 4.dp, end = 4.dp, top = 1.dp, bottom = 3.dp))
         }
     }
 }

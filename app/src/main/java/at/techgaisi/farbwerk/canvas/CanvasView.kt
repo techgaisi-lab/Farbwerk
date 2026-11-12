@@ -213,7 +213,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private fun fitMatrix(): Matrix {
         val doc = state.document ?: return Matrix()
         val m = Matrix()
-        val margin = 24f * density
+        val margin = 40f * density
         val s = min((width - 2 * margin) / doc.width, (height - 2 * margin) / doc.height).coerceAtLeast(0.01f)
         m.postScale(s, s)
         m.postTranslate((width - doc.width * s) / 2f, (height - doc.height * s) / 2f)
@@ -357,6 +357,25 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private var gestureScrubReversals = 0
     private var gestureScrubAnchorX = 0f
     private var gestureConsumed = false
+    /** Startposition je Finger (Pointer-ID → x,y) – für kumulierte Bewegung (Tipp vs. Zoom/Verschieben). */
+    private val gesturePointerStart = HashMap<Int, FloatArray>()
+    /** Größte Strecke, die ein einzelner Finger seit Gestenbeginn zurückgelegt hat (px). */
+    private var gestureMaxTravel = 0f
+
+    private fun recordGesturePointers(e: MotionEvent) {
+        for (i in 0 until e.pointerCount) {
+            val id = e.getPointerId(i)
+            if (!gesturePointerStart.containsKey(id)) gesturePointerStart[id] = floatArrayOf(e.getX(i), e.getY(i))
+        }
+    }
+
+    private fun updateGestureTravel(e: MotionEvent) {
+        for (i in 0 until e.pointerCount) {
+            val st = gesturePointerStart[e.getPointerId(i)] ?: continue
+            val d = hypot(e.getX(i) - st[0], e.getY(i) - st[1])
+            if (d > gestureMaxTravel) gestureMaxTravel = d
+        }
+    }
     /** Tipp-Gesten (Rückgängig, Vollbild …) unterdrücken – Geste begann, während der Stift nahe war. */
     private var gestureSuppressTaps = false
     private var savedViewBeforeFit: Matrix? = null
@@ -778,6 +797,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             }
             Mode.GESTURE -> {
                 gestureMaxPointers = max(gestureMaxPointers, e.pointerCount)
+                recordGesturePointers(e)
                 resetGestureGeometry(e)
                 cancelTimers()
                 if (!gestureSuppressTaps) scheduleRapid()
@@ -1091,6 +1111,9 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         gestureConsumed = false
         gestureScrubDir = 0
         gestureScrubReversals = 0
+        gesturePointerStart.clear()
+        gestureMaxTravel = 0f
+        recordGesturePointers(e)
         resetGestureGeometry(e)
         gestureStartSpan = gestureLastSpan
         gestureStartCy = gestureLastCy
@@ -1132,7 +1155,11 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val dx = cx - gestureLastCx
         val dy = cy - gestureLastCy
 
-        if (!gestureMoved && (hypot(dx, dy) > slop * 0.6f || (e.pointerCount >= 2 && abs(spanOf(e) - gestureLastSpan) > slop))) {
+        // Kumulierte Bewegung seit Gestenbeginn (nicht nur seit dem letzten Ereignis): langsames Zoomen/
+        // Verschieben darf nie als Tippen (Rückgängig) oder Halten (schnelles Rückgängig) gelten.
+        updateGestureTravel(e)
+        val spanDelta = if (e.pointerCount >= 2 && gestureStartSpan > 0f) abs(spanOf(e) - gestureStartSpan) else 0f
+        if (!gestureMoved && (gestureMaxTravel > slop * 0.8f || spanDelta > slop * 0.8f)) {
             gestureMoved = true
             cancelRapid()
         }
@@ -1221,7 +1248,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val dur = e.eventTime - gestureStartTime
         if (rapidRepeating) { rapidRepeating = false; return }
         if (gestureConsumed) return
-        if (!gestureMoved && dur < 400) {
+        // Tippen = kurz und praktisch ohne Bewegung (wie im Vorbild); alles andere war Zoomen/Verschieben.
+        if (!gestureMoved && dur < 300 && gestureMaxTravel < slop * 0.8f) {
             if (gestureSuppressTaps) return
             when (gestureMaxPointers) {
                 2 -> if (state.prefs.gestureTapUndo) state.undo.undo()

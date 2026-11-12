@@ -72,6 +72,8 @@ class GalleryDragState {
     var menuKey by mutableStateOf<String?>(null)
 
     internal var gridOrigin = Offset.Zero
+    /** Unterkante der (über dem Raster schwebenden) Kopfzeile im Grid-Raum, in px – darüber gilt „über Kopfzeile“. */
+    internal var headerBottom = 0f
     internal val tileOrigins = HashMap<String, Offset>()
     private var startPointer = Offset.Zero   // Finger im Grid-Raum beim Start
     private var moved = 0f
@@ -88,7 +90,7 @@ class GalleryDragState {
         offset += delta
         moved += hypot(delta.x, delta.y)
         val p = startPointer + offset
-        overHeader = p.y < 0f
+        overHeader = p.y < headerBottom
         var target: String? = null
         var before: String? = null
         val items = grid.layoutInfo.visibleItemsInfo

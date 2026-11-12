@@ -47,10 +47,13 @@ object ActionIcons {
         moveTo(15f, 10.5f); lineTo(20.5f, 7.5f); lineTo(20.5f, 16.5f); lineTo(15f, 13.5f)
     }
 
-    /** Einstellungen: Schieberegler */
+    /** Einstellungen: Schalter (Pille mit Knopf rechts) */
     val Settings = icon("a_settings") {
-        moveTo(4f, 7f); lineTo(20f, 7f); moveTo(4f, 12f); lineTo(20f, 12f); moveTo(4f, 17f); lineTo(20f, 17f)
-        moveTo(9f, 5f); lineTo(9f, 9f); moveTo(15f, 10f); lineTo(15f, 14f); moveTo(7f, 15f); lineTo(7f, 19f)
+        moveTo(8f, 6.5f); lineTo(16f, 6.5f); curveTo(19f, 6.5f, 21.5f, 9f, 21.5f, 12f)
+        curveTo(21.5f, 15f, 19f, 17.5f, 16f, 17.5f); lineTo(8f, 17.5f)
+        curveTo(5f, 17.5f, 2.5f, 15f, 2.5f, 12f); curveTo(2.5f, 9f, 5f, 6.5f, 8f, 6.5f); close()
+        moveTo(16f, 9f); curveTo(17.7f, 9f, 19f, 10.3f, 19f, 12f); curveTo(19f, 13.7f, 17.7f, 15f, 16f, 15f)
+        curveTo(14.3f, 15f, 13f, 13.7f, 13f, 12f); curveTo(13f, 10.3f, 14.3f, 9f, 16f, 9f); close()
     }
 
     /** Hilfe: Fragezeichen im Kreis */

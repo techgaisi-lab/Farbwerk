@@ -9,6 +9,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
@@ -22,6 +23,7 @@ import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -111,6 +113,8 @@ fun EditorScreen(state: EditorState) {
         )
         // ColorDrop-Nachfüllmodus: Tipp-Ebene über der Leinwand, unter Leisten/Panels (nur wenn aktiv)
         ColorDropTapLayer(state)
+        // Losgelöstes, schwebendes Farben-Fenster (über der Leinwand, unter den Leisten)
+        at.techgaisi.farbwerk.ui.color.FloatingColorPanelHost(state)
         // Schwebende Pipette (Modifizierer tippen): fängt das Ziehen ab, solange sie läuft
         FloatingEyedropperLayer(state)
 
@@ -145,9 +149,12 @@ fun EditorScreen(state: EditorState) {
             }
         }
 
-        if (state.copyPasteMenuVisible) {
-            CopyPasteMenu(state, Modifier.align(Alignment.Center))
-        }
+        AnimatedVisibility(
+            state.copyPasteMenuVisible,
+            enter = androidx.compose.animation.scaleIn(androidx.compose.animation.core.tween(180), initialScale = 0.94f) + fadeIn(androidx.compose.animation.core.tween(180)),
+            exit = androidx.compose.animation.scaleOut(androidx.compose.animation.core.tween(120), targetScale = 0.94f) + fadeOut(androidx.compose.animation.core.tween(120)),
+            modifier = Modifier.align(Alignment.Center),
+        ) { CopyPasteMenu(state) }
 
         // Tastenkürzel-Übersicht (Strg gedrückt halten)
         at.techgaisi.farbwerk.input.ShortcutOverlay(Modifier.align(Alignment.Center))
@@ -175,7 +182,11 @@ fun EditorScreen(state: EditorState) {
     }
 }
 
-/** Seitenleiste: Größe der Regler an die Bildschirmhöhe angepasst, verschiebbar, gleitet im Vollbild seitlich heraus. */
+/**
+ * Seitenleiste (UI_SPEC §2): bündig am Bildschirmrand (x = 0), Mitte bei ~45 % der Bildschirmhöhe.
+ * Die Rillenhöhe passt sich an kleine Bildschirme an; über den Modifizierer lässt sich die Leiste senkrecht
+ * verschieben ([Prefs.sidebarOffset] −1…1 relativ zum freien Weg). Im Vollbild gleitet sie seitlich heraus.
+ */
 @Composable
 private fun SidebarArea(state: EditorState, visible: Boolean) {
     val density = LocalDensity.current
@@ -186,9 +197,13 @@ private fun SidebarArea(state: EditorState, visible: Boolean) {
         val available = maxHeight - reserveTop - reserveBottom
         val slider = sidebarSliderHeight(available)
         val total = sidebarTotalHeight(slider)
-        // Verschiebeweg: symmetrisch um die Mitte, ohne unter die obere Leiste zu geraten
-        val travel = ((maxHeight / 2 - total / 2 - reserveTop).coerceAtLeast(0.dp))
+        // Grundlage: Mitte bei 45 % der Höhe, aber nie unter die obere Leiste oder über den unteren Rand
+        val maxTop = (maxHeight - reserveBottom - total).coerceAtLeast(reserveTop)
+        val baseTop = (maxHeight * UiMetrics.sidebarCenterFraction - total / 2).coerceIn(reserveTop, maxTop)
+        // Verschiebeweg: der kleinere freie Weg nach oben bzw. unten (symmetrisch um die Grundlage)
+        val travel = minOf(baseTop - reserveTop, maxTop - baseTop).coerceAtLeast(0.dp)
         val travelPx = with(density) { travel.toPx() }
+        val baseTopPx = with(density) { baseTop.toPx() }
         SidebarMove.travelPx = travelPx
         val right = state.prefs.sidebarRight
         AnimatedVisibility(
@@ -196,8 +211,8 @@ private fun SidebarArea(state: EditorState, visible: Boolean) {
             enter = slideInHorizontally(UiMotion.chromeOffset()) { if (right) it else -it } + fadeIn(UiMotion.chrome()),
             exit = slideOutHorizontally(UiMotion.chromeOffset()) { if (right) it else -it } + fadeOut(UiMotion.chrome()),
             modifier = Modifier
-                .align(if (right) Alignment.CenterEnd else Alignment.CenterStart)
-                .offset { IntOffset(0, (state.prefs.sidebarOffset * travelPx).roundToInt()) }
+                .align(if (right) Alignment.TopEnd else Alignment.TopStart)
+                .offset { IntOffset(0, (baseTopPx + state.prefs.sidebarOffset * travelPx).roundToInt()) }
                 .padding(horizontal = UiMetrics.sidebarEdge)
         ) { Sidebar(state, sliderHeight = slider) }
     }
@@ -217,89 +232,120 @@ private fun TrackPreviousBrushes(state: EditorState) {
     }
 }
 
+/**
+ * Obere Leiste (UI_SPEC §1): 44 dp hoch, Farbe `bar`, ohne Rand und Schatten.
+ *
+ *  - Links ab x = 12 dp „Galerie“ (15 sp, 400), dann 4 Symbole (22 dp) mit 36 dp Mitte-zu-Mitte, das erste
+ *    20 dp rechts vom Text. Aktiv/geöffnet: blaue Kreisscheibe Ø 30 dp hinter dem weißen Symbol.
+ *  - Rechts (Farbkreis 14 dp vom Rand) Malen, Wischen, Radieren, Ebenen (24 dp) mit 44 dp Mitte-zu-Mitte und
+ *    der Farbkreis (Ø 28 dp). Aktives Werkzeug / offenes Ebenen-Panel: Symbol in `accent`, kein Kreis.
+ */
 @Composable
 private fun TopBar(state: EditorState, anchors: PopoverAnchors) {
     val ui = LocalUi.current
-    Row(
+    val hit = UiMetrics.topIconHit
+    val rightHit = UiMetrics.topRightIconPitch
+    val circle = UiMetrics.topActiveCircle
+    // Klickfläche des Textes hat 8 dp Innenabstand; Text beginnt trotzdem bei x = 12 dp
+    val textPad = 8.dp
+    Box(
         Modifier
             .fillMaxWidth()
             .background(ui.bar)
             .statusBarsPadding()
             .height(UiMetrics.topBarHeight)
             .popoverAnchor(anchors, PopoverAnchors.Keys.BAR)
-            .padding(horizontal = UiMetrics.topBarSidePadding),
-        verticalAlignment = Alignment.CenterVertically,
-        horizontalArrangement = Arrangement.spacedBy(UiMetrics.topIconGap),
+            // Berührungen der Leiste nicht zur Leinwand durchlassen
+            .clickable(remember { MutableInteractionSource() }, indication = null) {}
     ) {
         // ---------- links ----------
-        Text(
-            "Galerie", color = ui.text, fontSize = UiMetrics.galleryText, fontWeight = FontWeight.Medium,
-            modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { state.closeToGallery() }
-                .padding(horizontal = 8.dp, vertical = 8.dp)
-        )
-        ToolIconButton(
-            AppIcons.Actions, "Aktionen", active = state.openPanel == Panel.ACTIONS,
-            modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.ACTIONS),
-        ) { togglePanel(state, Panel.ACTIONS) }
-        ToolIconButton(
-            AppIcons.Adjust, "Anpassungen",
-            active = state.openPanel == Panel.ADJUSTMENTS || state.tool == Tool.ADJUST,
-            modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.ADJUST),
+        Row(
+            Modifier.align(Alignment.CenterStart).padding(start = UiMetrics.topBarSidePadding - textPad),
+            verticalAlignment = Alignment.CenterVertically,
         ) {
-            if (state.tool == Tool.ADJUST && state.openPanel != Panel.ADJUSTMENTS) {
-                // Erneutes Tippen während einer Anpassung: übernehmen und verlassen
-                state.openPanel = Panel.NONE
-                state.adjustmentTool.applyAndClose()
-            } else togglePanel(state, Panel.ADJUSTMENTS)
-        }
-        ToolIconButton(
-            AppIcons.Select, "Auswahl", active = state.tool == Tool.SELECT,
-            modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.SELECT),
-            // Halten: letzte Auswahl neu laden
-            onLongClick = { state.openPanel = Panel.NONE; state.selectionTool.reloadLast() },
-        ) {
-            state.openPanel = Panel.NONE
-            state.selectTool(if (state.tool == Tool.SELECT) Tool.PAINT else Tool.SELECT)
-        }
-        ToolIconButton(
-            AppIcons.Transform, "Transformieren", active = state.tool == Tool.TRANSFORM,
-            modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.TRANSFORM),
-        ) {
-            state.openPanel = Panel.NONE
-            state.selectTool(if (state.tool == Tool.TRANSFORM) Tool.PAINT else Tool.TRANSFORM)
-        }
-
-        Spacer(Modifier.weight(1f))
-
-        // ---------- rechts ----------
-        BrushToolButton(state, anchors, Tool.PAINT, AppIcons.Paint, "Malen", PopoverAnchors.Keys.PAINT)
-        BrushToolButton(state, anchors, Tool.SMUDGE, AppIcons.Smudge, "Wischen", PopoverAnchors.Keys.SMUDGE)
-        BrushToolButton(state, anchors, Tool.ERASE, AppIcons.Erase, "Radieren", PopoverAnchors.Keys.ERASE)
-        ToolIconButton(
-            AppIcons.Layers, "Ebenen", active = state.openPanel == Panel.LAYERS,
-            modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.LAYERS),
-        ) { togglePanel(state, Panel.LAYERS) }
-        Spacer(Modifier.width(2.dp))
-        // Farbkreis: Tippen öffnet/schließt das Farben-Panel, Ziehen auf die Leinwand = ColorDrop
-        val drop = remember(state) { ColorDropController.of(state) }
-        val barGap = with(LocalDensity.current) { 10.dp.toPx() }
-        Box(Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.COLOR)) {
-            ColorDot(
-                state.color,
-                // Unterkante der Leiste ≈ Unterkante des Kreises + Restabstand – darüber wird nicht gefüllt
-                modifier = Modifier.onGloballyPositioned { drop.blockAboveY = it.boundsInWindow().bottom + barGap },
-                onDragStart = { p ->
-                    state.openPanel = Panel.NONE   // Leinwand freigeben
-                    drop.start(p)
-                },
-                onDrag = { drop.move(it) },
-                onDragEnd = { drop.end() },
-                onDragCancel = { drop.cancel() },
+            Text(
+                "Galerie", color = ui.text, fontSize = UiMetrics.galleryText, fontWeight = FontWeight.Normal,
+                maxLines = 1,
+                modifier = Modifier.clip(RoundedCornerShape(8.dp)).clickable { state.closeToGallery() }
+                    .padding(horizontal = textPad, vertical = 10.dp)
+            )
+            // Linke Kante des ersten Symbols 20 dp nach dem Text
+            Spacer(Modifier.width(UiMetrics.galleryToFirstIcon - textPad - (hit - UiMetrics.topIconSize) / 2))
+            ToolIconButton(
+                AppIcons.Actions, "Aktionen", active = state.openPanel == Panel.ACTIONS,
+                size = hit, iconSize = UiMetrics.topIconSize, activeCircle = circle,
+                modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.ACTIONS),
+            ) { togglePanel(state, Panel.ACTIONS) }
+            ToolIconButton(
+                AppIcons.Adjust, "Anpassungen",
+                active = state.openPanel == Panel.ADJUSTMENTS || state.tool == Tool.ADJUST,
+                size = hit, iconSize = UiMetrics.topIconSize, activeCircle = circle,
+                modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.ADJUST),
             ) {
-                state.openPanel = if (state.openPanel == Panel.COLORS) Panel.NONE else Panel.COLORS
+                if (state.tool == Tool.ADJUST && state.openPanel != Panel.ADJUSTMENTS) {
+                    // Erneutes Tippen während einer Anpassung: übernehmen und verlassen
+                    state.openPanel = Panel.NONE
+                    state.adjustmentTool.applyAndClose()
+                } else togglePanel(state, Panel.ADJUSTMENTS)
+            }
+            ToolIconButton(
+                AppIcons.Select, "Auswahl", active = state.tool == Tool.SELECT,
+                size = hit, iconSize = UiMetrics.topIconSize, activeCircle = circle,
+                modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.SELECT),
+                // Halten: letzte Auswahl neu laden
+                onLongClick = { state.openPanel = Panel.NONE; state.selectionTool.reloadLast() },
+            ) {
+                state.openPanel = Panel.NONE
+                state.selectTool(if (state.tool == Tool.SELECT) Tool.PAINT else Tool.SELECT)
+            }
+            ToolIconButton(
+                AppIcons.Transform, "Transformieren", active = state.tool == Tool.TRANSFORM,
+                size = hit, iconSize = UiMetrics.topIconSize, activeCircle = circle,
+                modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.TRANSFORM),
+            ) {
+                state.openPanel = Panel.NONE
+                state.selectTool(if (state.tool == Tool.TRANSFORM) Tool.PAINT else Tool.TRANSFORM)
             }
         }
-        Spacer(Modifier.width(4.dp))
+
+        // ---------- rechts ----------
+        Row(
+            // Farbkreis-Slot (44 dp) zentriert den 28-dp-Kreis → rechter Kreisrand bei 14 dp vom Rand
+            Modifier.align(Alignment.CenterEnd)
+                .padding(end = UiMetrics.topBarEndPadding - (rightHit - UiMetrics.colorDot) / 2),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            BrushToolButton(state, anchors, Tool.PAINT, AppIcons.Paint, "Malen", PopoverAnchors.Keys.PAINT)
+            BrushToolButton(state, anchors, Tool.SMUDGE, AppIcons.Smudge, "Wischen", PopoverAnchors.Keys.SMUDGE)
+            BrushToolButton(state, anchors, Tool.ERASE, AppIcons.Erase, "Radieren", PopoverAnchors.Keys.ERASE)
+            ToolIconButton(
+                AppIcons.Layers, "Ebenen", active = state.openPanel == Panel.LAYERS,
+                size = rightHit, iconSize = UiMetrics.topRightIconSize,
+                modifier = Modifier.popoverAnchor(anchors, PopoverAnchors.Keys.LAYERS),
+            ) { togglePanel(state, Panel.LAYERS) }
+            // Farbkreis: Tippen öffnet/schließt das Farben-Panel, Ziehen auf die Leinwand = ColorDrop
+            val drop = remember(state) { ColorDropController.of(state) }
+            val barGap = with(LocalDensity.current) { 10.dp.toPx() }
+            Box(
+                Modifier.size(rightHit).popoverAnchor(anchors, PopoverAnchors.Keys.COLOR),
+                contentAlignment = Alignment.Center,
+            ) {
+                ColorDot(
+                    state.color,
+                    // Unterkante der Leiste ≈ Unterkante des Kreises + Restabstand – darüber wird nicht gefüllt
+                    modifier = Modifier.onGloballyPositioned { drop.blockAboveY = it.boundsInWindow().bottom + barGap },
+                    onDragStart = { p ->
+                        state.openPanel = Panel.NONE   // Leinwand freigeben
+                        drop.start(p)
+                    },
+                    onDrag = { drop.move(it) },
+                    onDragEnd = { drop.end() },
+                    onDragCancel = { drop.cancel() },
+                ) {
+                    state.openPanel = if (state.openPanel == Panel.COLORS) Panel.NONE else Panel.COLORS
+                }
+            }
+        }
     }
 }
 
@@ -335,6 +381,7 @@ private fun BrushToolButton(
     } else null
     ToolIconButton(
         icon, label, active = state.tool == tool,
+        size = UiMetrics.topRightIconPitch, iconSize = UiMetrics.topRightIconSize,
         modifier = Modifier.popoverAnchor(anchors, anchorKey),
         onLongClick = hold,
     ) {
