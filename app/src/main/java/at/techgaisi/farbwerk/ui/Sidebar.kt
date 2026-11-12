@@ -21,6 +21,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -31,6 +32,9 @@ import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
+import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.layout.LayoutCoordinates
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -161,15 +165,76 @@ fun VerticalSlider(
 }
 
 
+/**
+ * Farbkreis (aktuelle Farbe) oben rechts.
+ *
+ *  - Kurzes Tippen → [onClick] (Farben-Panel öffnen/schließen). Ausgelöst beim Loslassen, damit ein
+ *    Ziehen nicht zusätzlich das Panel umschaltet.
+ *  - Ziehen über die Berührungstoleranz hinaus → [onDragStart], [onDrag], [onDragEnd] bzw. [onDragCancel]
+ *    mit FENSTER-Koordinaten (z. B. für ColorDrop auf die Leinwand). Compose liefert die Ereignisse auch
+ *    dann weiter an diesen Kreis, wenn der Finger längst über der Leinwand (AndroidView) ist.
+ *
+ * Die Füllfarbe folgt [argb] live (der Aufrufer liest state.color, das löst die Neuzusammensetzung aus).
+ */
 @Composable
-fun ColorDot(argb: Int, size: Int = 28, onClick: () -> Unit) {
+fun ColorDot(
+    argb: Int,
+    size: Int = 28,
+    modifier: Modifier = Modifier,
+    onDragStart: ((Offset) -> Unit)? = null,
+    onDrag: ((Offset) -> Unit)? = null,
+    onDragEnd: (() -> Unit)? = null,
+    onDragCancel: (() -> Unit)? = null,
+    onClick: () -> Unit,
+) {
     val ui = LocalUi.current
+    // Aktuelle Lambdas verwenden – pointerInput(Unit) startet nur einmal.
+    val click by rememberUpdatedState(onClick)
+    val dragStart by rememberUpdatedState(onDragStart)
+    val drag by rememberUpdatedState(onDrag)
+    val dragEnd by rememberUpdatedState(onDragEnd)
+    val dragCancel by rememberUpdatedState(onDragCancel)
+    val coords = remember { arrayOfNulls<LayoutCoordinates>(1) }
     Box(
-        Modifier
+        modifier
             .size(size.dp)
+            .onGloballyPositioned { coords[0] = it }
+            .pointerInput(Unit) {
+                awaitEachGesture {
+                    val down = awaitFirstDown()
+                    down.consume()
+                    val slop = viewConfiguration.touchSlop
+                    var dragging = false
+                    var finished = false
+                    fun toWindow(p: Offset): Offset = coords[0]?.takeIf { it.isAttached }?.localToWindow(p) ?: p
+                    try {
+                        while (true) {
+                            val ev = awaitPointerEvent()
+                            val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                            if (!ch.pressed) {
+                                ch.consume()
+                                finished = true
+                                if (dragging) dragEnd?.invoke() else click()
+                                break
+                            }
+                            if (!dragging && dragStart != null &&
+                                (ch.position - down.position).getDistance() > slop
+                            ) {
+                                dragging = true
+                                dragStart?.invoke(toWindow(ch.position))
+                            } else if (dragging && ch.positionChanged()) {
+                                drag?.invoke(toWindow(ch.position))
+                            }
+                            ch.consume()
+                        }
+                    } finally {
+                        // Geste ohne regulären Abschluss (Abbruch, Komposition verlassen) → Ziehen verwerfen
+                        if (dragging && !finished) dragCancel?.invoke()
+                    }
+                }
+            }
             .clip(CircleShape)
             .background(Color(argb))
             .border(2.dp, ui.icon.copy(alpha = 0.85f), CircleShape)
-            .pointerInput(Unit) { awaitEachGesture { awaitFirstDown(); onClick() } }
     )
 }

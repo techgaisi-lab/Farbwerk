@@ -26,6 +26,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -42,6 +46,9 @@ import at.techgaisi.farbwerk.ui.actions.ActionsPanel
 import at.techgaisi.farbwerk.ui.adjust.AdjustmentControls
 import at.techgaisi.farbwerk.ui.adjust.AdjustmentsMenu
 import at.techgaisi.farbwerk.ui.brush.BrushLibraryPanel
+import at.techgaisi.farbwerk.ui.color.ColorDropController
+import at.techgaisi.farbwerk.ui.color.ColorDropOverlay
+import at.techgaisi.farbwerk.ui.color.ColorDropTapLayer
 import at.techgaisi.farbwerk.ui.color.ColorPanel
 import at.techgaisi.farbwerk.ui.common.ToolIconButton
 import at.techgaisi.farbwerk.ui.gallery.GalleryScreen
@@ -72,6 +79,8 @@ fun EditorScreen(state: EditorState) {
             update = { state.canvasView = it },
             modifier = Modifier.fillMaxSize(),
         )
+        // ColorDrop-Nachfüllmodus: Tipp-Ebene über der Leinwand, unter Leisten/Panels (nur wenn aktiv)
+        ColorDropTapLayer(state)
 
         AnimatedVisibility(
             !state.fullscreen, enter = slideInVertically { -it } + fadeIn(),
@@ -135,6 +144,9 @@ fun EditorScreen(state: EditorState) {
             ) { Text(msg, color = Color.White, fontSize = 13.sp) }
         }
 
+        // ColorDrop: Farbtropfen beim Ziehen, Schwellenwert-Leiste, „Nachfüllen fortsetzen“ (ganz oben)
+        ColorDropOverlay(state)
+
         // Vollbild-Indikator oben links
         if (state.fullscreen) {
             Box(
@@ -192,7 +204,21 @@ private fun TopBar(state: EditorState) {
             state.openPanel = if (state.openPanel == Panel.LAYERS) Panel.NONE else Panel.LAYERS
         }
         Spacer(Modifier.width(6.dp))
-        ColorDot(state.color) {
+        // Farbkreis: Tippen öffnet/schließt das Farben-Panel, Ziehen auf die Leinwand = ColorDrop
+        val drop = remember(state) { ColorDropController.of(state) }
+        val barGap = with(LocalDensity.current) { 10.dp.toPx() }
+        ColorDot(
+            state.color,
+            // Unterkante der Leiste ≈ Unterkante des Kreises + Restabstand – darüber wird nicht gefüllt
+            modifier = Modifier.onGloballyPositioned { drop.blockAboveY = it.boundsInWindow().bottom + barGap },
+            onDragStart = { p ->
+                state.openPanel = Panel.NONE   // Leinwand freigeben
+                drop.start(p)
+            },
+            onDrag = { drop.move(it) },
+            onDragEnd = { drop.end() },
+            onDragCancel = { drop.cancel() },
+        ) {
             state.openPanel = if (state.openPanel == Panel.COLORS) Panel.NONE else Panel.COLORS
         }
     }

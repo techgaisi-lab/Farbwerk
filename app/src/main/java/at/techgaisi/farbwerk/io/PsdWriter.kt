@@ -44,6 +44,15 @@ object PsdWriter {
         LayerBlend.SATURATION -> "sat "
         LayerBlend.COLOR -> "colr"
         LayerBlend.LUMINOSITY -> "lum "
+        LayerBlend.SHADE -> "lbrn"
+        LayerBlend.DARKER_COLOR -> "dkCl"
+        LayerBlend.LIGHTER_COLOR -> "lgCl"
+        LayerBlend.VIVID_LIGHT -> "vLit"
+        LayerBlend.LINEAR_LIGHT -> "lLit"
+        LayerBlend.PIN_LIGHT -> "pLit"
+        LayerBlend.HARD_MIX -> "hMix"
+        LayerBlend.SUBTRACT -> "fsub"
+        LayerBlend.DIVIDE -> "fdiv"
     }
 
     /** Ein Eintrag der PSD-Ebenenliste (echte Ebene, Gruppenbeginn oder Gruppenende). */

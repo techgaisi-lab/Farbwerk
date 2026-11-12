@@ -19,17 +19,14 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.rememberScrollState
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,28 +39,13 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.LocalDensity
-import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.unit.IntOffset
-import androidx.compose.ui.unit.IntRect
-import androidx.compose.ui.unit.IntSize
-import androidx.compose.ui.unit.LayoutDirection
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
-import androidx.compose.ui.window.Popup
-import androidx.compose.ui.window.PopupPositionProvider
-import androidx.compose.ui.window.PopupProperties
 import at.techgaisi.farbwerk.EditorState
-import at.techgaisi.farbwerk.color.ColorDrop
 import at.techgaisi.farbwerk.color.PaletteStore
 import at.techgaisi.farbwerk.ui.common.PanelCard
 import at.techgaisi.farbwerk.ui.theme.LocalUi
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 /** Tabs des Farben-Panels. */
 enum class ColorTab(val label: String) {
@@ -87,23 +69,24 @@ fun ColorPanel(state: EditorState, modifier: Modifier = Modifier) {
     val model = remember { HsvModel(state) }
     val store = remember { PaletteStore.get(state.context) }
     var tab by remember { mutableStateOf(lastTab) }
-    val scope = rememberCoroutineScope()
-    val density = LocalDensity.current
-    val drag = remember { ColorDragController(state, scope, with(density) { 10.dp.toPx() }, with(density) { 280.dp.toPx() }) }
+    val drag = remember(state) { ColorDropController.of(state) }
+    var panelBounds by remember { mutableStateOf(Rect.Zero) }
 
     // externe Farbänderungen (Pipette, Verlauf, Tastenkürzel …) ins Modell übernehmen
     LaunchedEffect(state.color) { model.syncFrom(state.color) }
 
-    PanelCard(modifier.onGloballyPositioned { drag.panelBounds = it.boundsInWindow() }) {
-        Header(state, drag)
+    PanelCard(modifier.onGloballyPositioned { panelBounds = it.boundsInWindow() }) {
+        Header(state, drag) { panelBounds }
 
         Box(Modifier.weight(1f).fillMaxWidth()) {
             when (tab) {
                 ColorTab.PALETTES -> PalettesTab(state, model, store)
                 ColorTab.VALUES -> ValuesTab(model)
+                // Scheibe nicht scrollen: sie passt sich an die verfügbare Höhe an (kleine Tablets),
+                // und Scroll-Gesten würden mit dem Ziehen in Ring/Scheibe konkurrieren.
+                ColorTab.DISC -> DiscTab(model)
                 else -> Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
                     when (tab) {
-                        ColorTab.DISC -> DiscTab(model)
                         ColorTab.CLASSIC -> ClassicTab(model)
                         ColorTab.HARMONY -> HarmonyTab(model)
                         else -> {}
@@ -116,14 +99,12 @@ fun ColorPanel(state: EditorState, modifier: Modifier = Modifier) {
         MiniStrips(state, model, store)
         TabBar(tab) { tab = it; lastTab = it }
     }
-
-    if (drag.active) DragOverlay(state, drag)
 }
 
 // ============================================================================ Kopfzeile
 
 @Composable
-private fun Header(state: EditorState, drag: ColorDragController) {
+private fun Header(state: EditorState, drag: ColorDropController, panelBounds: () -> Rect) {
     val ui = LocalUi.current
     var swatchCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     Row(
@@ -142,7 +123,8 @@ private fun Header(state: EditorState, drag: ColorDragController) {
                 .onGloballyPositioned { swatchCoords = it }
                 .pointerInput(Unit) {
                     detectDragGestures(
-                        onDragStart = { off -> swatchCoords?.let { drag.start(it.localToWindow(off)) } },
+                        // Ablegen über dem Panel selbst füllt nicht
+                        onDragStart = { off -> swatchCoords?.let { drag.start(it.localToWindow(off), panelBounds()) } },
                         onDrag = { change, _ ->
                             change.consume()
                             swatchCoords?.let { drag.move(it.localToWindow(change.position)) }
@@ -265,152 +247,6 @@ private fun TabGlyph(tab: ColorTab, tint: Color) {
                 val cell = (s - 3 * sw) / 2f
                 for (i in 0..1) for (j in 0..1) {
                     drawRect(tint, Offset(sw + i * (cell + sw), sw + j * (cell + sw)), androidx.compose.ui.geometry.Size(cell, cell))
-                }
-            }
-        }
-    }
-}
-
-// ============================================================================ Ziehen auf die Leinwand (ColorDrop)
-
-/**
- * Zustandsmaschine für "Farbe auf die Leinwand ziehen":
- *  - Loslassen außerhalb des Panels → Bereich mit [ColorDrop.lastThreshold] füllen.
- *  - Finger nach dem Ablegen kurz still halten → Vorschau-Füllung; waagrechtes Ziehen ändert den
- *    Schwellenwert live, Loslassen übernimmt.
- * Alle Positionen in Fensterkoordinaten.
- */
-private class ColorDragController(
-    private val state: EditorState,
-    private val scope: CoroutineScope,
-    private val slopPx: Float,
-    /** Wegstrecke (px), die einer Schwellenwertänderung von 100 % entspricht. */
-    private val rangePx: Float,
-) {
-    var active by mutableStateOf(false); private set
-    var pos by mutableStateOf(Offset.Zero); private set
-    var thresholdMode by mutableStateOf(false); private set
-    var thresholdPercent by mutableIntStateOf(0); private set
-    var panelBounds: Rect = Rect.Zero
-
-    private var holdJob: Job? = null
-    private var holdAnchor = Offset.Zero
-    private var anchorX = 0f
-    private var startThreshold = 0f
-
-    fun start(p: Offset) {
-        active = true
-        pos = p
-        thresholdMode = false
-        scheduleHold(p)
-    }
-
-    fun move(p: Offset) {
-        if (!active) return
-        pos = p
-        if (thresholdMode) {
-            val t = (startThreshold + (p.x - anchorX) / rangePx).coerceIn(0f, 1f)
-            ColorDrop.updateThreshold(t)
-            thresholdPercent = (ColorDrop.currentThreshold * 100f).roundToInt()
-        } else if ((p - holdAnchor).getDistance() > slopPx) {
-            scheduleHold(p)
-        }
-    }
-
-    fun end() {
-        holdJob?.cancel()
-        if (thresholdMode) {
-            ColorDrop.commit()
-        } else if (!panelBounds.contains(pos)) {
-            ColorDrop.fillAtWindowPoint(state, pos.x, pos.y)
-        }
-        reset()
-    }
-
-    fun cancel() {
-        holdJob?.cancel()
-        if (thresholdMode) ColorDrop.cancel()
-        reset()
-    }
-
-    private fun reset() {
-        active = false
-        thresholdMode = false
-    }
-
-    private fun scheduleHold(p: Offset) {
-        holdAnchor = p
-        holdJob?.cancel()
-        holdJob = scope.launch {
-            delay(HOLD_MS)
-            if (!active || thresholdMode || panelBounds.contains(pos)) return@launch
-            if (ColorDrop.beginAtWindowPoint(state, pos.x, pos.y)) {
-                thresholdMode = true
-                anchorX = pos.x
-                startThreshold = ColorDrop.currentThreshold
-                thresholdPercent = (startThreshold * 100f).roundToInt()
-            }
-        }
-    }
-
-    private companion object { const val HOLD_MS = 550L }
-}
-
-/** Positionsgeber, der das Popup im Ursprung des Fensters platziert. */
-private object OriginPositionProvider : PopupPositionProvider {
-    override fun calculatePosition(
-        anchorBounds: IntRect, windowSize: IntSize, layoutDirection: LayoutDirection, popupContentSize: IntSize,
-    ): IntOffset = IntOffset.Zero
-}
-
-/** Schwebender Farbpunkt und Schwellenwertanzeige während des Ziehens (eigenes Fenster, nicht geclippt). */
-@Composable
-private fun DragOverlay(state: EditorState, drag: ColorDragController) {
-    val ui = LocalUi.current
-    val hostView = LocalView.current
-    // Ursprung des Hauptfensters auf dem Bildschirm
-    val hostOrigin = remember(hostView) {
-        val screen = IntArray(2); val win = IntArray(2)
-        hostView.getLocationOnScreen(screen); hostView.getLocationInWindow(win)
-        Offset((screen[0] - win[0]).toFloat(), (screen[1] - win[1]).toFloat())
-    }
-    Popup(
-        popupPositionProvider = OriginPositionProvider,
-        properties = PopupProperties(focusable = false, clippingEnabled = false, dismissOnClickOutside = false),
-    ) {
-        val popupView = LocalView.current
-        var popupOrigin by remember { mutableStateOf(Offset.Zero) }
-        Box(Modifier.fillMaxSize().onGloballyPositioned {
-            val a = IntArray(2); popupView.getLocationOnScreen(a)
-            popupOrigin = Offset(a[0].toFloat(), a[1].toFloat())
-        }) {
-            Canvas(Modifier.fillMaxSize()) {
-                val p = drag.pos + hostOrigin - popupOrigin
-                val r = 15.dp.toPx()
-                drawCircle(Color(0x44000000), r + 3.dp.toPx(), p + Offset(0f, 2.dp.toPx()))
-                drawCircle(Color.White, r + 2.dp.toPx(), p)
-                drawCircle(Color(state.color), r, p)
-            }
-            if (drag.thresholdMode) {
-                Column(
-                    Modifier
-                        .align(Alignment.TopCenter)
-                        .padding(top = 64.dp)
-                        .clip(RoundedCornerShape(10.dp))
-                        .background(ui.panel)
-                        .padding(horizontal = 16.dp, vertical = 10.dp),
-                    horizontalAlignment = Alignment.CenterHorizontally
-                ) {
-                    Text("Schwellenwert: ${drag.thresholdPercent} %", color = ui.text, fontSize = 14.sp, fontWeight = FontWeight.Medium)
-                    Spacer(Modifier.height(6.dp))
-                    Box(Modifier.width(200.dp).height(4.dp).clip(CircleShape).background(ui.divider)) {
-                        Box(
-                            Modifier.fillMaxWidth(drag.thresholdPercent / 100f).height(4.dp)
-                                .clip(CircleShape).background(ui.accent)
-                        )
-                    }
-                    Spacer(Modifier.height(4.dp))
-                    Text("Nach links/rechts ziehen", color = ui.textMuted, fontSize = 11.sp)
                 }
             }
         }

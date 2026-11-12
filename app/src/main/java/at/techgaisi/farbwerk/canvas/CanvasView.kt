@@ -11,10 +11,14 @@ import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
 import android.graphics.Shader
+import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
+import android.view.KeyEvent
 import android.view.MotionEvent
 import android.view.View
+import androidx.input.motionprediction.MotionEventPredictor
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.guides.GuidesOverlay
 import at.techgaisi.farbwerk.model.InputPoint
@@ -22,11 +26,17 @@ import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.model.ToolInputHandler
 import at.techgaisi.farbwerk.render.Compositor
 import at.techgaisi.farbwerk.selection.SelectionOverlay
+import at.techgaisi.farbwerk.stylus.HoverPreview
+import at.techgaisi.farbwerk.stylus.StylusActions
+import at.techgaisi.farbwerk.stylus.StylusButtonAction
+import at.techgaisi.farbwerk.stylus.StylusSession
 import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.cos
 import kotlin.math.hypot
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.sin
 
 /**
  * Die Leinwand. Zuständig für:
@@ -42,6 +52,12 @@ import kotlin.math.min
  *      3 Finger hin und her: Ebene leeren
  *      3 Finger nach unten wischen: Kopieren & Einfügen-Menü
  *      4-Finger-Tippen: Vollbild umschalten
+ *  - Stift (S Pen), angelehnt an das Apple-Pencil-Verhalten:
+ *      ungebündelte Zustellung + Bewegungsvorhersage (nur Vorschau), Druck/Neigung/Ausrichtung je Sample,
+ *      Handballenerkennung (Stift bevorzugt, Finger-Kontakte in Stiftnähe gedämpft, große Kontakte verworfen),
+ *      "Nur Stift malt", sobald ein Stift benutzt wurde, Schwebevorschau des Pinsels,
+ *      Seitentaste (beim Berühren: Pipette/Radierer/…; Klick in der Luft: konfigurierbare Aktion),
+ *      Radierer-Ende radiert.
  */
 @SuppressLint("ViewConstructor")
 class CanvasView(context: Context, private val state: EditorState) : View(context) {
@@ -174,7 +190,22 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         try { GuidesOverlay.draw(canvas, state, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "guides", t) }
         try { SelectionOverlay.draw(canvas, state, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "selOverlay", t) }
         try { state.activeHandler()?.drawOverlay(canvas, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "overlay", t) }
+        try { state.canvasOverride?.drawOverlay(canvas, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "ovOverlay", t) }
         if (eyedropperActive) state.eyedropper.drawOverlay(canvas, m)
+        if (hovering && mode != Mode.STROKE && mode != Mode.EYEDROPPER && state.prefs.hoverPreview) drawHover(canvas, m)
+    }
+
+    /** Schwebevorschau: Pinselumriss bzw. Pipetten-Ring an der Stiftposition. */
+    private fun drawHover(canvas: Canvas, m: Matrix) {
+        val pipette = state.eyedropperArmed || (penButtonDown &&
+            (StylusButtonAction.fromId(state.prefs.stylusButtonAction) == StylusButtonAction.EYEDROPPER ||
+                StylusButtonAction.fromId(state.prefs.stylusButtonHoverAction) == StylusButtonAction.EYEDROPPER))
+        val inv = Matrix(); m.invert(inv)
+        val pt = floatArrayOf(hoverX, hoverY); inv.mapPoints(pt)
+        try {
+            hoverPreview.draw(canvas, m, hoverX, hoverY, pt[0], pt[1], hoverTilt, hoverOrient, hoverEraser,
+                showBrush = true, pipette = pipette)
+        } catch (t: Throwable) { android.util.Log.e("Farbwerk", "hover", t) }
     }
 
     /** Matrix Dokument → View inkl. Spiegelung. */
@@ -207,7 +238,11 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private var strokeStartX = 0f
     private var strokeStartY = 0f
     private var lastPoint: InputPoint? = null
-    private var stylusEraserOverride = false
+    /** Vorübergehendes Werkzeug für den nächsten Strich (Radierer-Ende, Seitentaste "Radierer"). */
+    private var strokeTempTool: Tool? = null
+
+    /** Aktueller Finger-Kontakt wurde von der Handballenerkennung gedämpft (Stift in der Nähe). */
+    private var fingerSuppressed = false
 
     // Gesten
     private var gestureMaxPointers = 0
@@ -223,33 +258,153 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private var gestureScrubReversals = 0
     private var gestureScrubAnchorX = 0f
     private var gestureConsumed = false
+    /** Tipp-Gesten (Rückgängig, Vollbild …) unterdrücken – Geste begann, während der Stift nahe war. */
+    private var gestureSuppressTaps = false
     private var savedViewBeforeFit: Matrix? = null
     private var rapidRepeating = false
 
     private val slop get() = 12f * density
+    private val pxPerMm = resources.displayMetrics.xdpi.coerceAtLeast(80f) / 25.4f
 
-    private fun toDoc(e: MotionEvent, idx: Int, hist: Int = -1): InputPoint {
+    // Koordinaten-Umrechnung: Inverse der Anzeige-Matrix, einmal pro Ereignis berechnet
+    private val invDisplay = Matrix()
+    private val mapTmp = FloatArray(2)
+
+    private fun prepareInverse() { displayMatrix().invert(invDisplay) }
+
+    // Bewegungsvorhersage
+    private val predictor: MotionEventPredictor? = try { MotionEventPredictor.newInstance(this) } catch (t: Throwable) { null }
+    private val predictedPts = ArrayList<InputPoint>(32)
+
+    // Schweben (Hover) und Seitentaste
+    private val hoverPreview = HoverPreview(state)
+    private var hovering = false
+    private var lastHoverTime = 0L
+    private var hoverX = 0f
+    private var hoverY = 0f
+    private var hoverTilt = 0f
+    private var hoverOrient = 0f
+    private var hoverEraser = false
+    private var penButtonDown = false
+    private var penButtonDownTime = 0L
+    /** Taste wurde während einer Berührung benutzt → beim Loslassen kein "Klick in der Luft". */
+    private var penButtonUsed = false
+    private var lastPenButtonMotion = Long.MIN_VALUE / 2
+    /** Samsung-Altgeräte melden Striche mit gedrückter Taste als eigene Aktionen (211–214). */
+    private var samsungButtonEvent = false
+
+    /**
+     * Wandelt einen Zeiger (optional einen historischen Wert) in einen Eingabepunkt in Dokument-Koordinaten.
+     * Druck (mit Druckkurve), Neigung (AXIS_TILT, Radiant ab Senkrechte) und Ausrichtung (in Dokument-Richtung
+     * umgerechnet) werden auch für alle historischen Samples einzeln gelesen. [prepareInverse] vorher aufrufen.
+     */
+    private fun toDoc(e: MotionEvent, idx: Int, hist: Int = -1, forceStylus: Boolean? = null): InputPoint {
         val x = if (hist >= 0) e.getHistoricalX(idx, hist) else e.getX(idx)
         val y = if (hist >= 0) e.getHistoricalY(idx, hist) else e.getY(idx)
-        val pts = floatArrayOf(x, y)
-        val inv = Matrix(); displayMatrix().invert(inv)
-        inv.mapPoints(pts)
-        val stylus = e.getToolType(idx) == MotionEvent.TOOL_TYPE_STYLUS || e.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER
-        val rawP = if (hist >= 0) e.getHistoricalPressure(idx, hist) else e.getPressure(idx)
-        val pressure = if (stylus) state.prefs.applyPressureCurve(rawP) else 1f
-        val tilt = if (stylus) e.getAxisValue(MotionEvent.AXIS_TILT, idx) else 0f
-        val orient = if (stylus) e.getOrientation(idx) else 0f
+        mapTmp[0] = x; mapTmp[1] = y
+        invDisplay.mapPoints(mapTmp)
+        val stylus = forceStylus ?: isStylus(e, idx)
+        var pressure = 1f
+        var tilt = 0f
+        var orient = 0f
+        if (stylus) {
+            val rawP = if (hist >= 0) e.getHistoricalPressure(idx, hist) else e.getPressure(idx)
+            pressure = state.prefs.applyPressureCurve(rawP)
+            tilt = (if (hist >= 0) e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, idx, hist)
+                    else e.getAxisValue(MotionEvent.AXIS_TILT, idx)).coerceIn(0f, HALF_PI)
+            val o = if (hist >= 0) e.getHistoricalOrientation(idx, hist) else e.getOrientation(idx)
+            orient = screenOrientationToDoc(o)
+        }
         val t = if (hist >= 0) e.getHistoricalEventTime(hist) else e.eventTime
-        return InputPoint(pts[0], pts[1], pressure, tilt, orient, t, stylus)
+        return InputPoint(mapTmp[0], mapTmp[1], pressure, tilt, orient, t, stylus)
     }
+
+    /**
+     * MotionEvent-Ausrichtung des Stifts (0 = nach oben, +π/2 = nach rechts, Bildschirm) → Winkel im
+     * Dokument (atan2-Konvention, x nach rechts, y nach unten), berücksichtigt Drehung/Spiegelung der Ansicht.
+     */
+    private fun screenOrientationToDoc(o: Float): Float {
+        if (o == 0f && !orientationSeen) return 0f
+        orientationSeen = true
+        val a = o - HALF_PI
+        val v0 = cos(a); val v1 = sin(a)
+        mapTmp2[0] = v0; mapTmp2[1] = v1
+        invDisplay.mapVectors(mapTmp2)
+        return atan2(mapTmp2[1], mapTmp2[0])
+    }
+    private val mapTmp2 = FloatArray(2)
+    /** Bis der Digitizer einmal eine Ausrichtung ≠ 0 liefert, gilt er als ohne Ausrichtung (Winkel 0). */
+    private var orientationSeen = false
 
     private fun isStylus(e: MotionEvent, idx: Int) =
         e.getToolType(idx) == MotionEvent.TOOL_TYPE_STYLUS || e.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER
 
+    private fun hasStylus(e: MotionEvent): Boolean {
+        for (i in 0 until e.pointerCount) if (isStylus(e, i)) return true
+        return false
+    }
+
+    private fun penButtonPressed(e: MotionEvent): Boolean =
+        samsungButtonEvent || (e.buttonState and StylusSession.BUTTON_MASK) != 0
+
+    // ---------------------------------------------------------- Handballenerkennung
+
+    /** Großflächiger Kontakt oder vom System als Handballen gemeldet. */
+    private fun isPalmContact(e: MotionEvent, idx: Int): Boolean {
+        val strength = state.prefs.palmRejection
+        if (e.getToolType(idx) == StylusSession.TOOL_TYPE_PALM) return true
+        if (strength <= 0 || e.getToolType(idx) != MotionEvent.TOOL_TYPE_FINGER) return false
+        val major = e.getTouchMajor(idx)
+        return major > StylusSession.palmSizeMm(strength) * pxPerMm
+    }
+
+    /** Ist der Stift gerade nah (schwebt, berührt oder war bis vor Kurzem in Reichweite)? */
+    private fun stylusNear(now: Long): Boolean {
+        val strength = state.prefs.palmRejection
+        if (strength <= 0) return false
+        if (mode == Mode.STROKE && strokeIsStylus) return true
+        // Ein verpasstes HOVER_EXIT (z. B. Stift über einem Panel verlassen) darf Finger nicht dauerhaft sperren
+        if (hovering && now - lastHoverTime < 2000L) return true
+        return now - StylusSession.lastStylusTime < StylusSession.palmWindowMs(strength)
+    }
+
+    /** Dürfen Finger gerade malen? ("Mit Finger malen" und "Nur Stift malt nach Stifterkennung") */
+    private fun fingerMayPaint(): Boolean =
+        state.prefs.fingerPainting && !(state.prefs.stylusOnlyAfterPen && StylusSession.stylusUsed)
+
+    private fun isCanceledPointer(e: MotionEvent): Boolean =
+        Build.VERSION.SDK_INT >= 33 && (e.flags and StylusSession.FLAG_CANCELED) != 0
+
+    // ---------------------------------------------------------- Ereignisverteilung
+
     @SuppressLint("ClickableViewAccessibility")
     override fun onTouchEvent(e: MotionEvent): Boolean {
         if (state.document == null) return false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE, MotionEvent.ACTION_HOVER_EXIT -> return handleHover(e)
+            MotionEvent.ACTION_BUTTON_PRESS, MotionEvent.ACTION_BUTTON_RELEASE -> {
+                if (hasStylus(e)) trackPenButton(e, touching = mode == Mode.STROKE || mode == Mode.EYEDROPPER)
+                return true
+            }
+        }
+        // Samsung-S-Pen-Aktionen mit gedrückter Taste (ältere Geräte) auf Standardaktionen abbilden
+        samsungButtonEvent = false
+        when (e.actionMasked) {
+            SPEN_ACTION_DOWN -> { e.action = MotionEvent.ACTION_DOWN; samsungButtonEvent = true }
+            SPEN_ACTION_UP -> { e.action = MotionEvent.ACTION_UP; samsungButtonEvent = true }
+            SPEN_ACTION_MOVE -> { e.action = MotionEvent.ACTION_MOVE; samsungButtonEvent = true }
+            SPEN_ACTION_CANCEL -> { e.action = MotionEvent.ACTION_CANCEL; samsungButtonEvent = true }
+        }
         requestFocus()
+        prepareInverse()
+        if (hasStylus(e)) {
+            StylusSession.seen(e.eventTime, touched = true)
+            if (hovering) { hovering = false; hoverPreview.reset() }
+            trackPenButton(e, touching = true)
+        }
+        if (predictor != null && state.prefs.motionPrediction) {
+            try { predictor.record(e) } catch (t: Throwable) { android.util.Log.w("Farbwerk", "predictor", t) }
+        }
         when (e.actionMasked) {
             MotionEvent.ACTION_DOWN -> onFirstDown(e)
             MotionEvent.ACTION_POINTER_DOWN -> onPointerDown(e)
@@ -261,8 +416,110 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         return true
     }
 
+    override fun onHoverEvent(e: MotionEvent): Boolean = handleHover(e) || super.onHoverEvent(e)
+
+    override fun onGenericMotionEvent(e: MotionEvent): Boolean {
+        if (state.document != null && hasStylus(e) &&
+            (e.actionMasked == MotionEvent.ACTION_BUTTON_PRESS || e.actionMasked == MotionEvent.ACTION_BUTTON_RELEASE)
+        ) {
+            trackPenButton(e, touching = mode == Mode.STROKE || mode == Mode.EYEDROPPER)
+            return true
+        }
+        return super.onGenericMotionEvent(e)
+    }
+
+    /** Stift schwebt über dem Display: Position für Vorschau/Handballenerkennung merken, Seitentaste verfolgen. */
+    private fun handleHover(e: MotionEvent): Boolean {
+        if (state.document == null) return false
+        if (!isStylus(e, 0)) {
+            if (hovering) { hovering = false; invalidate() }
+            return false
+        }
+        StylusSession.seen(e.eventTime, touched = false)
+        prepareInverse()
+        samsungButtonEvent = false
+        when (e.actionMasked) {
+            MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
+                if (!hovering) hoverPreview.reset()
+                hovering = true
+                lastHoverTime = e.eventTime
+                hoverX = e.x; hoverY = e.y
+                hoverTilt = e.getAxisValue(MotionEvent.AXIS_TILT, 0).coerceIn(0f, HALF_PI)
+                hoverOrient = screenOrientationToDoc(e.getOrientation(0))
+                hoverEraser = e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
+                trackPenButton(e, touching = false)
+                if (state.prefs.hoverPreview && mode != Mode.STROKE) invalidate()
+            }
+            MotionEvent.ACTION_HOVER_EXIT -> {
+                trackPenButton(e, touching = false)
+                hovering = false
+                invalidate()
+            }
+        }
+        return true
+    }
+
+    /**
+     * Verfolgt die Seitentaste über Zustandswechsel (funktioniert unabhängig davon, ob das Gerät
+     * ACTION_BUTTON_PRESS sendet oder nur buttonState in Schwebe-/Berührungsereignissen setzt).
+     * Drücken und Loslassen ohne Berührung dazwischen = Klick in der Luft → [performHoverClick].
+     */
+    private fun trackPenButton(e: MotionEvent, touching: Boolean) {
+        val pressed = penButtonPressed(e)
+        if (pressed && !penButtonDown) {
+            penButtonDown = true
+            penButtonDownTime = e.eventTime
+            penButtonUsed = touching
+            lastPenButtonMotion = SystemClock.uptimeMillis()
+            if (hovering) invalidate()
+        } else if (!pressed && penButtonDown) {
+            penButtonDown = false
+            lastPenButtonMotion = SystemClock.uptimeMillis()
+            if (!penButtonUsed && !touching && e.eventTime - penButtonDownTime < 1000L) performHoverClick()
+            if (hovering) invalidate()
+        } else if (pressed && touching) {
+            penButtonUsed = true
+        }
+    }
+
+    /** Seitentaste in der Luft geklickt (Stift schwebt). */
+    private fun performHoverClick() {
+        if (mode == Mode.STROKE || mode == Mode.EYEDROPPER || mode == Mode.GESTURE) return
+        val action = StylusButtonAction.fromId(state.prefs.stylusButtonHoverAction)
+        if (action == StylusButtonAction.OFF) return
+        prepareInverse()
+        mapTmp[0] = hoverX; mapTmp[1] = hoverY
+        invDisplay.mapPoints(mapTmp)
+        StylusActions.performClick(state, action, mapTmp[0], mapTmp[1])
+        invalidate()
+    }
+
+    /**
+     * Stift-Tastenereignisse (Android 14+: KEYCODE_STYLUS_BUTTON_*), falls das Gerät die Seitentaste so meldet
+     * statt über MotionEvent.buttonState. Wird ignoriert, wenn die Taste gerade schon über Bewegungsereignisse
+     * erkannt wurde.
+     */
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode in KEYCODE_STYLUS_FIRST..KEYCODE_STYLUS_LAST) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode in KEYCODE_STYLUS_FIRST..KEYCODE_STYLUS_LAST) {
+            if (SystemClock.uptimeMillis() - lastPenButtonMotion > 300L && !penButtonDown) performHoverClick()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
+    }
+
+    // ---------------------------------------------------------- Berührungen
+
     private fun onFirstDown(e: MotionEvent) {
         cancelTimers()
+        fingerSuppressed = false
+        strokeTempTool = null
+        // Geringste Latenz: Ereignisse dieses Kontakts nicht bündeln (nicht erst zum nächsten Frame liefern)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) requestUnbufferedDispatch(e)
         state.copyPasteMenuVisible = false
         if (state.openPanel != at.techgaisi.farbwerk.model.Panel.NONE) {
             // Tippen auf die Leinwand schließt offene Panels (wie im Original) – und malt nicht.
@@ -276,32 +533,91 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             gestureLastCx = e.x; gestureLastCy = e.y
             return
         }
-        if (state.eyedropperArmed) {
-            startEyedropper(toDoc(e, 0))
+        if (!stylus && isPalmContact(e, 0)) {
+            // Handballen: ganzen Kontakt verwerfen (ein später aufsetzender Stift malt trotzdem)
+            mode = Mode.BLOCKED
             return
         }
-        if (!stylus && !state.prefs.fingerPainting && state.tool in setOf(Tool.PAINT, Tool.SMUDGE, Tool.ERASE)) {
-            // Finger malen deaktiviert: nur Gesten/Pipette
-            mode = Mode.IDLE
+        if (stylus && handleStylusButtonDown(e, 0)) return
+        if (state.eyedropperArmed) {
+            startEyedropper(toDoc(e, 0), e.getPointerId(0), stylus)
+            return
+        }
+        if (!stylus) {
             strokeStartX = e.x; strokeStartY = e.y
             strokeIsStylus = false
             strokeStartTime = e.eventTime
-            scheduleHoldEyedropper(e)
-            return
+            if (stylusNear(e.eventTime)) {
+                // Stift in der Nähe: einzelner Finger-Kontakt ist sehr wahrscheinlich der Handballen
+                fingerSuppressed = true
+                mode = Mode.IDLE
+                return
+            }
+            if (!fingerMayPaint() && state.tool in BRUSH_TOOLS) {
+                // Finger malen nicht: nur Gesten/Pipette
+                mode = Mode.IDLE
+                scheduleHoldEyedropper(e)
+                return
+            }
         }
-        stylusEraserOverride = e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER &&
-            state.tool in setOf(Tool.PAINT, Tool.SMUDGE)
+        prepareTempTool(e, 0)
         startStroke(e, 0)
     }
 
+    /**
+     * Seitentaste beim Aufsetzen gedrückt: konfigurierte Aktion ausführen.
+     * @return true, wenn der Kontakt damit erledigt ist (kein Strich)
+     */
+    private fun handleStylusButtonDown(e: MotionEvent, idx: Int): Boolean {
+        if (!penButtonPressed(e)) return false
+        penButtonUsed = true
+        return when (StylusButtonAction.fromId(state.prefs.stylusButtonAction)) {
+            StylusButtonAction.OFF -> false
+            StylusButtonAction.EYEDROPPER -> {
+                // Taste halten + ziehen = Pipette mit Lupe, Farbe wird beim Abheben übernommen
+                startEyedropper(toDoc(e, idx), e.getPointerId(idx), true)
+                true
+            }
+            StylusButtonAction.ERASER -> {
+                // Radieren, solange die Taste gehalten wird (bzw. Malen, wenn der Radierer aktiv ist)
+                strokeTempTool = when (state.tool) {
+                    Tool.PAINT, Tool.SMUDGE -> Tool.ERASE
+                    Tool.ERASE -> Tool.PAINT
+                    else -> null
+                }
+                false
+            }
+            StylusButtonAction.UNDO -> { state.undo.undo(); mode = Mode.BLOCKED; true }
+            StylusButtonAction.REDO -> { state.undo.redo(); mode = Mode.BLOCKED; true }
+            StylusButtonAction.COLORS -> {
+                state.openPanel = at.techgaisi.farbwerk.model.Panel.COLORS
+                mode = Mode.BLOCKED
+                true
+            }
+        }
+    }
+
+    /** Radierer-Ende des Stifts: Malen/Wischen wird für diesen Strich zum Radieren. */
+    private fun prepareTempTool(e: MotionEvent, idx: Int) {
+        if (strokeTempTool != null) return
+        if (e.getToolType(idx) == MotionEvent.TOOL_TYPE_ERASER && (state.tool == Tool.PAINT || state.tool == Tool.SMUDGE)) {
+            strokeTempTool = Tool.ERASE
+        }
+    }
+
     private fun startStroke(e: MotionEvent, idx: Int) {
-        val handlerTool = if (stylusEraserOverride) {
-            state.brushEngine.temporaryTool = Tool.ERASE
+        val temp = strokeTempTool?.takeIf { it in BRUSH_TOOLS }
+        val override = state.canvasOverride
+        val handlerTool = if (override != null) {
+            override
+        } else if (temp != null) {
+            state.brushEngine.temporaryTool = temp
             state.brushEngine
         } else {
             state.brushEngine.temporaryTool = null
             state.activeHandler()
         }
+        strokeTempTool = null
         strokeHandler = handlerTool
         mode = Mode.STROKE
         strokePointerId = e.getPointerId(idx)
@@ -312,18 +628,19 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val p = toDoc(e, idx)
         lastPoint = p
         try { handlerTool?.onStrokeStart(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "start", t) }
-        if (!strokeIsStylus && state.tool in setOf(Tool.PAINT, Tool.SMUDGE, Tool.ERASE)) scheduleHoldEyedropper(e)
+        if (!strokeIsStylus && state.tool in BRUSH_TOOLS) scheduleHoldEyedropper(e)
         invalidate()
     }
 
     private fun onPointerDown(e: MotionEvent) {
         val idx = e.actionIndex
+        if (isStylus(e, idx)) { onStylusJoins(e, idx); return }
+        if (isPalmContact(e, idx)) { onPalmJoins(); return }
         when (mode) {
             Mode.STROKE -> {
                 if (strokeIsStylus) return // Stift malt weiter, Finger werden ignoriert (Handballen)
                 // Wenn ein zweiter Finger nach kurzem Strich dazukommt → Strich verwerfen, Geste starten
                 val age = e.eventTime - strokeStartTime
-                if (isStylus(e, idx)) return
                 if (age < 350 || !strokeMoved) {
                     cancelStroke()
                     startGesture(e)
@@ -333,7 +650,10 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 }
             }
             Mode.IDLE, Mode.EYEDROPPER -> {
-                if (mode == Mode.EYEDROPPER) { state.eyedropper.cancel(); eyedropperActive = false }
+                if (mode == Mode.EYEDROPPER) {
+                    if (eyedropperByStylus) return // Pipette per Stift: weitere Finger ignorieren
+                    state.eyedropper.cancel(); eyedropperActive = false
+                }
                 cancelTimers()
                 startGesture(e)
             }
@@ -341,10 +661,54 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 gestureMaxPointers = max(gestureMaxPointers, e.pointerCount)
                 resetGestureGeometry(e)
                 cancelTimers()
-                scheduleRapid()
+                if (!gestureSuppressTaps) scheduleRapid()
             }
             else -> {}
         }
+    }
+
+    /** Ein Handballen kommt zu einem laufenden Kontakt hinzu: Finger-Aktionen verwerfen, Stift-Striche bleiben. */
+    private fun onPalmJoins() {
+        when (mode) {
+            Mode.STROKE -> if (!strokeIsStylus) { cancelStroke(); mode = Mode.BLOCKED }
+            Mode.GESTURE -> { gestureConsumed = true; cancelRapid() }
+            Mode.IDLE -> { cancelTimers(); mode = Mode.BLOCKED }
+            else -> {}
+        }
+    }
+
+    /**
+     * Der Stift setzt auf, während schon Finger (meist der Handballen) liegen: Finger-Aktion verwerfen
+     * und mit dem Stift malen – wie Procreate, das den Stift immer bevorzugt.
+     */
+    private fun onStylusJoins(e: MotionEvent, idx: Int) {
+        when (mode) {
+            Mode.STROKE -> {
+                if (strokeIsStylus) return
+                cancelStroke()
+            }
+            Mode.GESTURE -> {
+                if (gestureMoved) return // laufendes Zoomen/Drehen nicht unterbrechen
+                cancelRapid(); rapidRepeating = false
+                gestureConsumed = true
+            }
+            Mode.EYEDROPPER -> {
+                if (eyedropperByStylus) return
+                state.eyedropper.cancel(); eyedropperActive = false
+            }
+            Mode.PAN_SPACE -> return
+            else -> {}
+        }
+        cancelTimers()
+        fingerSuppressed = false
+        strokeTempTool = null
+        if (handleStylusButtonDown(e, idx)) return
+        if (state.eyedropperArmed) {
+            startEyedropper(toDoc(e, idx), e.getPointerId(idx), true)
+            return
+        }
+        prepareTempTool(e, idx)
+        startStroke(e, idx)
     }
 
     private fun onMove(e: MotionEvent) {
@@ -352,6 +716,12 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             Mode.STROKE -> {
                 val idx = e.findPointerIndex(strokePointerId)
                 if (idx < 0) return
+                // Finger-Strich, dessen Kontaktfläche kurz nach dem Aufsetzen zum Handballen anwächst → verwerfen
+                if (!strokeIsStylus && !strokeMoved && isPalmContact(e, idx)) {
+                    cancelStroke()
+                    mode = Mode.BLOCKED
+                    return
+                }
                 val pts = ArrayList<InputPoint>(e.historySize + 1)
                 for (h in 0 until e.historySize) pts.add(toDoc(e, idx, h))
                 pts.add(toDoc(e, idx))
@@ -372,12 +742,20 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                     }
                 }
                 lastPoint = np
-                try { strokeHandler?.onStrokeMove(pts) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "move", t) }
+                val h = strokeHandler
+                try { h?.onStrokeMove(pts) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "move", t) }
+                dispatchPrediction(h)
                 invalidate()
             }
-            Mode.GESTURE -> onGestureMove(e)
+            Mode.GESTURE -> {
+                if (!gestureMoved && !gestureConsumed) {
+                    for (i in 0 until e.pointerCount) if (isPalmContact(e, i)) { gestureConsumed = true; cancelRapid(); break }
+                }
+                onGestureMove(e)
+            }
             Mode.EYEDROPPER -> {
-                state.eyedropper.move(toDoc(e, 0)); invalidate()
+                val idx = e.findPointerIndex(eyedropperPointerId).let { if (it < 0) 0 else it }
+                state.eyedropper.move(toDoc(e, idx)); invalidate()
             }
             Mode.PAN_SPACE -> {
                 viewMatrix.postTranslate(e.x - gestureLastCx, e.y - gestureLastCy)
@@ -385,34 +763,76 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 updateInverse(); invalidate()
             }
             Mode.IDLE -> {
+                if (fingerSuppressed && isPalmContact(e, 0)) { mode = Mode.BLOCKED; return }
                 if (hypot(e.x - strokeStartX, e.y - strokeStartY) > slop) handler.removeCallbacks(holdEyedropperRunnable)
             }
             else -> {}
         }
     }
 
+    /**
+     * Fragt die Bewegungsvorhersage ab und reicht die vorhergesagten Punkte als temporäre Vorschau an das
+     * Werkzeug weiter (sie werden beim nächsten echten Punkt verworfen).
+     */
+    private fun dispatchPrediction(h: ToolInputHandler?) {
+        if (h == null) return
+        val pr = predictor ?: return
+        if (!state.prefs.motionPrediction) return
+        predictedPts.clear()
+        val pe = try { pr.predict() } catch (t: Throwable) { null }
+        if (pe != null) {
+            try {
+                var idx = pe.findPointerIndex(strokePointerId)
+                // Ohne passende Zeiger-ID nur bei eindeutigem Einzelzeiger verwenden (nie den Handballen vorhersagen)
+                if (idx < 0 && pe.pointerCount == 1) idx = 0
+                if (idx >= 0) {
+                    for (k in 0 until pe.historySize) predictedPts.add(toDoc(pe, idx, k, strokeIsStylus))
+                    predictedPts.add(toDoc(pe, idx, -1, strokeIsStylus))
+                }
+            } finally {
+                pe.recycle()
+            }
+        }
+        try { h.onPredicted(predictedPts) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "predict", t) }
+    }
+
     private fun onPointerUp(e: MotionEvent) {
-        if (mode == Mode.STROKE && e.getPointerId(e.actionIndex) == strokePointerId) {
-            finishStroke(toDoc(e, e.actionIndex))
+        val pid = e.getPointerId(e.actionIndex)
+        val canceled = isCanceledPointer(e)
+        if (mode == Mode.STROKE && pid == strokePointerId) {
+            // FLAG_CANCELED: System hat den Kontakt nachträglich als unbeabsichtigt (Handballen) erkannt
+            if (canceled) cancelStroke() else finishStroke(toDoc(e, e.actionIndex))
             mode = Mode.BLOCKED
+        } else if (mode == Mode.EYEDROPPER && pid == eyedropperPointerId) {
+            if (canceled) state.eyedropper.cancel() else state.eyedropper.end(toDoc(e, e.actionIndex))
+            eyedropperActive = false
+            state.eyedropperArmed = false
+            mode = Mode.BLOCKED
+            invalidate()
         } else if (mode == Mode.GESTURE) {
+            if (canceled) { gestureConsumed = true; cancelRapid() }
             resetGestureGeometry(e, excludeIndex = e.actionIndex)
         }
     }
 
     private fun onLastUp(e: MotionEvent) {
         cancelTimers()
+        val canceled = isCanceledPointer(e)
         when (mode) {
-            Mode.STROKE -> finishStroke(toDoc(e, 0))
-            Mode.GESTURE -> endGesture(e)
+            Mode.STROKE -> {
+                val idx = e.findPointerIndex(strokePointerId).let { if (it < 0) 0 else it }
+                if (canceled) cancelStroke() else finishStroke(toDoc(e, idx))
+            }
+            Mode.GESTURE -> if (!canceled) endGesture(e)
             Mode.EYEDROPPER -> {
-                state.eyedropper.end(toDoc(e, 0))
+                if (canceled) state.eyedropper.cancel() else state.eyedropper.end(toDoc(e, 0))
                 eyedropperActive = false
                 state.eyedropperArmed = false
             }
             else -> {}
         }
         mode = Mode.IDLE
+        fingerSuppressed = false
         invalidate()
     }
 
@@ -421,6 +841,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         if (mode == Mode.STROKE) cancelStroke()
         if (mode == Mode.EYEDROPPER) { state.eyedropper.cancel(); eyedropperActive = false }
         mode = Mode.IDLE
+        fingerSuppressed = false
         invalidate()
     }
 
@@ -462,12 +883,15 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     // ---------------------------------------------------------- Pipette (Berühren & Halten)
 
     private var eyedropperActive = false
+    private var eyedropperPointerId = -1
+    private var eyedropperByStylus = false
     private var holdEvent: MotionEvent? = null
     private val holdEyedropperRunnable = Runnable {
         val ev = holdEvent ?: return@Runnable
         if (mode == Mode.STROKE && !strokeMoved) cancelStroke()
-        if (mode == Mode.STROKE || mode == Mode.GESTURE) return@Runnable
-        startEyedropper(toDoc(ev, 0))
+        if (mode == Mode.STROKE || mode == Mode.GESTURE || mode == Mode.BLOCKED) return@Runnable
+        prepareInverse()
+        startEyedropper(toDoc(ev, 0), ev.getPointerId(0), false)
     }
 
     private fun scheduleHoldEyedropper(e: MotionEvent) {
@@ -478,9 +902,11 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         handler.postDelayed(holdEyedropperRunnable, state.prefs.holdDelayMs.toLong())
     }
 
-    private fun startEyedropper(p: InputPoint) {
+    private fun startEyedropper(p: InputPoint, pointerId: Int, byStylus: Boolean) {
         mode = Mode.EYEDROPPER
         eyedropperActive = true
+        eyedropperPointerId = pointerId
+        eyedropperByStylus = byStylus
         state.eyedropper.begin(p)
         invalidate()
     }
@@ -516,7 +942,18 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         gestureStartSpan = gestureLastSpan
         gestureStartCy = gestureLastCy
         gestureScrubAnchorX = gestureLastCx
-        scheduleRapid()
+        // Lag der erste Kontakt schon länger, während der Stift nahe war (aufliegender Handballen + Finger),
+        // keine Tipp-Aktionen (Rückgängig …) auslösen. Gleichzeitig aufgesetzte Finger (bewusstes Tippen mit der
+        // anderen Hand, während der Stift schwebt) bleiben erlaubt.
+        // Zwei-Finger-Geste innerhalb eines Werkzeugbereichs (z. B. Transform-Rahmen) ans Werkzeug geben
+        gestureToTool = false
+        if (e.pointerCount == 2) {
+            val p = viewToDocPoint(gestureLastCx, gestureLastCy)
+            gestureToTool = try { state.activeHandler()?.handlesTwoFingerAt(p[0], p[1]) == true } catch (t: Throwable) { false }
+        }
+        val restMs = if (state.prefs.palmRejection >= 2) 100L else 200L
+        gestureSuppressTaps = fingerSuppressed && e.eventTime - strokeStartTime > restMs
+        if (!gestureSuppressTaps) scheduleRapid()
     }
 
     private fun resetGestureGeometry(e: MotionEvent, excludeIndex: Int = -1) {
@@ -551,7 +988,21 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             e.pointerCount == 2 && gestureMaxPointers == 2 -> {
                 val span = spanOf(e)
                 val angle = atan2(e.getY(1) - e.getY(0), e.getX(1) - e.getX(0))
-                if (gestureMoved) {
+                if (gestureMoved && gestureToTool) {
+                    val a = viewToDocPoint(gestureLastCx, gestureLastCy)
+                    val b = viewToDocPoint(cx, cy)
+                    val s = if (gestureLastSpan > 0f && span > 0f) span / gestureLastSpan else 1f
+                    var da = angle - gestureLastAngle
+                    if (da > Math.PI) da -= (2 * Math.PI).toFloat()
+                    if (da < -Math.PI) da += (2 * Math.PI).toFloat()
+                    val doc = state.document
+                    val flipSign = if (doc != null && (doc.flipHorizontal xor doc.flipVertical)) -1f else 1f
+                    try {
+                        state.activeHandler()?.onTwoFingerTransform(b[0], b[1], b[0] - a[0], b[1] - a[1], s,
+                            flipSign * Math.toDegrees(da.toDouble()).toFloat())
+                    } catch (t: Throwable) { android.util.Log.e("Farbwerk", "twoFinger", t) }
+                    invalidate()
+                } else if (gestureMoved) {
                     viewMatrix.postTranslate(dx, dy)
                     if (gestureLastSpan > 0f && span > 0f) {
                         val s = span / gestureLastSpan
@@ -598,12 +1049,27 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private fun spanOf(e: MotionEvent): Float =
         if (e.pointerCount >= 2) hypot(e.getX(0) - e.getX(1), e.getY(0) - e.getY(1)) else 0f
 
+    private var gestureToTool = false
+
+    private fun viewToDocPoint(x: Float, y: Float): FloatArray {
+        val pts = floatArrayOf(x, y)
+        val inv = Matrix(); displayMatrix().invert(inv)
+        inv.mapPoints(pts)
+        return pts
+    }
+
     private fun endGesture(e: MotionEvent) {
+        if (gestureToTool) {
+            gestureToTool = false
+            try { state.activeHandler()?.onTwoFingerEnd() } catch (t: Throwable) { android.util.Log.e("Farbwerk", "twoFingerEnd", t) }
+            if (gestureMoved) return
+        }
         cancelRapid()
         val dur = e.eventTime - gestureStartTime
         if (rapidRepeating) { rapidRepeating = false; return }
         if (gestureConsumed) return
         if (!gestureMoved && dur < 400) {
+            if (gestureSuppressTaps) return
             when (gestureMaxPointers) {
                 2 -> if (state.prefs.gestureTapUndo) state.undo.undo()
                 3 -> if (state.prefs.gestureTapUndo) state.undo.redo()
@@ -651,6 +1117,19 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         handler.removeCallbacks(holdEyedropperRunnable)
         handler.removeCallbacks(quickShapeRunnable)
         quickShapeScheduled = false
+    }
+
+    private companion object {
+        const val HALF_PI = (Math.PI / 2.0).toFloat()
+        val BRUSH_TOOLS = setOf(Tool.PAINT, Tool.SMUDGE, Tool.ERASE)
+        /** Samsung-S-Pen-Aktionen mit gedrückter Seitentaste (ältere Galaxy-Geräte). */
+        const val SPEN_ACTION_DOWN = 211
+        const val SPEN_ACTION_UP = 212
+        const val SPEN_ACTION_MOVE = 213
+        const val SPEN_ACTION_CANCEL = 214
+        /** KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY … _TAIL (API 34). */
+        const val KEYCODE_STYLUS_FIRST = 308
+        const val KEYCODE_STYLUS_LAST = 311
     }
 
     override fun onAttachedToWindow() {

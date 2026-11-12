@@ -46,5 +46,7 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
     implementation("androidx.exifinterface:exifinterface:1.4.1")
+    // Bewegungsvorhersage für Stift/Finger (geringere sichtbare Latenz beim Malen)
+    implementation("androidx.input:input-motionprediction:1.0.1")
     testImplementation("junit:junit:4.13.2")
 }

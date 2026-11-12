@@ -74,6 +74,7 @@ object GuidesOverlay {
             GuideKind.GRID_2D -> grid2d(g.gridSize, scale)
             GuideKind.ISOMETRIC -> isometric(g.gridSize, scale)
             GuideKind.SYMMETRY -> symmetry(doc)
+            GuideKind.PERSPECTIVE -> {} // Perspektiv-Hilfe folgt im Zeichenhilfen-Paket
             GuideKind.NONE -> {}
         }
         if (count > 0) {

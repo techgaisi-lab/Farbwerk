@@ -18,6 +18,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -40,6 +43,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.prefs.Prefs
+import at.techgaisi.farbwerk.stylus.StylusButtonAction
 import at.techgaisi.farbwerk.ui.theme.LocalUi
 import kotlin.math.hypot
 import kotlin.math.roundToInt
@@ -73,6 +77,8 @@ internal fun SettingsTab(state: EditorState) {
             }
             ActionRow("Druck und Glättung", chevron = true) { SettingsMemory.page = SettingsPage.PRESSURE }
             ActionRow("Gestensteuerung", chevron = true) { SettingsMemory.page = SettingsPage.GESTURES }
+            FwDivider()
+            StylusSection(p)
             FwDivider()
             SectionHeader("Verlauf")
             SliderRow("Rückgängig-Schritte", p.undoLimit.toFloat(), 10f..500f, { it.roundToInt().toString() },
@@ -119,6 +125,88 @@ internal fun SettingsTab(state: EditorState) {
             SliderRow("Schnelles Rückgängig", p.rapidUndoDelayMs.toFloat(), 200f..1500f, { "${(it / 10).roundToInt() * 10} ms" },
                 onChange = { p.rapidUndoDelayMs = it.roundToInt() }, onDone = { p.save() })
             Spacer(Modifier.height(10.dp))
+        }
+    }
+}
+
+/** Abschnitt "S Pen": Seitentaste, Handballenerkennung, Schwebevorschau, Bewegungsvorhersage, Druckglättung. */
+@Composable
+private fun StylusSection(p: Prefs) {
+    val ui = LocalUi.current
+    SectionHeader("S Pen")
+    ChoiceRow(
+        "Seitentaste + Berühren", "Taste gedrückt halten und Stift aufsetzen",
+        StylusButtonAction.entries.map { it.id to touchLabel(it) }, p.stylusButtonAction,
+    ) { p.stylusButtonAction = it; p.save() }
+    ChoiceRow(
+        "Seitentaste in der Luft", "Taste klicken, während der Stift über dem Display schwebt",
+        StylusButtonAction.entries.map { it.id to hoverLabel(it) }, p.stylusButtonHoverAction,
+    ) { p.stylusButtonHoverAction = it; p.save() }
+    SwitchRow("Nur Stift malt nach Stifterkennung", p.stylusOnlyAfterPen,
+        subtitle = "Sobald der Stift benutzt wurde, steuern Finger nur noch Gesten") {
+        p.stylusOnlyAfterPen = it; p.save()
+    }
+    Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 6.dp)) {
+        Text("Handballenerkennung", color = ui.text, fontSize = 15.sp)
+        Text("Finger-Berührungen in Stiftnähe und großflächige Kontakte ignorieren", color = ui.textMuted, fontSize = 12.sp)
+        Spacer(Modifier.height(6.dp))
+        Segmented(listOf(0 to "Aus", 1 to "Normal", 2 to "Stark"), p.palmRejection.coerceIn(0, 2),
+            Modifier.fillMaxWidth()) { p.palmRejection = it; p.save() }
+    }
+    SwitchRow("Schwebevorschau", p.hoverPreview, subtitle = "Pinselumriss zeigen, wenn der Stift über dem Display schwebt") {
+        p.hoverPreview = it; p.save()
+    }
+    SwitchRow("Bewegungsvorhersage", p.motionPrediction, subtitle = "Verringert die sichtbare Verzögerung beim Zeichnen") {
+        p.motionPrediction = it; p.save()
+    }
+    SliderRow("Druckglättung", p.pressureSmoothing, 0f..1f, { "${(it * 100).roundToInt()} %" },
+        onChange = { p.pressureSmoothing = it }, onDone = { p.save() })
+}
+
+private fun touchLabel(a: StylusButtonAction): String = when (a) {
+    StylusButtonAction.EYEDROPPER -> "Pipette (mit Lupe)"
+    StylusButtonAction.ERASER -> "Radieren, solange gedrückt"
+    StylusButtonAction.COLORS -> "Farbpanel öffnen"
+    else -> a.label
+}
+
+private fun hoverLabel(a: StylusButtonAction): String = when (a) {
+    StylusButtonAction.EYEDROPPER -> "Farbe unter dem Stift aufnehmen"
+    StylusButtonAction.ERASER -> "Zum Radierer wechseln und zurück"
+    StylusButtonAction.COLORS -> "Farbpanel ein/aus"
+    else -> a.label
+}
+
+/** Zeile mit aufklappbarer Auswahl (aktueller Wert rechts). */
+@Composable
+private fun ChoiceRow(label: String, subtitle: String?, options: List<Pair<Int, String>>, selected: Int, onSelect: (Int) -> Unit) {
+    val ui = LocalUi.current
+    var open by remember { mutableStateOf(false) }
+    Box(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().heightIn(min = 46.dp).clickable { open = true }.padding(horizontal = 16.dp, vertical = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text(label, color = ui.text, fontSize = 15.sp)
+                if (subtitle != null) Text(subtitle, color = ui.textMuted, fontSize = 12.sp)
+            }
+            Text(options.firstOrNull { it.first == selected }?.second ?: "", color = ui.accent, fontSize = 13.sp)
+            Icon(ActionIcons.Chevron, null, tint = ui.iconMuted, modifier = Modifier.size(16.dp))
+        }
+        DropdownMenu(
+            expanded = open, onDismissRequest = { open = false },
+            modifier = Modifier.background(ui.panelElevated),
+        ) {
+            for ((id, text) in options) {
+                DropdownMenuItem(
+                    text = {
+                        Text(text, color = if (id == selected) ui.accent else ui.text, fontSize = 14.sp,
+                            fontWeight = if (id == selected) FontWeight.SemiBold else FontWeight.Normal)
+                    },
+                    onClick = { open = false; onSelect(id) },
+                )
+            }
         }
     }
 }

@@ -117,7 +117,10 @@ fun HarmonyTab(model: HsvModel) {
             ) {
                 val g = WheelGeometry(IntSize(size.width.toInt(), size.height.toInt()))
                 val d = (g.radius * 2).roundToInt().coerceAtLeast(2)
-                drawImage(renderer.image(d, model.v), IntOffset((g.center.x - d / 2f).roundToInt(), (g.center.y - d / 2f).roundToInt()))
+                // Rad mit voller Helligkeit einmal pro Größe rendern; Helligkeit als schwarze Überlagerung
+                // (HSB: V · Farbe) – dadurch kostet das Ziehen am Helligkeitsregler keine Pixelrechnung.
+                drawImage(renderer.image(d), IntOffset((g.center.x - d / 2f).roundToInt(), (g.center.y - d / 2f).roundToInt()))
+                if (model.v < 1f) drawCircle(Color.Black.copy(alpha = 1f - model.v), g.radius, g.center)
                 drawCircle(ui.divider, g.radius, g.center, style = Stroke(1.dp.toPx()))
                 // Verbindungslinien
                 val main = g.point(model.h, model.s)
@@ -167,45 +170,27 @@ private class WheelGeometry(size: IntSize) {
     }
 }
 
-/** Rendert das Farbrad für eine Helligkeit; Farbton/Sättigung je Pixel sind vorberechnet. */
+/** Rendert das Farbrad mit voller Helligkeit; wird nur bei Größenänderung neu berechnet. */
 private class WheelRenderer {
     private var dim = 0
-    private var hueMap = FloatArray(0)
-    private var satMap = FloatArray(0)
-    private var pixels = IntArray(0)
-    private var bitmap: Bitmap? = null
     private var image: ImageBitmap? = null
-    private var renderedV = Float.NaN
 
-    fun image(d: Int, v: Float): ImageBitmap {
-        if (d != dim) prepare(d)
-        val img = image!!
-        if (v == renderedV) return img
-        renderedV = v
-        for (i in pixels.indices) {
-            val s = satMap[i]
-            pixels[i] = if (s < 0f) 0 else ColorMath.hsvToArgb(hueMap[i], s, v)
-        }
-        bitmap!!.setPixels(pixels, 0, d, 0, 0, d, d)
-        img.prepareToDraw()
-        return img
-    }
-
-    private fun prepare(d: Int) {
+    fun image(d: Int): ImageBitmap {
+        image?.let { if (d == dim) return it }
         dim = d
-        hueMap = FloatArray(d * d); satMap = FloatArray(d * d); pixels = IntArray(d * d)
+        val pixels = IntArray(d * d)
         val r = d / 2f
         for (y in 0 until d) for (x in 0 until d) {
-            val i = y * d + x
             val dx = x + 0.5f - r; val dy = y + 0.5f - r
             val dist = hypot(dx, dy) / r
-            if (dist > 1f) { satMap[i] = -1f; continue }
-            satMap[i] = dist
-            hueMap[i] = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat() + 90f
+            if (dist > 1f) continue
+            // Farbton: Rot oben, im Uhrzeigersinn – identisch zu WheelGeometry.point()/apply()
+            val hue = Math.toDegrees(atan2(dy.toDouble(), dx.toDouble())).toFloat() + 90f
+            pixels[y * d + x] = ColorMath.hsvToArgb(hue, dist, 1f)
         }
         val b = Bitmap.createBitmap(d, d, Bitmap.Config.ARGB_8888)
-        bitmap = b
-        image = b.asImageBitmap()
-        renderedV = Float.NaN
+        b.setPixels(pixels, 0, d, 0, 0, d, d)
+        // alte Bitmap nicht recyceln: sie kann im laufenden Frame noch gezeichnet werden
+        return b.asImageBitmap().also { it.prepareToDraw(); image = it }
     }
 }

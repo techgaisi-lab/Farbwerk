@@ -209,6 +209,7 @@ private fun guideSummary(k: GuideKind) = when (k) {
     GuideKind.NONE -> "Keine"
     GuideKind.GRID_2D -> "2D-Raster"
     GuideKind.ISOMETRIC -> "Isometrisch"
+    GuideKind.PERSPECTIVE -> "Perspektive"
     GuideKind.SYMMETRY -> "Symmetrie"
 }
 

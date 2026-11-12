@@ -80,6 +80,13 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     private var lastX = 0f
     private var lastY = 0f
 
+    // Bewegungsvorhersage (nur Vorschau, wird nie festgeschrieben)
+    private var predN = 0
+    private val predX = FloatArray(MAX_PREDICTED)
+    private val predY = FloatArray(MAX_PREDICTED)
+    private val predRect = RectF()
+    private val predBounds = RectF()
+
     // Overlay
     private val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 1.5f }
     private val anchorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
@@ -148,6 +155,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
                 c.restore()
             }
             if (sel != null) c.restore()
+            if (predN > 0) drawPrediction(c, sel)
         }
     }
 
@@ -219,6 +227,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
 
     override fun onStrokeMove(points: List<InputPoint>) {
         if (!active) return
+        // Echte Punkte sind da → alte Vorhersage verwerfen
+        predN = 0
         val sh = shape
         if (sh != null) {
             val p = points.last()
@@ -241,6 +251,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     }
 
     override fun onStrokeEnd(p: InputPoint) {
+        predN = 0
         if (!active) { reset(); return }
         if (shape == null) {
             renderer.add(p.x, p.y, p.pressure, p.tilt, p.orientation, p.time)
@@ -258,6 +269,77 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         }
         reset()
         state.invalidate()
+    }
+
+    override fun onPredicted(points: List<InputPoint>) {
+        val had = predN > 0
+        predN = 0
+        if (active && shape == null && strokeTool != Tool.SMUDGE && points.isNotEmpty() && predictionAllowed()) {
+            val n = minOf(points.size, MAX_PREDICTED)
+            for (i in 0 until n) { predX[i] = points[i].x; predY[i] = points[i].y }
+            predN = n
+        }
+        if (had || predN > 0) state.canvasView?.postInvalidateOnAnimation()
+    }
+
+    /**
+     * Vorhersage nur bei wenig Glättung: Starke StreamLine/Stabilisierung zieht den Strich absichtlich nach –
+     * eine Vorschau an der Rohposition würde dort nur springen.
+     */
+    private fun predictionAllowed(): Boolean {
+        val b = renderer.brush
+        return b[BP.STREAMLINE] <= 0.6f && b[BP.STABILIZE] <= 0.05f && b[BP.MOTION_FILTER] <= 0.05f &&
+            state.prefs.motionPrediction && state.prefs.motionFilteringAmount <= 0.05f
+    }
+
+    /**
+     * Zeichnet die Vorhersage: vom letzten echten Tupfer über die aktuelle Kopfposition zu den vorhergesagten
+     * Punkten, mit Größe/Form/Farbe des letzten Tupfers. Über eine Offscreen-Ebene mit [mergePaint], damit
+     * Deckkraft, Mischmodus und Radieren (DST_OUT) genau wie beim fertigen Strich wirken.
+     */
+    private fun drawPrediction(c: Canvas, sel: android.graphics.Path?) {
+        val l = renderer.dabs
+        if (l.size == 0) return
+        val i = l.size - 1
+        val d = l.diam[i]; val asp = l.aspect[i]; val ang = l.angle[i]
+        val a = l.alpha[i]; val col = l.color[i]; val f = l.flags[i]
+        val r = d * 0.75f + 2f
+        predRect.set(l.x[i] - r, l.y[i] - r, l.x[i] + r, l.y[i] + r)
+        predRect.union(renderer.headX - r, renderer.headY - r, renderer.headX + r, renderer.headY + r)
+        for (k in 0 until predN) predRect.union(predX[k] - r, predY[k] - r, predX[k] + r, predY[k] + r)
+        // Gesamtlänge → Schrittweite (höchstens MAX_PREDICTED_DABS Tupfer)
+        var len = hypot(renderer.headX - l.x[i], renderer.headY - l.y[i])
+        var px = renderer.headX; var py = renderer.headY
+        for (k in 0 until predN) { len += hypot(predX[k] - px, predY[k] - py); px = predX[k]; py = predY[k] }
+        if (len < 0.5f) return
+        val step = max(max(0.3f, renderer.brush[BP.SPACING] * d), len / MAX_PREDICTED_DABS)
+
+        predBounds.set(predRect)
+        for (m in symm) { tmpRect.set(predRect); m.mapRect(tmpRect); predBounds.union(tmpRect) }
+        val sc = c.saveLayer(predBounds, mergePaint)
+        if (sel != null) c.clipPath(sel)
+        var carry = step
+        var ax = l.x[i]; var ay = l.y[i]
+        for (k in -1 until predN) {
+            val bx = if (k < 0) renderer.headX else predX[k]
+            val by = if (k < 0) renderer.headY else predY[k]
+            val segLen = hypot(bx - ax, by - ay)
+            var t = carry
+            while (t <= segLen) {
+                val fr = t / segLen
+                val x = ax + (bx - ax) * fr; val y = ay + (by - ay) * fr
+                painter.draw(c, x, y, d, asp, ang, a, col, f)
+                for (m in symm) {
+                    c.save(); c.concat(m)
+                    painter.draw(c, x, y, d, asp, ang, a, col, f)
+                    c.restore()
+                }
+                t += step
+            }
+            carry = t - segLen
+            ax = bx; ay = by
+        }
+        c.restoreToCount(sc)
     }
 
     override fun onHoldStill(p: InputPoint) {
@@ -325,6 +407,16 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         return d
     }
 
+    /**
+     * Pinsel, mit dem [tool] gerade malen würde (für die Schwebevorschau des Stifts). null für Werkzeuge
+     * ohne Pinsel.
+     */
+    fun brushFor(tool: Tool): Brush? {
+        if (tool != Tool.PAINT && tool != Tool.SMUDGE && tool != Tool.ERASE) return null
+        val settings = state.toolSettings[tool] ?: return null
+        return state.brushLibrary.getOrDefault(settings.brushId, tool)
+    }
+
     /** Ist gerade ein Strich aktiv? */
     val isStroking: Boolean get() = active
 
@@ -354,6 +446,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
     }
 
     private fun reset() {
+        predN = 0
         active = false
         layer = null
         edit = null
@@ -457,6 +550,11 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler {
         // Bereich bleibt als Vereinigung erhalten (für Undo/Puffer-Löschen), neu zeichnen
         renderer.renderPath(shapeXs.data, shapeYs.data, n, sh.closed, shapePressure)
         state.canvasView?.postInvalidateOnAnimation()
+    }
+
+    private companion object {
+        const val MAX_PREDICTED = 32
+        const val MAX_PREDICTED_DABS = 300f
     }
 
     /** Gibt Speicher frei (z. B. beim Schließen eines Dokuments). */

@@ -51,6 +51,36 @@ class EditorState(val context: Context) {
     var copyPasteMenuVisible by mutableStateOf(false)
     /** Kurzer Hinweistext oben in der Mitte (z. B. "Rückgängig: Pinselstrich"). */
     var flashMessage by mutableStateOf<String?>(null)
+    /** Optionale Schaltfläche im Hinweis (z. B. "Form bearbeiten", "Nachfüllen fortsetzen"). */
+    var flashActionLabel by mutableStateOf<String?>(null)
+    var flashAction: (() -> Unit)? = null
+        private set
+
+    /**
+     * Dauerhafte Statusleiste oben (z. B. "Gaußscher Weichzeichner 42 %", "Deckkraft 80 %",
+     * "ColorDrop-Schwellenwert 47 %"). null = ausgeblendet. Wer sie setzt, entfernt sie auch wieder.
+     */
+    var statusBar by mutableStateOf<StatusBar?>(null)
+
+    /** Letzter Punkt, an dem gemalt/berührt wurde (Dokument-Koordinaten) – z. B. für die schwebende Pipette. */
+    var lastPaintPoint: android.graphics.PointF? = null
+
+    /**
+     * Wenn gesetzt, steuert die Seitenleiste diese Quelle statt Pinselgröße/-deckkraft
+     * (z. B. Klonen, Verflüssigen, Anpassung im Stift-Modus). Die Seitenleiste ist dann auch
+     * außerhalb von Malen/Wischen/Radieren sichtbar.
+     */
+    var sidebarSource by mutableStateOf<SidebarSource?>(null)
+
+    /**
+     * Wenn gesetzt, gehen Ein-Finger-/Stift-Eingaben auf der Leinwand an diesen Handler statt an das
+     * aktive Werkzeug (z. B. Ebenendeckkraft per Ziehen nach 2-Finger-Tippen auf eine Ebene).
+     * Der Handler setzt das Feld selbst wieder auf null, wenn er fertig ist.
+     */
+    var canvasOverride by mutableStateOf<at.techgaisi.farbwerk.model.ToolInputHandler?>(null)
+
+    /** QuickMenu sichtbar (Position in Fenster-Koordinaten). */
+    var quickMenuAt by mutableStateOf<android.graphics.PointF?>(null)
     /** Modifizierer-Taste (Quadrat in der Seitenleiste) gedrückt bzw. Pipette scharf geschaltet. */
     var eyedropperArmed by mutableStateOf(false)
     /** Leertaste gehalten (Tastatur): Ziehen verschiebt die Leinwand. */
@@ -61,6 +91,8 @@ class EditorState(val context: Context) {
     var color by mutableIntStateOf(0xFF1E88E5.toInt())
     /** Vorherige Farbe (für "Farbe tauschen" und Verlauf). */
     var previousColor by mutableIntStateOf(0xFF000000.toInt())
+    /** Sekundärfarbe (für Farbdynamik der Pinsel, wie im Vorbild). */
+    var secondaryColor by mutableIntStateOf(0xFFFFFFFF.toInt())
     val recentColors = mutableStateListOf<Int>()
 
     fun setColorAndRemember(argb: Int) {
@@ -218,10 +250,37 @@ class EditorState(val context: Context) {
 
     // ---------------- Hinweise ----------------
     private val handler = Handler(Looper.getMainLooper())
-    private val clearFlash = Runnable { flashMessage = null }
-    fun flash(msg: String) {
+    private val clearFlash = Runnable { flashMessage = null; flashActionLabel = null; flashAction = null }
+    fun flash(msg: String, actionLabel: String? = null, onAction: (() -> Unit)? = null) {
         flashMessage = msg
+        flashActionLabel = actionLabel
+        flashAction = onAction
         handler.removeCallbacks(clearFlash)
-        handler.postDelayed(clearFlash, 1200)
+        handler.postDelayed(clearFlash, if (actionLabel != null) 3500 else 1200)
     }
+
+    /** Hinweis-Schaltfläche wurde angetippt. */
+    fun triggerFlashAction() {
+        val a = flashAction
+        flashMessage = null; flashActionLabel = null; flashAction = null
+        a?.invoke()
+    }
+}
+
+/** Inhalt der dauerhaften Statusleiste. [percent] 0..1 oder null. */
+data class StatusBar(
+    val text: String,
+    val percent: Float? = null,
+    val actionLabel: String? = null,
+    val onAction: (() -> Unit)? = null,
+)
+
+/**
+ * Alternative Quelle für die Seitenleiste. Werte 0..1. [label] erscheint in der Vorschaublase.
+ */
+interface SidebarSource {
+    val topLabel: String get() = "Größe"
+    val bottomLabel: String get() = "Deckkraft"
+    var top: Float
+    var bottom: Float
 }

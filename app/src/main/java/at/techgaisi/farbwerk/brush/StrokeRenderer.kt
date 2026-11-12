@@ -120,6 +120,8 @@ class StrokeRenderer {
     private var lastTime = 0L
     private var speed = 0f
     private var lastTilt = 0f; private var lastOrient = 0f
+    /** Geglättete Neigung/Ausrichtung (Rohwerte des Digitizers rauschen leicht). */
+    private var smT = 0f; private var smO = 0f
 
     private val wx = FloatArray(4); private val wy = FloatArray(4)
     private val wp = FloatArray(4); private val wt = FloatArray(4); private val wo = FloatArray(4)
@@ -165,6 +167,7 @@ class StrokeRenderer {
         smX = x; smY = y
         lastRawX = x; lastRawY = y; lastTime = time
         lastTilt = tilt; lastOrient = orient
+        smT = tilt; smO = orient
         headX = x; headY = y; headDiameter = diameter
         pushStab(x, y)
         addControl(x, y, smP, tilt, orient)
@@ -176,12 +179,15 @@ class StrokeRenderer {
         val inst = d / dt * viewScale
         speed += (inst - speed) * 0.3f
         lastRawX = x; lastRawY = y; lastTime = time
-        lastTilt = tilt; lastOrient = orient
 
         val p = inputPressure(pressure)
         val ps = max(globalPressureSmoothing, brush[BP.PRESSURE_SMOOTHING])
         smP += (p - smP) * (1f - 0.92f * ps)
         pressureSum += smP; pressureCount++
+        // Neigung und Ausrichtung leicht glätten (Ausrichtung über den kürzesten Winkelweg)
+        smT += (tilt - smT) * 0.5f
+        smO = wrapAngle(smO + wrapAngle(orient - smO) * 0.5f)
+        lastTilt = smT; lastOrient = smO
 
         pushStab(x, y)
         var ax = 0f; var ay = 0f
@@ -189,7 +195,7 @@ class StrokeRenderer {
         ax /= stabCount; ay /= stabCount
         smX += (ax - smX) * streamK
         smY += (ay - smY) * streamK
-        addControl(smX, smY, smP, tilt, orient)
+        addControl(smX, smY, smP, smT, smO)
     }
 
     /** Strich beenden: etwas zum Endpunkt nachziehen und das letzte Segment zeichnen. */
@@ -363,7 +369,7 @@ class StrokeRenderer {
             return
         }
         if (hypot(x - wx[3], y - wy[3]) < 0.4f) {
-            wp[3] = p
+            wp[3] = p; wt[3] = tilt; wo[3] = orient
             return
         }
         for (i in 0 until 3) { wx[i] = wx[i + 1]; wy[i] = wy[i + 1]; wp[i] = wp[i + 1]; wt[i] = wt[i + 1]; wo[i] = wo[i + 1] }
@@ -417,8 +423,8 @@ class StrokeRenderer {
         val b = brush
         val p = segPa + (segPb - segPa) * t
         val tilt = segTa + (segTb - segTa) * t
-        val orient = segOa + (segOb - segOa) * t
-        val tiltT = (tilt / (PI.toFloat() / 2f)).coerceIn(0f, 1f)
+        val orient = wrapAngle(segOa + wrapAngle(segOb - segOa) * t)
+        val tiltT = tiltFactor(b, tilt)
         val speedNorm = (speed / 4f).coerceIn(0f, 1f)
 
         // Verjüngung
@@ -479,7 +485,11 @@ class StrokeRenderer {
         val rotMode = b.int(BP.ROTATION_MODE)
         val baseRot = Math.toRadians(b[BP.ROTATION].toDouble()).toFloat()
         val scatter = b[BP.SCATTER]
-        val aspect = (b[BP.ROUNDNESS] * (1f - b[BP.TILT_ROUNDNESS] * tiltT * 0.7f)).coerceIn(0.03f, 1f)
+        val tiltRound = b[BP.TILT_ROUNDNESS]
+        val aspect = (b[BP.ROUNDNESS] * (1f - tiltRound * tiltT * 0.7f)).coerceIn(0.03f, 1f)
+        // Schraffieren mit geneigtem Stift: Bei runden Spitzen mit "Neigung → Rundheit" liegt die lange Achse der
+        // abgeflachten Spitze entlang der Stiftausrichtung (wie die Mine eines flach gehaltenen Bleistifts).
+        val tiltOriented = tiltRound > 0f && tiltT > 0f && b[BP.ROUNDNESS] > 0.95f && rotMode == RotationMode.FIXED
         val hj = b[BP.HUE_JITTER]; val sj = b[BP.SAT_JITTER]; val bj = b[BP.BRIGHT_JITTER]
         for (k in 0 until count) {
             var sx = x; var sy = y
@@ -492,7 +502,7 @@ class StrokeRenderer {
                 RotationMode.FOLLOW -> dir + baseRot
                 RotationMode.RANDOM -> rand() * 2f * PI.toFloat()
                 RotationMode.AZIMUTH -> orient + baseRot
-                else -> baseRot
+                else -> if (tiltOriented) orient + baseRot else baseRot
             }
             if (scatter > 0f) ang += (rand() - 0.5f) * 2f * PI.toFloat() * scatter
             val dj = d * (1f - b[BP.SIZE_JITTER] * rand())
@@ -521,6 +531,29 @@ class StrokeRenderer {
     }
 
     companion object {
+        private const val HALF_PI = (PI / 2.0).toFloat()
+        private const val TWO_PI = (PI * 2.0).toFloat()
+
+        /**
+         * Neigungsfaktor 0..1 für die Dynamik: 0 = senkrecht (bzw. steiler als [BP.TILT_ANGLE]), 1 = flach.
+         * [tilt] in Radiant ab der Senkrechten (wie MotionEvent.AXIS_TILT). Ein weicher Übergang (smoothstep)
+         * verhindert sichtbare Sprünge, wenn die Schwelle überschritten wird.
+         */
+        fun tiltFactor(b: Brush, tilt: Float): Float {
+            if (tilt <= 0f) return 0f
+            val start = Math.toRadians(b[BP.TILT_ANGLE].toDouble()).toFloat().coerceIn(0f, HALF_PI - 0.05f)
+            val u = ((tilt - start) / (HALF_PI - start)).coerceIn(0f, 1f)
+            return u * u * (3f - 2f * u)
+        }
+
+        /** Winkel auf -π..π abbilden. */
+        fun wrapAngle(a: Float): Float {
+            var r = a
+            while (r > PI) r -= TWO_PI
+            while (r < -PI) r += TWO_PI
+            return r
+        }
+
         fun mix(a: Int, b: Int, t: Float): Int {
             val u = 1f - t
             return Color.argb(

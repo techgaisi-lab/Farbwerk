@@ -29,6 +29,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.DrawScope
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.drawscope.inset
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.LocalDensity
@@ -46,6 +47,9 @@ fun Int.toUiColor() = Color(this)
 /**
  * Einheitliche Zeige-Geste für Farbflächen: Drücken, Ziehen, Loslassen, optional Doppeltippen.
  * Callbacks erhalten die lokale Position und die Größe der Fläche.
+ *
+ * Doppeltippen wird nur erkannt, wenn die vorherige Geste ein echtes Tippen war (kurz, ohne
+ * nennenswerte Bewegung) – ein Ziehen mit anschließendem schnellem Tippen löst also kein Einrasten aus.
  */
 @Composable
 fun Modifier.colorGestures(
@@ -59,33 +63,45 @@ fun Modifier.colorGestures(
     val release by rememberUpdatedState(onRelease)
     val dbl by rememberUpdatedState(onDoubleTap)
     return this.pointerInput(Unit) {
-        var lastUpTime = 0L
-        var lastUpPos = Offset.Zero
+        var lastTapTime = 0L
+        var lastTapPos = Offset.Zero
         val dblSlop = 36.dp.toPx()
+        val tapSlop = viewConfiguration.touchSlop
         awaitEachGesture {
             val down = awaitFirstDown()
             down.consume()
             val d = dbl
-            val isDouble = d != null && down.uptimeMillis - lastUpTime < 320 &&
-                (down.position - lastUpPos).getDistance() < dblSlop
+            val isDouble = d != null && down.uptimeMillis - lastTapTime < DOUBLE_TAP_MS &&
+                (down.position - lastTapPos).getDistance() < dblSlop
             if (isDouble) d!!(down.position, size) else press(down.position, size)
-            while (true) {
-                val ev = awaitPointerEvent()
-                val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
-                if (!ch.pressed) {
-                    lastUpTime = if (isDouble) 0L else ch.uptimeMillis
-                    lastUpPos = ch.position
-                    break
+            var moved = false
+            try {
+                while (true) {
+                    val ev = awaitPointerEvent()
+                    val ch = ev.changes.firstOrNull { it.id == down.id } ?: break
+                    if (!ch.pressed) {
+                        ch.consume()
+                        val isTap = !isDouble && !moved && ch.uptimeMillis - down.uptimeMillis < TAP_MAX_MS
+                        lastTapTime = if (isTap) ch.uptimeMillis else 0L
+                        lastTapPos = ch.position
+                        break
+                    }
+                    if (ch.positionChanged()) {
+                        ch.consume()
+                        if ((ch.position - down.position).getDistance() > tapSlop) moved = true
+                        if (!isDouble) move(ch.position, size)
+                    }
                 }
-                if (ch.positionChanged()) {
-                    ch.consume()
-                    if (!isDouble) move(ch.position, size)
-                }
+            } finally {
+                // auch bei Abbruch (z. B. Panel geschlossen) die Geste sauber beenden
+                release()
             }
-            release()
         }
     }
 }
+
+private const val DOUBLE_TAP_MS = 320L
+private const val TAP_MAX_MS = 300L
 
 /**
  * Regler mit Farbverlaufs-Spur (für Farbton/Sättigung/Helligkeit/RGB).
@@ -114,8 +130,12 @@ fun GradientSlider(
         val r = size.height / 2f
         val trackH = 14.dp.toPx()
         val top = (size.height - trackH) / 2f
-        drawRoundRect(track, Offset(r, top), Size(size.width - 2 * r, trackH), CornerRadius(trackH / 2))
-        drawRoundRect(ui.divider, Offset(r, top), Size(size.width - 2 * r, trackH), CornerRadius(trackH / 2), style = Stroke(1.dp.toPx()))
+        // Verlauf exakt über die Spur legen (r … Breite − r): Brush.horizontalGradient ohne Grenzen
+        // spannt sich über die Größe der DrawScope – ohne inset wäre er um r gegenüber dem Wert versetzt.
+        inset(left = r, top = top, right = r, bottom = top) {
+            drawRoundRect(track, cornerRadius = CornerRadius(trackH / 2))
+            drawRoundRect(ui.divider, cornerRadius = CornerRadius(trackH / 2), style = Stroke(1.dp.toPx()))
+        }
         val cx = r + value.coerceIn(0f, 1f) * (size.width - 2 * r)
         drawKnob(Offset(cx, size.height / 2f), r - 2.dp.toPx(), thumbColor)
     }

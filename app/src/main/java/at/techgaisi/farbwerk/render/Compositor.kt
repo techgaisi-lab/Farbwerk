@@ -97,6 +97,16 @@ object Compositor {
         LayerBlend.SATURATION -> BlendMode.SATURATION
         LayerBlend.COLOR -> BlendMode.COLOR
         LayerBlend.LUMINOSITY -> BlendMode.LUMINOSITY
+        // Vorläufige Näherungen – das Ebenen-Paket ersetzt sie durch exakte Shader
+        LayerBlend.SHADE -> BlendMode.MULTIPLY
+        LayerBlend.DARKER_COLOR -> BlendMode.DARKEN
+        LayerBlend.LIGHTER_COLOR -> BlendMode.LIGHTEN
+        LayerBlend.VIVID_LIGHT -> BlendMode.HARD_LIGHT
+        LayerBlend.LINEAR_LIGHT -> BlendMode.HARD_LIGHT
+        LayerBlend.PIN_LIGHT -> BlendMode.HARD_LIGHT
+        LayerBlend.HARD_MIX -> BlendMode.HARD_LIGHT
+        LayerBlend.SUBTRACT -> BlendMode.DIFFERENCE
+        LayerBlend.DIVIDE -> BlendMode.COLOR_DODGE
     }
 
     /** Zeichnet das ganze Dokument (inkl. Hintergrund, falls sichtbar) in Dokument-Koordinaten. */

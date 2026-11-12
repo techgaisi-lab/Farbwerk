@@ -39,6 +39,20 @@ class Prefs(context: Context) {
     var quickShapeEnabled by mutableStateOf(sp.getBoolean("quickShape", true))
     var undoLimit by mutableIntStateOf(sp.getInt("undoLimit", 250))
 
+    // ---------------- S Pen / Stift ----------------
+    /** Seitentaste gedrückt + Berühren (Wert = StylusButtonAction.id, Standard 1 = Pipette). */
+    var stylusButtonAction by mutableIntStateOf(sp.getInt("penButton", 1))
+    /** Seitentaste klicken, während der Stift schwebt (StylusButtonAction.id, Standard 2 = Radierer umschalten). */
+    var stylusButtonHoverAction by mutableIntStateOf(sp.getInt("penButtonHover", 2))
+    /** Sobald ein Stift benutzt wurde, malen Finger nicht mehr (nur noch Gesten). */
+    var stylusOnlyAfterPen by mutableStateOf(sp.getBoolean("penOnlyAuto", true))
+    /** Handballenerkennung: 0 = aus, 1 = normal, 2 = stark. */
+    var palmRejection by mutableIntStateOf(sp.getInt("palmRejection", 1))
+    /** Pinselumriss anzeigen, während der Stift über dem Display schwebt. */
+    var hoverPreview by mutableStateOf(sp.getBoolean("hoverPreview", true))
+    /** Bewegungsvorhersage (vorhergesagte Punkte als Vorschau zeichnen). */
+    var motionPrediction by mutableStateOf(sp.getBoolean("motionPrediction", true))
+
     fun save() {
         sp.edit()
             .putBoolean("light", lightInterface)
@@ -60,6 +74,12 @@ class Prefs(context: Context) {
             .putBoolean("gHoldEyedropper", gestureHoldEyedropper)
             .putBoolean("quickShape", quickShapeEnabled)
             .putInt("undoLimit", undoLimit)
+            .putInt("penButton", stylusButtonAction)
+            .putInt("penButtonHover", stylusButtonHoverAction)
+            .putBoolean("penOnlyAuto", stylusOnlyAfterPen)
+            .putInt("palmRejection", palmRejection)
+            .putBoolean("hoverPreview", hoverPreview)
+            .putBoolean("motionPrediction", motionPrediction)
             .apply()
     }
 

@@ -68,6 +68,17 @@ class HsvModel(private val state: EditorState) {
         emitted = final
     }
 
+    /**
+     * Geste verwerfen: Farbe auf den Stand vor der Geste zurücksetzen, ohne Verlaufseintrag
+     * (z. B. wenn aus einem Ein-Finger-Ziehen eine Zwei-Finger-Pinch-Geste wird).
+     */
+    fun cancelGesture() {
+        val start = gestureStart ?: return
+        gestureStart = null
+        syncFrom(start, force = true)
+        state.color = start
+    }
+
     /** Sofortige Auswahl einer fertigen Farbe (Farbfeld, Harmonie, Hex). */
     fun pick(color: Int) {
         gestureStart = null

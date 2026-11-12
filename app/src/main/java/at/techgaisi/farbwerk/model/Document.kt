@@ -28,6 +28,16 @@ enum class LayerBlend(val label: String, val short: String) {
     SATURATION("Sättigung", "S"),
     COLOR("Farbe", "F"),
     LUMINOSITY("Luminanz", "L"),
+    // Erweiterte Modi (Compositor rendert sie per eigenem Shader/CPU-Pfad)
+    SHADE("Schattieren", "Sc"),
+    DARKER_COLOR("Dunklere Farbe", "DF"),
+    LIGHTER_COLOR("Hellere Farbe", "HF"),
+    VIVID_LIGHT("Strahlendes Licht", "Sl"),
+    LINEAR_LIGHT("Lineares Licht", "LL"),
+    PIN_LIGHT("Lichtpunkt", "Lp"),
+    HARD_MIX("Harte Mischung", "HM"),
+    SUBTRACT("Subtrahieren", "Su"),
+    DIVIDE("Dividieren", "Di"),
 }
 
 /**
@@ -50,6 +60,15 @@ class Layer(
     /** Optionale Ebenenmaske (ALPHA_8 oder ARGB_8888, weiß = sichtbar). */
     var mask: Bitmap? = null
 
+    /** Zeichenassistent für diese Ebene aktiv (Striche rasten an der aktiven Zeichenhilfe ein). */
+    var assisted: Boolean = false
+
+    /** Private Ebene: erscheint nicht in Miniatur, Export und Zeitraffer. */
+    var isPrivate: Boolean = false
+
+    /** Vektor-Textdaten, wenn es eine (noch nicht gerasterte) Textebene ist. Typ gehört dem Text-Modul. */
+    var text: Any? = null
+
     /** Gruppen: Ebenen mit gleicher groupId gehören zusammen (vom Ebenenmodul verwaltet). */
     var groupId: String? = null
 
@@ -70,7 +89,7 @@ class Layer(
 }
 
 enum class SymmetryMode { VERTICAL, HORIZONTAL, QUADRANT, RADIAL }
-enum class GuideKind { NONE, GRID_2D, ISOMETRIC, SYMMETRY }
+enum class GuideKind { NONE, GRID_2D, ISOMETRIC, PERSPECTIVE, SYMMETRY }
 
 /** Zeichenhilfen-Einstellungen (Aktionen → Leinwand → Zeichenhilfe). */
 class GuideSettings {
@@ -84,6 +103,14 @@ class GuideSettings {
     var symmetryCenterY: Float = Float.NaN
     var rotationalSymmetry: Boolean = false
     var radialSegments: Int = 8
+    /** Linienstärke der Hilfslinien in Bildschirm-dp. */
+    var thickness: Float = 1f
+    /** Verschiebung und Drehung des Rasters (Grad). */
+    var offsetX: Float = 0f
+    var offsetY: Float = 0f
+    var rotation: Float = 0f
+    /** Fluchtpunkte der Perspektiv-Hilfe (Dokument-Koordinaten), 1–3 Stück. */
+    val vanishingPoints: MutableList<android.graphics.PointF> = mutableListOf()
     /** Zeichenassistent: Striche werden an der aktiven Hilfe ausgerichtet bzw. gespiegelt. */
     var assisted: Boolean = false
 }
@@ -119,6 +146,8 @@ class ArtDocument(
     var created: Long = System.currentTimeMillis()
     var modified: Long = System.currentTimeMillis()
     var dirty: Boolean = false
+    /** Einstellungen des Animationsassistenten (null = aus). Typ gehört dem Animations-Modul. */
+    var animation: Any? = null
 
     val activeLayer: Layer? get() = layers.getOrNull(activeIndex)
 

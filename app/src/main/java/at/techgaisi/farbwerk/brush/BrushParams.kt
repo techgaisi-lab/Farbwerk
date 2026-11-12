@@ -148,6 +148,8 @@ enum class BP(
     PRESSURE_SMOOTHING(BrushGroup.PEN, "Druckglättung", ParamKind.PERCENT, 0f, 1f, 0.1f),
     TILT_SIZE(BrushGroup.PEN, "Neigung → Größe", ParamKind.PERCENT, 0f, 2f, 0f),
     TILT_OPACITY(BrushGroup.PEN, "Neigung → Deckkraft", ParamKind.PERCENT, 0f, 1f, 0f),
+    /** Neigung (ab Senkrechte), ab der die Neigungs-Dynamik einsetzt – darunter wirkt der Stift wie senkrecht. */
+    TILT_ANGLE(BrushGroup.PEN, "Neigung wirkt ab", ParamKind.DEGREES, 0f, 80f, 0f),
     FINGER_PRESSURE(BrushGroup.PEN, "Fingerdruck über Tempo simulieren", ParamKind.TOGGLE, 0f, 1f, 0f),
 
     // ---- Eigenschaften

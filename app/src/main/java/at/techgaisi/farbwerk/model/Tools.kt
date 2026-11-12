@@ -31,6 +31,27 @@ interface ToolInputHandler {
     /** Stift/Finger wurde nach einer Bewegung still gehalten (QuickShape). */
     fun onHoldStill(p: InputPoint) {}
     /**
+     * Vorhergesagte (noch nicht eingetroffene) Punkte des laufenden Strichs – nur als temporäre Vorschau
+     * zeichnen, nie festschreiben. Jeder Aufruf ersetzt die vorige Vorhersage; eine leere Liste löscht sie.
+     * Wird nach jedem [onStrokeMove] aufgerufen.
+     */
+    fun onPredicted(points: List<InputPoint>) {}
+
+    /**
+     * Soll eine Zwei-Finger-Geste, die bei ([docX], [docY]) beginnt, an dieses Werkzeug gehen
+     * statt die Ansicht zu zoomen/drehen? (z. B. Kneifen innerhalb des Transform-Rahmens)
+     */
+    fun handlesTwoFingerAt(docX: Float, docY: Float): Boolean = false
+
+    /**
+     * Zwei-Finger-Änderung in Dokument-Koordinaten: Verschiebung ([dx], [dy]), Skalierung [scale] und
+     * Drehung [rotationDeg] jeweils relativ zum letzten Aufruf, um den Drehpunkt ([pivotX], [pivotY]).
+     */
+    fun onTwoFingerTransform(pivotX: Float, pivotY: Float, dx: Float, dy: Float, scale: Float, rotationDeg: Float) {}
+
+    /** Ende der Zwei-Finger-Geste, die an dieses Werkzeug ging. */
+    fun onTwoFingerEnd() {}
+    /**
      * Overlay zeichnen (Canvas ist in View-Koordinaten). [docToView] bildet Dokument- auf View-Koordinaten ab.
      */
     fun drawOverlay(canvas: android.graphics.Canvas, docToView: android.graphics.Matrix) {}

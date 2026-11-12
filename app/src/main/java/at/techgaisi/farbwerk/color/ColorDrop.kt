@@ -3,6 +3,7 @@ package at.techgaisi.farbwerk.color
 import android.graphics.Rect
 import at.techgaisi.farbwerk.EditorState
 import at.techgaisi.farbwerk.model.Layer
+import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.render.Compositor
 import at.techgaisi.farbwerk.undo.PixelEdit
 import kotlin.math.abs
@@ -16,6 +17,11 @@ import kotlin.math.roundToInt
  *  - Gibt es eine sichtbare Ebene mit `isReference = true`, bestimmen deren Pixel die Grenzen
  *    (Linienzeichnung auf eigener Ebene, Farbe auf einer anderen).
  *  - Sonst die aktive Ebene selbst.
+ *
+ * Auswahl: Ist eine Auswahl aktiv, wirkt sie als zusätzliche Grenze – gefüllt wird nur innerhalb der
+ * Auswahl (weiche Auswahlkanten werden anteilig gefüllt). Auf einer leeren Ebene füllt ein Tropfen in
+ * die Auswahl daher die gesamte Auswahl. Ein Tropfen außerhalb der Auswahl füllt nichts.
+ * Alpha-Sperre: Nur vorhandene Pixel werden eingefärbt (deren Deckkraft bleibt erhalten).
  *
  * Schwellenwert 0..1: maximal erlaubter Farbabstand zur Startfarbe (0 = nur exakt gleiche Pixel).
  * Kantenglättung: Die an den gefüllten Bereich angrenzenden Pixel erhalten eine Teilabdeckung
@@ -47,6 +53,8 @@ object ColorDrop {
         val source: IntArray,
         val color: Int,
         var threshold: Float,
+        /** Auswahlmaske (0..255 je Pixel, Dokumentgröße) oder null ohne Auswahl. */
+        val sel: ByteArray?,
         /** Bereich, der bisher in der Ebene verändert wurde (für Wiederherstellen und Commit). */
         val touched: Rect = Rect(),
     )
@@ -63,8 +71,7 @@ object ColorDrop {
      */
     fun fill(state: EditorState, x: Float, y: Float, threshold: Float): Boolean {
         if (!begin(state, x, y, threshold)) return false
-        commit()
-        return true
+        return commit()
     }
 
     /**
@@ -99,10 +106,19 @@ object ColorDrop {
         val layer = doc.activeLayer ?: return false
         val sx = x.toInt(); val sy = y.toInt()
         if (x < 0f || y < 0f || sx >= doc.width || sy >= doc.height) return false
+        // Transformieren/Anpassen halten eigene Kopien der Ebene – Füllen würde beim Abschluss überschrieben.
+        if (state.tool == Tool.TRANSFORM || state.tool == Tool.ADJUST) {
+            state.flash("Zuerst Transformieren/Anpassen abschließen"); return false
+        }
         if (layer.locked) { state.flash("Ebene gesperrt"); return false }
+        if (!layer.visible) { state.flash("Ebene ist ausgeblendet"); return false }
         if (!layer.bitmap.isMutable) return false
 
         val w = layer.width; val h = layer.height
+        val sel = doc.selection?.let { readSelection(it.mask, w, h) }
+        if (sel != null && sel[sy * w + sx] == 0.toByte()) {
+            state.flash("Außerhalb der Auswahl"); return false
+        }
         val source = IntArray(w * h)
         val ref = doc.layers.firstOrNull { it.isReference && it.visible && it !== layer }
         when {
@@ -118,7 +134,7 @@ object ColorDrop {
         }
 
         val edit = state.beginPixelEdit(layer)
-        val s = Session(state, layer, edit, w, h, sx, sy, source, ColorMath.opaque(color), threshold.coerceIn(0f, 1f))
+        val s = Session(state, layer, edit, w, h, sx, sy, source, ColorMath.opaque(color), threshold.coerceIn(0f, 1f), sel)
         session = s
         run(s)
         return true
@@ -133,15 +149,16 @@ object ColorDrop {
         run(s)
     }
 
-    /** Sitzung abschließen: Undo-Eintrag anlegen. */
-    fun commit() {
-        val s = session ?: return
+    /** Sitzung abschließen: Undo-Eintrag anlegen. @return true, wenn etwas gefüllt wurde. */
+    fun commit(): Boolean {
+        val s = session ?: return false
         session = null
         lastThreshold = s.threshold
-        if (s.touched.isEmpty) { s.edit.cancel(); releaseBuffers(); return }
+        if (s.touched.isEmpty) { s.edit.cancel(); releaseBuffers(); return false }
         s.edit.commit(Rect(s.touched), "Farbe füllen")
         s.state.invalidate()
         releaseBuffers()
+        return true
     }
 
     /** Sitzung verwerfen und Ebene wiederherstellen. */
@@ -209,6 +226,8 @@ object ColorDrop {
         val sg = ((seed ushr 8) and 0xFF) * sa / 255
         val sb = (seed and 0xFF) * sa / 255
         val t = s.threshold
+        val sel = s.sel
+        val zero = 0.toByte()
 
         var minX = s.seedX; var maxX = s.seedX; var minY = s.seedY; var maxY = s.seedY
         if (stack.size < 1024) stack = IntArray(1024)
@@ -224,18 +243,21 @@ object ColorDrop {
             var x = idx - rowStart
             // nach links laufen
             while (x > 0 && coverage[rowStart + x - 1] != full &&
+                (sel == null || sel[rowStart + x - 1] != zero) &&
                 distance(src[rowStart + x - 1], sa, sr, sg, sb) <= t) x--
             var spanAbove = false
             var spanBelow = false
             while (x < w) {
                 val i = rowStart + x
-                if (coverage[i] == full || distance(src[i], sa, sr, sg, sb) > t) break
+                if (coverage[i] == full || (sel != null && sel[i] == zero) ||
+                    distance(src[i], sa, sr, sg, sb) > t) break
                 coverage[i] = full
                 if (x < minX) minX = x
                 if (x > maxX) maxX = x
                 if (y > 0) {
                     val up = i - w
-                    val ok = coverage[up] != full && distance(src[up], sa, sr, sg, sb) <= t
+                    val ok = coverage[up] != full && (sel == null || sel[up] != zero) &&
+                        distance(src[up], sa, sr, sg, sb) <= t
                     if (ok && !spanAbove) {
                         if (sp >= stack.size) stack = stack.copyOf(stack.size * 2)
                         stack[sp++] = up; spanAbove = true
@@ -243,7 +265,8 @@ object ColorDrop {
                 }
                 if (y < h - 1) {
                     val dn = i + w
-                    val ok = coverage[dn] != full && distance(src[dn], sa, sr, sg, sb) <= t
+                    val ok = coverage[dn] != full && (sel == null || sel[dn] != zero) &&
+                        distance(src[dn], sa, sr, sg, sb) <= t
                     if (ok && !spanBelow) {
                         if (sp >= stack.size) stack = stack.copyOf(stack.size * 2)
                         stack[sp++] = dn; spanBelow = true
@@ -264,6 +287,7 @@ object ColorDrop {
             for (x in x0..x1) {
                 val i = row + x
                 if (coverage[i] != 0.toByte()) continue
+                if (sel != null && sel[i] == zero) continue
                 val adj = (x > 0 && coverage[i - 1] == full) || (x < w - 1 && coverage[i + 1] == full) ||
                     (y > 0 && coverage[i - w] == full) || (y < h - 1 && coverage[i + w] == full)
                 if (!adj) continue
@@ -287,12 +311,19 @@ object ColorDrop {
         val fb = s.color and 0xFF
         val alphaLock = s.layer.alphaLock
         val w = s.w
+        val sel = s.sel
         for (yy in 0 until rh) {
             val covRow = (r.top + yy) * w + r.left
             val outRow = yy * rw
             for (xx in 0 until rw) {
-                val cov = coverage[covRow + xx].toInt() and 0xFF
+                var cov = coverage[covRow + xx].toInt() and 0xFF
                 if (cov == 0) continue
+                if (sel != null) {
+                    // weiche Auswahlkanten: Abdeckung anteilig verringern
+                    val sa = sel[covRow + xx].toInt() and 0xFF
+                    if (sa < 255) cov = if (cov == 255) minOf(sa, 254) else cov * sa / 255
+                    if (cov == 0) continue
+                }
                 val o = px[outRow + xx]
                 val oa = (o ushr 24) and 0xFF
                 if (alphaLock) {
@@ -322,6 +353,28 @@ object ColorDrop {
             }
         }
         s.layer.bitmap.setPixels(px, 0, rw, r.left, r.top, rw, rh)
+    }
+
+    /**
+     * Liest eine ALPHA_8-Auswahlmaske (Dokumentgröße) in ein kompaktes Byte-Array (ohne Zeilenpolster).
+     * null, wenn die Maske nicht zur Ebene passt (dann wird ohne Auswahl gefüllt).
+     */
+    private fun readSelection(mask: android.graphics.Bitmap, w: Int, h: Int): ByteArray? {
+        if (mask.width != w || mask.height != h) return null
+        if (mask.config != android.graphics.Bitmap.Config.ALPHA_8) {
+            // Fallback für andere Formate: Alpha je Pixel
+            val px = IntArray(w * h)
+            mask.getPixels(px, 0, w, 0, 0, w, h)
+            return ByteArray(w * h) { (px[it] ushr 24).toByte() }
+        }
+        val stride = mask.rowBytes
+        val buf = java.nio.ByteBuffer.allocate(stride * h)
+        mask.copyPixelsToBuffer(buf)
+        val raw = buf.array()
+        if (stride == w) return raw
+        val out = ByteArray(w * h)
+        for (y in 0 until h) System.arraycopy(raw, y * stride, out, y * w, w)
+        return out
     }
 
     private fun isFullyTransparent(px: IntArray): Boolean {
