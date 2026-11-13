@@ -186,7 +186,8 @@ fun GalleryScreen(state: EditorState) {
         if (uri != null) Background.run("Foto wird geöffnet …", onError) {
             val stackId = openStackId
             val doc = withContext(Dispatchers.IO) {
-                val bmp = Importers.decodeImage(ctx, uri)
+                // Fotos auf max. 16 MP begrenzen: große Handykamera-Bilder (50–200 MP) sonst zu speicherhungrig
+                val bmp = Importers.decodeImage(ctx, uri, maxPixels = 16_000_000L)
                 Importers.documentFromImage(bmp, Importers.displayName(ctx, uri)).also { store.saveDetached(it, stackId) }
             }
             state.openDocument(doc)
@@ -333,7 +334,10 @@ fun GalleryScreen(state: EditorState) {
             }
 
             // ------------------------------------------------------- Raster
-            if (loaded && items.isEmpty()) {
+            if (!loaded) {
+                // Skelett statt leerer Fläche, bis die Projektliste geladen ist
+                GallerySkeleton(headerHeight)
+            } else if (items.isEmpty()) {
                 Box(Modifier.fillMaxSize().padding(top = headerHeight), contentAlignment = Alignment.Center) {
                     Column(horizontalAlignment = Alignment.CenterHorizontally) {
                         Text("Noch keine Werke", color = GalleryTokens.textPrimary, fontSize = 18.sp, fontWeight = FontWeight.SemiBold)
@@ -557,7 +561,7 @@ private fun Thumbnail(
         ) {
             if (bmp != null) {
                 Image(bmp.asImageBitmap(), null, contentScale = ContentScale.FillBounds, modifier = Modifier.fillMaxSize())
-            } else Box(Modifier.fillMaxSize().background(GalleryTokens.panelInset))
+            } else Box(Modifier.fillMaxSize().shimmer()) // Miniatur lädt noch
             if (highlight) Box(Modifier.fillMaxSize().border(3.dp, GalleryTokens.accent, shape))
             overlay()
         }

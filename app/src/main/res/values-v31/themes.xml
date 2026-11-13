@@ -1,0 +1,15 @@
+<resources>
+    <!--
+      Android 12+ zeigt beim Start immer einen System-Startbildschirm. Statt des App-Icons nur
+      die dunkle Galerie-Hintergrundfarbe – danach erscheint direkt das Lade-Skelett der Galerie.
+    -->
+    <style name="Theme.Farbwerk" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowBackground">#FF050505</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:windowSplashScreenBackground">#FF050505</item>
+        <item name="android:windowSplashScreenAnimatedIcon">@drawable/splash_empty</item>
+        <item name="android:windowSplashScreenAnimationDuration">0</item>
+        <item name="android:windowSplashScreenIconBackgroundColor">#FF050505</item>
+    </style>
+</resources>

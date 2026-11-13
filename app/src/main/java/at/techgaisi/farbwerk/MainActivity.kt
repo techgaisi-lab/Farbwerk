@@ -18,6 +18,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        CrashReporter.install(this)
         // Systemleisten komplett durchsichtig und dunkel – kein heller Streifen unten (Gesten-Leiste),
         // auch wenn das Gerät im hellen Systemmodus läuft.
         enableEdgeToEdge(
@@ -38,6 +39,7 @@ class MainActivity : ComponentActivity() {
                     }
                 }
                 EditorScreen(state)
+                CrashReportDialog()
             }
         }
     }
