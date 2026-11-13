@@ -4,6 +4,7 @@ import android.os.Bundle
 import android.view.KeyEvent
 import android.view.inputmethod.InputMethodManager
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -17,7 +18,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        enableEdgeToEdge()
+        // Systemleisten komplett durchsichtig und dunkel – kein heller Streifen unten (Gesten-Leiste),
+        // auch wenn das Gerät im hellen Systemmodus läuft.
+        enableEdgeToEdge(
+            statusBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+            navigationBarStyle = SystemBarStyle.dark(android.graphics.Color.TRANSPARENT),
+        )
+        window.isNavigationBarContrastEnforced = false
+        window.isStatusBarContrastEnforced = false
         state = (lastCustomNonConfigurationInstanceCompat() as? EditorState) ?: EditorState(applicationContext)
         setContent {
             FarbwerkTheme(light = state.prefs.lightInterface) {
