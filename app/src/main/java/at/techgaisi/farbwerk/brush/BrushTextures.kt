@@ -35,6 +35,17 @@ enum class ShapeKind(val label: String) {
     LEAF("Blatt"),
     SQUARE("Quadrat"),
     DRYBRUSH("Trockenpinsel"),
+    // neue Formen nur hinten anhängen (Index wird gespeichert)
+    GRASS("Halme"),
+    STAR("Stern"),
+    STREAK("Strich"),
+    FLAME("Flamme"),
+    RING("Ring"),
+    STIPPLE("Punktwolke"),
+    FUR("Fasern"),
+    CHISEL("Keilspitze"),
+    TRIANGLE("Dreieck"),
+    BOKEH("Lichtscheibe"),
 }
 
 /** Prozedural erzeugte, nahtlos kachelbare Körnungen. */
@@ -48,6 +59,11 @@ enum class GrainKind(val label: String) {
     CONCRETE("Beton"),
     HATCH("Schraffur"),
     HALFTONE("Raster"),
+    // neue Körnungen nur hinten anhängen (Index wird gespeichert)
+    WOOD("Holz"),
+    CROSSHATCH("Kreuzschraffur"),
+    LINES("Linien"),
+    CELLS("Zellen"),
 }
 
 /** Rausch-Hilfsfunktionen (deterministisch, optional periodisch/kachelbar). */
@@ -190,6 +206,19 @@ object BrushTextures {
             ShapeKind.DRYBRUSH -> List(60) { i ->
                 floatArrayOf(-0.9f + 1.8f * Noise.hash(i, 1, 21), 0f, 0.01f + 0.035f * Noise.hash(i, 2, 21), 0.4f + 0.6f * Noise.hash(i, 3, 21))
             }
+            ShapeKind.GRASS -> List(9) { i ->
+                // Basis-x, Spitzen-x, Höhe, Breite
+                val bx = -0.55f + 1.1f * Noise.hash(i, 1, 41)
+                floatArrayOf(bx, bx + (Noise.hash(i, 2, 41) - 0.5f) * 0.9f, 0.9f + 0.95f * Noise.hash(i, 3, 41), 0.04f + 0.04f * Noise.hash(i, 4, 41))
+            }
+            ShapeKind.STIPPLE -> List(70) { i ->
+                val a = Noise.hash(i, 1, 43) * 2 * PI.toFloat(); val r = sqrt(Noise.hash(i, 2, 43)) * 0.85f
+                floatArrayOf(cos(a) * r, sin(a) * r, 0.025f + 0.035f * Noise.hash(i, 3, 43), 0.6f + 0.4f * Noise.hash(i, 4, 43))
+            }
+            ShapeKind.FUR -> List(40) { i ->
+                val y0 = -0.9f + 0.9f * Noise.hash(i, 2, 47)
+                floatArrayOf(-0.85f + 1.7f * Noise.hash(i, 1, 47), y0, y0 + 0.6f + 0.9f * Noise.hash(i, 3, 47), 0.5f + 0.5f * Noise.hash(i, 4, 47))
+            }
             else -> emptyList()
         }
         for (y in 0 until n) for (x in 0 until n) {
@@ -281,6 +310,62 @@ object BrushTextures {
                     val lenMask = 1f - smooth(0.25f + 0.2f * Noise.value(u * 30f, 0f, 0, 22), 0.5f, abs(v))
                     s * lenMask * (1f - smooth(0.88f, 0.98f, abs(u)))
                 }
+                ShapeKind.GRASS -> {
+                    var s = 0f
+                    for (d in dots) {
+                        val t = (0.95f - v) / d[2] // 0 = Fuß, 1 = Spitze
+                        if (t < 0f || t > 1f) continue
+                        val cx = d[0] + (d[1] - d[0]) * t * t
+                        val w = d[3] * (1f - t)
+                        s = max(s, ((w - abs(u - cx)) / px).coerceIn(0f, 1f))
+                    }
+                    s
+                }
+                ShapeKind.STAR -> {
+                    val ang = atan2(v, u) + PI.toFloat() / 2f
+                    val rr = 0.4f + 0.52f * abs(cos(2.5f * ang)).pow(5f)
+                    ((rr - r) / px).coerceIn(0f, 1f)
+                }
+                ShapeKind.STREAK -> (1f - smooth(0.025f, 0.07f, abs(u))) * (1f - smooth(0.55f, 0.95f, abs(v))) * (0.7f + 0.3f * (1f - abs(v)))
+                ShapeKind.FLAME -> {
+                    // Spitze oben, runder Bauch unten
+                    val t = ((v + 0.92f) / 1.37f).coerceIn(0f, 1f)
+                    val w = if (v < 0.45f) 0.42f * t.pow(0.75f) else sqrt((0.42f * 0.42f - (v - 0.45f) * (v - 0.45f)).coerceAtLeast(0f))
+                    val sway = 0.08f * sin(v * 5f) * (1f - t)
+                    val body = 1f - smooth(w - 0.08f, w + 0.02f, abs(u - sway))
+                    body * (0.55f + 0.45f * t) * (if (v < -0.95f) 0f else 1f)
+                }
+                ShapeKind.RING -> 1f - smooth(0.07f, 0.13f, abs(r - 0.72f))
+                ShapeKind.STIPPLE -> {
+                    var s = 0f
+                    for (d in dots) {
+                        val dd = sqrt((u - d[0]) * (u - d[0]) + (v - d[1]) * (v - d[1]))
+                        s = max(s, ((d[2] - dd) / px).coerceIn(0f, 1f) * d[3])
+                    }
+                    s
+                }
+                ShapeKind.FUR -> {
+                    var s = 0f
+                    for (d in dots) {
+                        if (v < d[1] || v > d[2]) continue
+                        val t = (v - d[1]) / (d[2] - d[1])
+                        val cx = d[0] + 0.06f * sin(t * 3f + d[3] * 6f)
+                        s = max(s, (1f - smooth(0.006f, 0.02f, abs(u - cx))) * d[3] * sin(t * PI.toFloat()).pow(0.5f))
+                    }
+                    s
+                }
+                ShapeKind.CHISEL -> {
+                    val edge = (1f - smooth(0.78f, 0.86f, abs(u))) * (1f - smooth(0.26f, 0.32f, abs(v)))
+                    edge * (0.82f + 0.18f * Noise.value(u * 3f, (v + 1f) * 30f, 0, 49))
+                }
+                ShapeKind.TRIANGLE -> {
+                    // gleichseitig, Spitze oben
+                    val d1 = v - 0.62f
+                    val d2 = -0.866f * u - 0.5f * v - 0.62f
+                    val d3 = 0.866f * u - 0.5f * v - 0.62f
+                    ((-max(d1, max(d2, d3))) / px).coerceIn(0f, 1f)
+                }
+                ShapeKind.BOKEH -> ((0.86f - r) / (px * 2f)).coerceIn(0f, 1f) * (0.5f + 0.5f * smooth(0.55f, 0.84f, r))
             }
             out[y * n + x] = a
         }
@@ -327,6 +412,35 @@ object BrushTextures {
                 GrainKind.HALFTONE -> {
                     val cx = (x % 8) - 3.5f; val cy = (y % 8) - 3.5f
                     1f - smooth(2.6f, 3.4f, sqrt(cx * cx + cy * cy))
+                }
+                GrainKind.WOOD -> {
+                    val f = Noise.fbm(fx / 64f, fy / 8f, n / 64, n / 8, 3, 109)
+                    val ring = 0.5f + 0.5f * sin(fy / n * 2f * PI.toFloat() * 14f + f * 9f)
+                    0.3f + 0.7f * smooth(0.2f, 0.8f, ring) * (0.75f + 0.25f * Noise.value(fx / 2f, fy / 6f, n / 2, n / 6, 110))
+                }
+                GrainKind.CROSSHATCH -> {
+                    val t1 = abs(((fx + fy) % 8f) / 8f - 0.5f)
+                    val t2 = abs(((fx - fy + n) % 8f) / 8f - 0.5f)
+                    val l1 = smooth(0.12f, 0.28f, t1); val l2 = smooth(0.12f, 0.28f, t2)
+                    min(l1, l2) * 0.85f + 0.15f
+                }
+                GrainKind.LINES -> {
+                    val t = abs((fy % 6f) / 6f - 0.5f)
+                    smooth(0.15f, 0.3f, t) * (0.8f + 0.2f * Noise.value(fx / 16f, fy / 6f, n / 16, n / 6, 111))
+                }
+                GrainKind.CELLS -> {
+                    // kachelbares Zellmuster (Abstand zur Zellgrenze)
+                    val c = 32; val cells = n / c
+                    val gx = x / c; val gy = y / c
+                    var d1 = 1e9f; var d2 = 1e9f
+                    for (oy in -1..1) for (ox in -1..1) {
+                        val cx = gx + ox; val cy = gy + oy
+                        val wx = ((cx % cells) + cells) % cells; val wy = ((cy % cells) + cells) % cells
+                        val ppx = (cx + Noise.hash(wx, wy, 112)) * c; val ppy = (cy + Noise.hash(wx, wy, 113)) * c
+                        val d = sqrt((fx - ppx) * (fx - ppx) + (fy - ppy) * (fy - ppy))
+                        if (d < d1) { d2 = d1; d1 = d } else if (d < d2) d2 = d
+                    }
+                    smooth(0.5f, 4f, d2 - d1) * (0.7f + 0.3f * smooth(0f, 24f, d1))
                 }
             }
             out[y * n + x] = g.coerceIn(0f, 1f)

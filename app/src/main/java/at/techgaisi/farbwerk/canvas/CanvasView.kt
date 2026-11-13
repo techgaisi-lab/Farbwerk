@@ -258,9 +258,24 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
 
     // ===================================================================== Zeichnen
 
+    /** Feines Raster auf der Arbeitsfläche hinter der Leinwand (fest am Bildschirm, nicht am Dokument). */
+    private val workspaceGridPaint = Paint().apply { strokeWidth = 1f; isAntiAlias = false }
+
+    private fun drawWorkspaceGrid(canvas: Canvas, light: Boolean) {
+        val step = 28f * density
+        workspaceGridPaint.color = if (light) Color.argb(14, 0, 0, 0) else Color.argb(11, 255, 255, 255)
+        val w = width.toFloat(); val h = height.toFloat()
+        // Raster mittig ausrichten, damit es symmetrisch zu den Bildschirmrändern liegt
+        var x = (w / 2f) % step
+        while (x < w) { canvas.drawLine(x, 0f, x, h, workspaceGridPaint); x += step }
+        var y = (h / 2f) % step
+        while (y < h) { canvas.drawLine(0f, y, w, y, workspaceGridPaint); y += step }
+    }
+
     override fun onDraw(canvas: Canvas) {
         val light = state.prefs.lightInterface
         canvas.drawColor(if (light) Color.rgb(217, 217, 221) else Color.rgb(30, 30, 32)) // Arbeitsfläche (Theme: workspace)
+        drawWorkspaceGrid(canvas, light)
         val doc = state.document ?: return
         val bounds = RectF(0f, 0f, doc.width.toFloat(), doc.height.toFloat())
 

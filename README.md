@@ -12,7 +12,7 @@ Native Android-Zeichen-App für Tablets mit Stift. Funktionsumfang, Gesten, Tast
 |---|---|
 | **Pinsel-Engine** | Stempel-Rendering mit Stiftdruck, Neigung, Tempo · StreamLine & Stabilisierung · Verjüngung · Streuung, Rotation, Körnung · Strichdeckkraft wie bei echten Mal-Apps · Nasse Farbe, Farbdynamik |
 | **Werkzeuge** | Malen · Wischen · Radieren (auch per Radierer-Ende des Stifts) |
-| **Pinselbibliothek** | 44 eigene Pinsel in 10 Sets, Favoriten, Zuletzt verwendet, eigene Pinsel, Pinsel-Studio mit Live-Testfläche |
+| **Pinselbibliothek** | 180 eigene Pinsel in 18 Sets, Favoriten, Zuletzt verwendet, eigene Pinsel, Pinsel-Studio mit Live-Testfläche |
 | **QuickShape** | Linie, Ellipse/Kreis, Rechteck/Quadrat, Polygon, Bogen – Zeichnen & Halten, danach skalieren/drehen |
 | **Ebenen** | 18 Mischmodi · Deckkraft · Alpha-Sperre · Schnittmasken · Ebenenmasken · Gruppen · Referenzebene · Sperren · Zusammenfügen per Kneifgeste |
 | **Farben** | Scheibe · Klassisch · Harmonie · Werte (HSB/RGB/Hex) · Paletten (auch aus Fotos) · Pipetten-Lupe · ColorDrop-Füllung mit Schwellenwert |

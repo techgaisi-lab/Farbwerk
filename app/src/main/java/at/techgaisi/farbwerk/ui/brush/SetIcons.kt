@@ -52,22 +52,33 @@ internal fun SetIcon(setId: String, emoji: String?, tint: Color, size: Dp = 14.d
 /** Raster, in dem die Symbole entworfen sind. */
 private const val GRID = 14f
 
-private enum class Glyph { HOURGLASS, STAR, PENCIL, NIB, FINELINER, PAINTBRUSH, PALETTE, SPRAY, TEXTURE, CHARCOAL, DROP, SCRIPT, IMPORT, STROKE }
+private enum class Glyph {
+    HOURGLASS, STAR, PENCIL, NIB, FINELINER, PAINTBRUSH, PALETTE, SPRAY, TEXTURE, CHARCOAL, DROP, SCRIPT, IMPORT, STROKE,
+    MARKER, CRAYON, TUBE, SHAPES, BUBBLE, SWIRL, GLOW, LEAF,
+}
 
 private fun glyphFor(setId: String): Glyph = when (setId) {
     BrushLibrary.SET_RECENT -> Glyph.HOURGLASS
     BrushLibrary.SET_FAVORITES -> Glyph.STAR
     BrushLibrary.SET_IMPORTED -> Glyph.IMPORT
     "skizze" -> Glyph.PENCIL
-    "tinte" -> Glyph.NIB
     "zeichnen" -> Glyph.FINELINER
+    "tinte" -> Glyph.NIB
+    "marker" -> Glyph.MARKER
+    "pastell" -> Glyph.CRAYON
+    "oel" -> Glyph.TUBE
     "malen" -> Glyph.PAINTBRUSH
-    "kunst" -> Glyph.PALETTE
-    "airbrush" -> Glyph.SPRAY
-    "texturen" -> Glyph.TEXTURE
+    "gouache" -> Glyph.PALETTE
+    "aquarell" -> Glyph.DROP
     "kohle" -> Glyph.CHARCOAL
-    "elemente" -> Glyph.DROP
+    "grundformen" -> Glyph.SHAPES
     "kalligrafie" -> Glyph.SCRIPT
+    "comic" -> Glyph.BUBBLE
+    "texturen" -> Glyph.TEXTURE
+    "kunst" -> Glyph.SWIRL
+    "leuchten" -> Glyph.GLOW
+    "elemente" -> Glyph.LEAF
+    "airbrush" -> Glyph.SPRAY
     else -> Glyph.STROKE
 }
 
@@ -216,6 +227,74 @@ private fun DrawScope.drawSetGlyph(g: Glyph, c: Color) {
             drawPath(head, c, style = Stroke(1.4f, cap = StrokeCap.Round, join = StrokeJoin.Round))
             val tray = Path().apply { moveTo(1.6f, 9f); lineTo(1.6f, 12.4f); lineTo(12.4f, 12.4f); lineTo(12.4f, 9f) }
             drawPath(tray, c, style = Stroke(1.4f, cap = StrokeCap.Round, join = StrokeJoin.Round))
+        }
+        Glyph.MARKER -> rotate(-45f, Offset(7f, 7f)) {
+            // dicker Marker mit schräger Keilspitze und Kappenring
+            drawRoundRect(c, Offset(4.4f, 4.6f), Size(8.8f, 4.8f), CornerRadius(1.4f))
+            drawLine(Color.Black, Offset(10.4f, 4.4f), Offset(10.4f, 9.6f), 0.7f, blendMode = androidx.compose.ui.graphics.BlendMode.Clear)
+            val tip = Path().apply { moveTo(4.4f, 5.4f); lineTo(1.4f, 6.2f); lineTo(1.4f, 8.2f); lineTo(4.4f, 8.6f); close() }
+            drawPath(tip, c, alpha = 0.8f)
+        }
+        Glyph.CRAYON -> {
+            // zwei kurze Kreidestücke, eines liegend, eines schräg
+            drawRoundRect(c, Offset(1.4f, 9.6f), Size(8.4f, 3f), CornerRadius(1.5f))
+            rotate(-50f, Offset(9.4f, 5.6f)) {
+                drawRoundRect(c, Offset(5.6f, 4.2f), Size(7.6f, 2.8f), CornerRadius(1.4f), alpha = 0.7f)
+            }
+        }
+        Glyph.TUBE -> rotate(-35f, Offset(7f, 7f)) {
+            // Farbtube: Körper, Falz am Ende, Hals und Deckel
+            val body = Path().apply { moveTo(3.2f, 5f); lineTo(10.6f, 4.6f); lineTo(10.6f, 9.4f); lineTo(3.2f, 9f); close() }
+            drawPath(body, c)
+            drawRect(c, Offset(11f, 4.4f), Size(1.4f, 5.2f), alpha = 0.6f)
+            drawRect(c, Offset(2f, 6f), Size(1.2f, 2f), alpha = 0.8f)
+            drawRoundRect(c, Offset(0.4f, 5.6f), Size(1.6f, 2.8f), CornerRadius(0.5f))
+        }
+        Glyph.SHAPES -> {
+            drawCircle(c, 3.6f, Offset(5f, 5f))
+            drawRect(c, Offset(6.6f, 6.6f), Size(6.4f, 6.4f), alpha = 0.6f)
+        }
+        Glyph.BUBBLE -> {
+            // Sprechblase mit Zipfel
+            drawOval(c, Offset(1f, 1.6f), Size(12f, 8.4f), style = Stroke(1.2f))
+            val tail = Path().apply { moveTo(4f, 9.2f); lineTo(3f, 12.8f); lineTo(6.6f, 9.8f) }
+            drawPath(tail, c, style = Stroke(1.2f, join = StrokeJoin.Round, cap = StrokeCap.Round))
+            drawCircle(c, 0.8f, Offset(4.4f, 5.8f)); drawCircle(c, 0.8f, Offset(7f, 5.8f)); drawCircle(c, 0.8f, Offset(9.6f, 5.8f))
+        }
+        Glyph.SWIRL -> {
+            // Spirale nach außen
+            val p = Path()
+            var first = true
+            var t = 0f
+            while (t <= 4.2f * Math.PI.toFloat()) {
+                val r = 0.4f + 0.46f * t
+                val x = 7f + r * kotlin.math.cos(t); val y = 7f + r * kotlin.math.sin(t)
+                if (first) { p.moveTo(x, y); first = false } else p.lineTo(x, y)
+                t += 0.2f
+            }
+            drawPath(p, c, style = thin)
+        }
+        Glyph.GLOW -> {
+            // Lichtpunkt mit Strahlen
+            drawCircle(c.copy(alpha = c.alpha * 0.35f), 4.4f, Offset(7f, 7f))
+            drawCircle(c, 2.4f, Offset(7f, 7f))
+            for (i in 0 until 8) {
+                val a = Math.toRadians(i * 45.0)
+                val r0 = 5f; val r1 = if (i % 2 == 0) 6.8f else 6f
+                val ca = kotlin.math.cos(a).toFloat(); val sa = kotlin.math.sin(a).toFloat()
+                drawLine(c, Offset(7f + ca * r0, 7f + sa * r0), Offset(7f + ca * r1, 7f + sa * r1), 0.9f, StrokeCap.Round)
+            }
+        }
+        Glyph.LEAF -> {
+            val leaf = Path().apply {
+                moveTo(2f, 12f)
+                cubicTo(1.6f, 6f, 5.4f, 1.8f, 12.6f, 1.4f)
+                cubicTo(12.4f, 8.6f, 8f, 12.4f, 2f, 12f)
+                close()
+            }
+            drawPath(leaf, c)
+            drawLine(Color.Black, Offset(2.6f, 11.4f), Offset(9.6f, 4.4f), 0.8f, StrokeCap.Round,
+                blendMode = androidx.compose.ui.graphics.BlendMode.Clear)
         }
         Glyph.STROKE -> {
             // Allgemeines Set: geschwungener Pinselstrich, dick → dünn
