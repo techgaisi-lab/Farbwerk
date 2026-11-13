@@ -1,0 +1,39 @@
+name: Windows-Build
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    name: Farbwerk für Windows (.exe / .msi)
+    runs-on: windows-latest
+    env:
+      # Android-Modul nicht einbinden – für den Desktop-Build wird kein Android-SDK gebraucht
+      FARBWERK_SKIP_ANDROID: "true"
+    steps:
+      - name: Quellcode auschecken
+        uses: actions/checkout@v4
+
+      - name: JDK 17 (Temurin) einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Windows-Pakete bauen
+        shell: bash
+        run: ./gradlew --no-daemon :desktop:packageExe :desktop:packageMsi
+
+      - name: Artefakte hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Farbwerk-Windows
+          path: |
+            desktop/build/compose/binaries/main/exe/*.exe
+            desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error

@@ -107,6 +107,16 @@ Voraussetzungen: JDK 17+, Android SDK (Platform 35). Pfad zum SDK in `local.prop
 - [`docs/FUNKTIONSANLEITUNG.md`](docs/FUNKTIONSANLEITUNG.md) – Funktions- und Verhaltensbeschreibung aller Bereiche
 - [`docs/LUECKEN.md`](docs/LUECKEN.md) – Abgleich mit dem Umsetzungsstand und Arbeitspakete
 
+## Windows-Version
+
+Das Modul `desktop/` baut dieselbe App als Windows-Programm (Compose Multiplatform Desktop). Es kompiliert die
+unveränderten Quellen aus `app/` gegen eine Kompatibilitätsschicht, die die benutzten Android-APIs auf Skia/AWT abbildet.
+
+- **Installer:** wird von GitHub Actions (`.github/workflows/windows.yml`) bei jedem Push auf `main` als `.exe` und `.msi` gebaut → Artefakt „Farbwerk-Windows“
+- **Lokal starten (Linux/Windows):** `./gradlew :desktop:run`
+- **Eingabe:** Maus/Stift malen, Mausrad zoomt, mittlere Taste verschiebt, rechte Taste = Pipette, Touch-Gesten wie auf dem Tablet
+- **Einschränkungen:** kein Stiftdruck über AWT, kein MP4-Export (GIF/PNG stattdessen)
+
 ## Bekannte Einschränkungen
 
 - Gruppen sind nicht verschachtelbar
