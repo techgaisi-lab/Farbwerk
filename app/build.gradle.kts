@@ -12,8 +12,8 @@ android {
         applicationId = "at.techgaisi.farbwerk"
         minSdk = 29
         targetSdk = 35
-        versionCode = 7
-        versionName = "0.4.0"
+        versionCode = 8
+        versionName = "0.4.1"
     }
 
     buildTypes {

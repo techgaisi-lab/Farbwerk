@@ -54,7 +54,7 @@ private const val GRID = 14f
 
 private enum class Glyph {
     HOURGLASS, STAR, PENCIL, NIB, FINELINER, PAINTBRUSH, PALETTE, SPRAY, TEXTURE, CHARCOAL, DROP, SCRIPT, IMPORT, STROKE,
-    MARKER, CRAYON, TUBE, SHAPES, BUBBLE, SWIRL, GLOW, LEAF,
+    MARKER, CRAYON, TUBE, SHAPES, BUBBLE, SWIRL, GLOW, LEAF, SPLASH, WAVE, HAIR, NUT, WEAVE,
 }
 
 private fun glyphFor(setId: String): Glyph = when (setId) {
@@ -62,23 +62,23 @@ private fun glyphFor(setId: String): Glyph = when (setId) {
     BrushLibrary.SET_FAVORITES -> Glyph.STAR
     BrushLibrary.SET_IMPORTED -> Glyph.IMPORT
     "skizze" -> Glyph.PENCIL
-    "zeichnen" -> Glyph.FINELINER
     "tinte" -> Glyph.NIB
     "marker" -> Glyph.MARKER
-    "pastell" -> Glyph.CRAYON
-    "oel" -> Glyph.TUBE
     "malen" -> Glyph.PAINTBRUSH
-    "gouache" -> Glyph.PALETTE
     "aquarell" -> Glyph.DROP
     "kohle" -> Glyph.CHARCOAL
-    "grundformen" -> Glyph.SHAPES
     "kalligrafie" -> Glyph.SCRIPT
-    "comic" -> Glyph.BUBBLE
-    "texturen" -> Glyph.TEXTURE
-    "kunst" -> Glyph.SWIRL
-    "leuchten" -> Glyph.GLOW
-    "elemente" -> Glyph.LEAF
     "airbrush" -> Glyph.SPRAY
+    "spruehen" -> Glyph.SPLASH
+    "elemente" -> Glyph.WAVE
+    "haut" -> Glyph.HAIR
+    "leuchten" -> Glyph.GLOW
+    "texturen" -> Glyph.TEXTURE
+    "industrie" -> Glyph.NUT
+    "natur" -> Glyph.LEAF
+    "retro" -> Glyph.SHAPES
+    "kunst" -> Glyph.SWIRL
+    "material" -> Glyph.WEAVE
     else -> Glyph.STROKE
 }
 
@@ -295,6 +295,58 @@ private fun DrawScope.drawSetGlyph(g: Glyph, c: Color) {
             drawPath(leaf, c)
             drawLine(Color.Black, Offset(2.6f, 11.4f), Offset(9.6f, 4.4f), 0.8f, StrokeCap.Round,
                 blendMode = androidx.compose.ui.graphics.BlendMode.Clear)
+        }
+        Glyph.SPLASH -> {
+            // Farbklecks mit Spritzern
+            drawCircle(c, 3.1f, Offset(6.2f, 7.6f))
+            drawCircle(c, 1.5f, Offset(8.6f, 9.6f))
+            drawCircle(c, 0.9f, Offset(11.4f, 4.2f))
+            drawCircle(c, 0.7f, Offset(2f, 3f))
+            drawCircle(c, 0.6f, Offset(12.2f, 11.2f))
+            drawCircle(c, 0.5f, Offset(3.2f, 12.4f))
+            drawCircle(c, 0.5f, Offset(9.6f, 2f))
+        }
+        Glyph.WAVE -> {
+            // sich einrollende Welle
+            val p = Path().apply {
+                moveTo(1f, 11f)
+                cubicTo(3.6f, 11f, 4.2f, 4.2f, 8.4f, 3.4f)
+                cubicTo(11.6f, 2.8f, 13.2f, 5.6f, 11.2f, 7.2f)
+                cubicTo(9.8f, 8.2f, 8.2f, 6.6f, 9.4f, 5.6f)
+            }
+            drawPath(p, c, style = thin)
+            drawLine(c, Offset(1f, 12.6f), Offset(13f, 12.6f), 1.2f, StrokeCap.Round)
+        }
+        Glyph.HAIR -> {
+            // drei fließende Strähnen
+            for (i in 0 until 3) {
+                val o = i * 3f
+                val p = Path().apply {
+                    moveTo(3f + o, 1.4f)
+                    cubicTo(1f + o, 5f, 6f + o, 8f, 3.4f + o, 12.6f)
+                }
+                drawPath(p, c, style = Stroke(1.1f, cap = StrokeCap.Round))
+            }
+        }
+        Glyph.NUT -> {
+            // Sechskantmutter
+            val p = Path()
+            for (i in 0 until 6) {
+                val a = Math.toRadians(i * 60.0)
+                val x = 7f + 5.8f * kotlin.math.cos(a).toFloat(); val y = 7f + 5.8f * kotlin.math.sin(a).toFloat()
+                if (i == 0) p.moveTo(x, y) else p.lineTo(x, y)
+            }
+            p.close()
+            drawPath(p, c)
+            drawCircle(Color.Black, 2.2f, Offset(7f, 7f), blendMode = androidx.compose.ui.graphics.BlendMode.Clear)
+        }
+        Glyph.WEAVE -> {
+            // Gewebe: abwechselnd waagrechte und senkrechte Fäden
+            for (r in 0 until 3) for (k in 0 until 3) {
+                val x = 1.2f + k * 4f; val y = 1.2f + r * 4f
+                if ((r + k) % 2 == 0) drawRoundRect(c, Offset(x, y + 0.9f), Size(3.6f, 1.8f), CornerRadius(0.9f))
+                else drawRoundRect(c, Offset(x + 0.9f, y), Size(1.8f, 3.6f), CornerRadius(0.9f))
+            }
         }
         Glyph.STROKE -> {
             // Allgemeines Set: geschwungener Pinselstrich, dick → dünn
