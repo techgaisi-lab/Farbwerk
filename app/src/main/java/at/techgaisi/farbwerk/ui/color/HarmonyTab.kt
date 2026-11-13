@@ -132,8 +132,16 @@ fun HarmonyTab(model: HsvModel, modifier: Modifier = Modifier) {
                 val dp = (g.radius * 2).roundToInt().coerceAtLeast(2)
                 // Rad mit voller Helligkeit einmal pro Größe rendern; Helligkeit als schwarze Überlagerung
                 // (HSB: V · Farbe) – dadurch kostet das Ziehen an der Helligkeitslinie keine Pixelrechnung.
-                drawImage(renderer.image(dp), IntOffset((g.center.x - dp / 2f).roundToInt(), (g.center.y - dp / 2f).roundToInt()))
-                if (model.v < 1f) drawCircle(Color.Black.copy(alpha = 1f - model.v), g.radius, g.center)
+                // Abdunkeln direkt auf den Pixeln des Rads (SrcAtop) – deckt exakt dieselbe Fläche ab,
+                // statt eines separaten Kreises, der um Rundungspixel versetzt sein kann.
+                drawImage(
+                    renderer.image(dp),
+                    dstOffset = IntOffset((g.center.x - dp / 2f).roundToInt(), (g.center.y - dp / 2f).roundToInt()),
+                    dstSize = IntSize(dp, dp),
+                    colorFilter = if (model.v < 1f)
+                        androidx.compose.ui.graphics.ColorFilter.tint(Color.Black.copy(alpha = 1f - model.v), androidx.compose.ui.graphics.BlendMode.SrcAtop)
+                    else null,
+                )
                 mode.offsets.forEach { off ->
                     drawHandle(g.point(model.h + off, model.s), 6.dp.toPx(), ColorMath.hsvToArgb(model.h + off, model.s, model.v).toUiColor())
                 }

@@ -67,7 +67,7 @@ enum class ActionTab(val label: String, val icon: ImageVector) {
     CANVAS("Leinwand", ActionIcons.Canvas),
     SHARE("Teilen", ActionIcons.Share),
     VIDEO("Video", ActionIcons.Video),
-    SETTINGS("Einstellungen", ActionIcons.Settings),
+    SETTINGS("Optionen", ActionIcons.Settings),
     HELP("Hilfe", ActionIcons.Help),
 }
 
@@ -141,8 +141,8 @@ private fun ActionTabRow() {
                 Spacer(Modifier.height(4.dp))
                 // Lange deutsche Labels dürfen minimal in die Nachbarzelle ragen (statt umzubrechen).
                 Text(
-                    tab.label, color = if (sel) t.text else t.text.copy(alpha = 0.85f), fontSize = 10.sp,
-                    lineHeight = 12.sp, fontWeight = if (sel) FontWeight.SemiBold else FontWeight.Normal,
+                    tab.label, color = if (sel) t.text else t.text.copy(alpha = 0.85f), fontSize = 9.5.sp,
+                    lineHeight = 12.sp, fontWeight = FontWeight.Normal, letterSpacing = (-0.1).sp,
                     maxLines = 1, softWrap = false, textAlign = TextAlign.Center,
                     modifier = Modifier.wrapContentWidth(unbounded = true),
                 )

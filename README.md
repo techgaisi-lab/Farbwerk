@@ -115,6 +115,10 @@ Voraussetzungen: JDK 17+, Android SDK (Platform 35). Pfad zum SDK in `local.prop
 - Kein Zeitraffer-Video, kein PDF-Import
 - Doppelpinsel und ABR-Import fehlen
 
+## Schrift
+
+Die Oberfläche nutzt **Inter** (SIL Open Font License 1.1, siehe [`licenses/Inter-OFL.txt`](licenses/Inter-OFL.txt)).
+
 ## Lizenz
 
 Privat – alle Rechte vorbehalten.

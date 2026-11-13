@@ -302,6 +302,31 @@ fun FarbwerkTheme(light: Boolean, content: @Composable () -> Unit) {
     val scheme = if (light) lightColorScheme(primary = ui.accent, surface = ui.panel, background = ui.workspace)
     else darkColorScheme(primary = ui.accent, surface = ui.panel, background = ui.workspace)
     CompositionLocalProvider(LocalUi provides ui) {
-        MaterialTheme(colorScheme = scheme, content = content)
+        MaterialTheme(colorScheme = scheme, typography = AppTypography, content = content)
     }
+}
+
+
+/**
+ * App-Schrift: Inter (SIL Open Font License, siehe licenses/Inter-OFL.txt).
+ * Inter ist eine freie, für Bildschirme gezeichnete Grotesk im Stil der iOS-Systemschrift;
+ * die Apple-Schriften selbst dürfen nicht in Android-Apps mitgeliefert werden.
+ */
+val AppFont = androidx.compose.ui.text.font.FontFamily(
+    androidx.compose.ui.text.font.Font(at.techgaisi.farbwerk.R.font.inter_regular, androidx.compose.ui.text.font.FontWeight.Normal),
+    androidx.compose.ui.text.font.Font(at.techgaisi.farbwerk.R.font.inter_medium, androidx.compose.ui.text.font.FontWeight.Medium),
+    androidx.compose.ui.text.font.Font(at.techgaisi.farbwerk.R.font.inter_semibold, androidx.compose.ui.text.font.FontWeight.SemiBold),
+    androidx.compose.ui.text.font.Font(at.techgaisi.farbwerk.R.font.inter_bold, androidx.compose.ui.text.font.FontWeight.Bold),
+)
+
+/** Alle Material-Textstile auf die App-Schrift umstellen (gilt auch für Text ohne eigenen Stil). */
+val AppTypography: androidx.compose.material3.Typography = androidx.compose.material3.Typography().let { t ->
+    fun androidx.compose.ui.text.TextStyle.f() = copy(fontFamily = AppFont)
+    t.copy(
+        displayLarge = t.displayLarge.f(), displayMedium = t.displayMedium.f(), displaySmall = t.displaySmall.f(),
+        headlineLarge = t.headlineLarge.f(), headlineMedium = t.headlineMedium.f(), headlineSmall = t.headlineSmall.f(),
+        titleLarge = t.titleLarge.f(), titleMedium = t.titleMedium.f(), titleSmall = t.titleSmall.f(),
+        bodyLarge = t.bodyLarge.f(), bodyMedium = t.bodyMedium.f(), bodySmall = t.bodySmall.f(),
+        labelLarge = t.labelLarge.f(), labelMedium = t.labelMedium.f(), labelSmall = t.labelSmall.f(),
+    )
 }
