@@ -504,6 +504,9 @@ class StrokeRenderer {
         var sp = m(BP.SPACING, p, tiltT) * signedSpeed(-b[BP.SPEED_SPACING], speedNorm).coerceAtLeast(0.1f)
         val sj = m(BP.SPACING_JITTER, p, tiltT)
         if (sj > 0f) sp *= 1f + 2f * sj * rand()
+        // Harte runde Spitze ohne Streuung: Abstand begrenzen, damit die Strichkante auch bei
+        // starkem Zoom glatt ist und keine "Perlenkette" aus einzelnen Tupfern zeigt
+        if (sj <= 0f && b[BP.SHAPE_KIND].toInt() == ShapeKind.HARD.ordinal && b[BP.JITTER] <= 0.001f) sp = sp.coerceAtMost(0.035f)
         distToNext = max(0.3f, sp * d)
         headDiameter = d
 

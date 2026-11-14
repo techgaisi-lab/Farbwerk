@@ -360,6 +360,8 @@ object Compositor {
             p.alpha = alpha
             p.blendMode = mode
             p.isFilterBitmap = filter
+            // Beim Hineinzoomen bikubisch statt bilinear vergrößern (glatte, scharfe Kanten)
+            if (SmoothUpscale.wanted(canvas) && SmoothUpscale.draw(canvas, content, p)) return
             canvas.drawBitmap(content, 0f, 0f, p)
             return
         }
