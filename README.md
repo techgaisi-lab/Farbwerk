@@ -1,4 +1,4 @@
-# Farbwerk
+<img width="3375" height="4219" alt="Farbwerk" src="https://github.com/user-attachments/assets/f226597f-a41c-4c9d-b708-28f13ae55d11" />
 
 Native Android-Zeichen-App für Tablets mit Stift. Funktionsumfang, Gesten, Tastenkürzel und Anordnung der Bedienelemente orientieren sich an etablierten iPad-Mal-Apps – Icons, Pinsel und Gestaltung sind eigenständig.
 
