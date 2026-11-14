@@ -191,8 +191,7 @@ object Compositor {
             composeSoftware(out, clip.left, clip.top, doc, layers, top + 1, doc.backgroundVisible, false, c)
             val p = c.direct
             p.alpha = 255; p.blendMode = BlendMode.SRC_OVER; p.isFilterBitmap = filter
-            if (!(SmoothUpscale.wanted(canvas) && SmoothUpscale.drawAt(canvas, out, clip.left.toFloat(), clip.top.toFloat(), p)))
-                canvas.drawBitmap(out, clip.left.toFloat(), clip.top.toFloat(), p)
+            canvas.drawBitmap(out, clip.left.toFloat(), clip.top.toFloat(), p)
             drawRange(canvas, doc, layers, top + 1, layers.size, filter, false, c)
         } finally {
             if (!main) { c.region.release(); c.content.release() }
@@ -367,8 +366,6 @@ object Compositor {
             p.alpha = alpha
             p.blendMode = mode
             p.isFilterBitmap = filter
-            // Beim Hineinzoomen bikubisch statt bilinear vergrößern (glatte, scharfe Kanten)
-            if (SmoothUpscale.wanted(canvas) && SmoothUpscale.draw(canvas, content, p)) return
             canvas.drawBitmap(content, 0f, 0f, p)
             return
         }
