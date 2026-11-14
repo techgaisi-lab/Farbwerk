@@ -118,6 +118,12 @@ object Compositor {
     /** Ab diesem Zoom würde ohne Filter gezeichnet – praktisch nie: Leinwand wird immer weich interpoliert. */
     private const val PIXEL_ZOOM = Float.MAX_VALUE
 
+    /**
+     * Aktueller Zoom der Leinwand (Dokument → Bildschirm), von der CanvasView vor jedem Zeichnen gesetzt.
+     * Canvas.getMatrix() liefert auf hardwarebeschleunigten Canvases nicht zuverlässig die echte Matrix.
+     */
+    @Volatile @JvmStatic var displayScale: Float = 1f
+
     /** Größte Dokumentkante für den GPU-Pfad (Texturgrenze gängiger GPUs). */
     private const val GPU_MAX_SIZE = 8192
 
@@ -185,7 +191,8 @@ object Compositor {
             composeSoftware(out, clip.left, clip.top, doc, layers, top + 1, doc.backgroundVisible, false, c)
             val p = c.direct
             p.alpha = 255; p.blendMode = BlendMode.SRC_OVER; p.isFilterBitmap = filter
-            canvas.drawBitmap(out, clip.left.toFloat(), clip.top.toFloat(), p)
+            if (!(SmoothUpscale.wanted(canvas) && SmoothUpscale.drawAt(canvas, out, clip.left.toFloat(), clip.top.toFloat(), p)))
+                canvas.drawBitmap(out, clip.left.toFloat(), clip.top.toFloat(), p)
             drawRange(canvas, doc, layers, top + 1, layers.size, filter, false, c)
         } finally {
             if (!main) { c.region.release(); c.content.release() }

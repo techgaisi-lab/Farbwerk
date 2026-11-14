@@ -72,13 +72,20 @@ object SmoothUpscale {
     @Volatile private var failed = false
 
     /** Soll bei diesem Canvas-Zoom bikubisch vergrößert werden? */
+    @Suppress("UNUSED_PARAMETER")
     fun wanted(canvas: Canvas): Boolean {
         if (failed || Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) return false
-        @Suppress("DEPRECATION")
-        canvas.getMatrix(tmpMatrix)
-        tmpMatrix.getValues(tmpValues)
-        val scale = hypot(tmpValues[Matrix.MSCALE_X], tmpValues[Matrix.MSKEW_Y])
-        return scale >= MIN_ZOOM
+        // Zoom kommt direkt von der Leinwand-Ansicht (Canvas.getMatrix() ist auf der GPU unzuverlässig)
+        return Compositor.displayScale >= MIN_ZOOM
+    }
+
+    /** Wie [draw], aber an Position ([x], [y]) in Dokument-Koordinaten. */
+    fun drawAt(canvas: Canvas, bitmap: Bitmap, x: Float, y: Float, paint: Paint): Boolean {
+        val sc = canvas.save()
+        canvas.translate(x, y)
+        val ok = draw(canvas, bitmap, paint)
+        canvas.restoreToCount(sc)
+        return ok
     }
 
     /**

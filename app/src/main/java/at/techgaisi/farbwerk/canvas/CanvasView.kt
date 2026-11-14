@@ -293,6 +293,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             canvas.restore()
         }
         try {
+            Compositor.displayScale = currentScale()
             Compositor.draw(canvas, doc)
         } catch (t: Throwable) {
             android.util.Log.e("Farbwerk", "Compositor", t)
