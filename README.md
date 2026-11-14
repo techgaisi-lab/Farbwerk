@@ -106,6 +106,7 @@ Voraussetzungen: JDK 17+, Android SDK (Platform 35). Pfad zum SDK in `local.prop
 
 - [`docs/FUNKTIONSANLEITUNG.md`](docs/FUNKTIONSANLEITUNG.md) – Funktions- und Verhaltensbeschreibung aller Bereiche
 - [`docs/LUECKEN.md`](docs/LUECKEN.md) – Abgleich mit dem Umsetzungsstand und Arbeitspakete
+- [`docs/RELEASE_NOTES_1.0.0.md`](docs/RELEASE_NOTES_1.0.0.md) – Release Notes zu Version 1.0.0
 
 ## Windows-Version
 
