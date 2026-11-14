@@ -98,9 +98,23 @@ object Importers {
     }
 
     /** Neues Dokument aus einem Bild (Galerie → Foto/Importieren). */
-    fun documentFromImage(bitmap: Bitmap, name: String): ArtDocument {
-        val doc = ArtDocument(name, bitmap.width, bitmap.height)
-        doc.layers.add(Layer("Ebene 1", ProjectFormat.fitToSize(bitmap, bitmap.width, bitmap.height)))
+    fun documentFromImage(bitmap: Bitmap, name: String, context: Context? = null): ArtDocument {
+        // Bilder mit niedriger Auflösung intern hochrechnen, damit darauf Gemaltes scharf bleibt
+        val detail = if (context != null) CanvasQuality.detailFor(context, bitmap.width, bitmap.height) else 1
+        val w = bitmap.width * detail
+        val h = bitmap.height * detail
+        val doc = ArtDocument(name, w, h)
+        doc.detailScale = detail.toFloat()
+        doc.dpi = (doc.dpi * detail).coerceAtMost(4800)
+        doc.guides.gridSize *= detail
+        val layerBmp = if (detail == 1) ProjectFormat.fitToSize(bitmap, w, h) else {
+            val out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            val c = Canvas(out)
+            c.scale(detail.toFloat(), detail.toFloat())
+            c.drawBitmap(bitmap, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+            out
+        }
+        doc.layers.add(Layer("Ebene 1", layerBmp))
         doc.activeIndex = 0
         doc.dirty = true
         return doc

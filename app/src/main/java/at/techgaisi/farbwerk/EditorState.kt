@@ -109,6 +109,7 @@ class EditorState(val context: Context) {
     init {
         // Pinselvorschauen beim Start im Hintergrund vorladen (Festplatten-Cache, sonst rendern)
         brushLibrary.warmUp()
+        try { at.techgaisi.farbwerk.io.CanvasQuality.screenLongSide(context) } catch (_: Throwable) {}
     }
     val toolSettings: Map<Tool, ToolSettings> = mapOf(
         Tool.PAINT to ToolSettings(brushLibrary.defaultBrushId(Tool.PAINT), 0.2f, 1f),

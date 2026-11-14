@@ -193,7 +193,8 @@ fun NewCanvasDialog(onDismiss: () -> Unit, onCreate: (CanvasSpec) -> Unit) {
 }
 
 private fun px(w: Int, h: Int) = "$w × ${h}px"
-private fun detailFor(w: Int, h: Int, hq: Boolean) = if (hq && highQualityPossible(w, h)) 2 else 1
+/** Feinberechnung: bei Hoher Qualität mind. 2×, kleine Leinwände mehr; ohne nur sehr kleine bis Bildschirmgröße. */
+private fun detailFor(w: Int, h: Int, hq: Boolean) = at.techgaisi.farbwerk.io.CanvasQuality.detailFor(w, h, hq)
 private fun spec(t: Template, hq: Boolean) =
     CanvasSpec("Ohne Titel", t.w, t.h, t.dpi, 0xFFFFFFFF.toInt(), detailFor(t.w, t.h, hq))
 
@@ -207,7 +208,7 @@ private fun HighQualityRow() {
         verticalAlignment = Alignment.CenterVertically
     ) {
         Column(Modifier.weight(1f)) {
-            Text("Hohe Qualität (2×)", color = GalleryTokens.textPrimary, fontSize = 14.sp)
+            Text("Hohe Qualität", color = GalleryTokens.textPrimary, fontSize = 14.sp)
             Text("Doppelte Auflösung – auch stark gezoomt scharf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
@@ -425,12 +426,12 @@ private fun CustomCanvasDialog(onBack: () -> Unit, onCreate: (CanvasSpec) -> Uni
             Row(Modifier.fillMaxWidth().clickable { NewCanvasMemory.highQuality = !hq }.padding(vertical = 4.dp),
                 verticalAlignment = Alignment.CenterVertically) {
                 Column(Modifier.weight(1f)) {
-                    Text("Hohe Qualität (2×)", color = ui.text, fontSize = 15.sp)
+                    Text("Hohe Qualität", color = ui.text, fontSize = 15.sp)
                     Text(
                         when {
                             !hq -> "Aus"
                             error == null && detail == 1 -> "Bei dieser Größe nicht möglich (max. 8192 px, 25 MP)"
-                            else -> "Doppelte Auflösung – auch stark gezoomt scharf"
+                            else -> "${detail}× feiner berechnet – auch stark gezoomt scharf"
                         },
                         color = ui.textMuted, fontSize = 12.sp,
                     )

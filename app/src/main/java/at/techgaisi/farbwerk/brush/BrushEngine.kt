@@ -19,7 +19,10 @@ import at.techgaisi.farbwerk.model.Tool
 import at.techgaisi.farbwerk.model.ToolInputHandler
 import at.techgaisi.farbwerk.undo.LayerPixelsAction
 import at.techgaisi.farbwerk.undo.PixelEdit
+import kotlin.math.abs
 import kotlin.math.atan2
+import kotlin.math.cos
+import kotlin.math.sin
 import kotlin.math.floor
 import kotlin.math.ceil
 import kotlin.math.hypot
@@ -40,8 +43,13 @@ import kotlin.math.max
  *    letztes Kurvenstück) – beim Absetzen entsteht genau dieses Ende, nichts springt,
  *  - bei harten Spitzen das noch nicht festgeschriebene, vereinigt gezeichnete Stück (saubere Kanten),
  *  - ohne Druck (Finger) die Ende-Verjüngung über die feste Länge,
- *  - die Bewegungsvorhersage (höchstens ein Bild voraus, beim Abheben abgeschaltet, siehe [onPredicted]).
- * Der darunterliegende Pufferinhalt wird vorher gesichert und danach wiederhergestellt ([TailStash]).
+ *  - die Bewegungsvorhersage (höchstens ein Bild voraus, beim Abheben abgeschaltet, siehe [onPredicted]; bei sehr
+ *    großen/aufwendigen Tupfern ganz aus, siehe [heavyDabs]).
+ * Dieser Rest steht in einer eigenen kleinen Vorschau-Ebene ([PreviewLayer]), die die Anzeige über den Puffer legt –
+ * beim Absetzen wird das Strichende genauso über den Puffer gelegt ([commitTailOverlay]). Nur bei Symmetrie und
+ * abschnittsweise vereinigt gezeichneten harten Spitzen wird es direkt in den Puffer gezeichnet; der Pufferinhalt
+ * darunter wird dann vorher gesichert und danach wiederhergestellt ([TailStash]).
+ * Große Tupfer zeichnet [DabPainter] streifenweise auf mehreren Kernen ([BrushParallel]).
  *
  * Absetzen: Die Originalpixel der berührten Undo-Kacheln werden schon während des Strichs gesichert ([markTouched]),
  * Einmischen und Leeren des Puffers laufen über ein feines Kachelraster ([FINE]) – nur dort, wo der Strich ist.
@@ -82,6 +90,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
 
     private val mergePaint = Paint(Paint.FILTER_BITMAP_FLAG)
     private val plainPaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    /** Puffer-Kacheln und Vorschau-Ebene innerhalb der gemeinsamen Zwischenebene (siehe [drawBufferLive]). */
+    private val livePaint = Paint(Paint.FILTER_BITMAP_FLAG)
+    /** Vorschau-Ebene beim Absetzen 1:1 über den Puffer legen. */
+    private val copyOverPaint = Paint()
     private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
     private val restorePaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
     /** Alpha-Schwelle: Puffer wird mit diesem Filter in eine Ebene (mit [mergePaint]) gezeichnet. */
@@ -148,6 +160,33 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     /** Neue Eingabe/Vorhersage seit dem letzten [refreshLive]. */
     private var liveStale = false
     private val stash = TailStash()
+    /**
+     * Strichende als eigene Vorschau-Ebene statt im Puffer ([overlay]): Der Puffer enthält dann nur festgeschriebene
+     * Tupfer – das Sichern/Wiederherstellen des Pufferbereichs unter dem Strichende ([stash]) und das erneute
+     * Übertragen dieses Bereichs in die Anzeige-Kacheln entfallen in jedem Bild.
+     */
+    private val preview = PreviewLayer()
+    /**
+     * Vorschau über [preview] (sonst über [stash]). Nicht bei Symmetrie (die Kopien lägen weit auseinander) und nicht
+     * bei abschnittsweise vereinigt gezeichneten harten Spitzen (Nahtreparatur verändert den Puffer, siehe [drawSpan]).
+     */
+    private var overlay = false
+    /**
+     * Tupfer sind so groß/aufwendig, dass die Bewegungsvorhersage abgeschaltet wird: Sie zeichnet in jedem Bild
+     * zusätzlich ganze Tupfer voraus (die mit dem nächsten Bild wieder verworfen werden) – bei großen Tupfern mit
+     * großem Abstand ein Vielfaches der eigentlichen Malarbeit für einen kaum sichtbaren Gewinn (der Strich ist dort
+     * ohnehin breit und weich). Das Ergebnis und das beim Absetzen gezeigte Strichende ändern sich dadurch nicht.
+     */
+    private var heavyDabs = false
+    /**
+     * Gemessen: Das Strichende samt Vorhersage zu zeichnen dauert zu lange ([PREDICT_BUDGET_NS]) – die Vorhersage
+     * bleibt für den Rest des Strichs aus. Passt sich so der Geschwindigkeit des Geräts an (dichte, gekörnte
+     * Pinsel mittlerer Größe zeichnen sonst in jedem Bild Dutzende Tupfer voraus).
+     */
+    private var predictionSlow = false
+    private var slowPreviews = 0
+    private val previewBounds = RectF()
+    private val liveArea = RectF()
     /** Seit der letzten Anzeige veränderter Pufferbereich (für [tiles]). */
     private val changed = RectF()
     /** Anzeige-Kacheln des Puffers: nur geänderte Kacheln müssen pro Bild neu zur GPU. */
@@ -178,12 +217,29 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private val drawSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
         val bc = bufferCanvas ?: return@DabConsumer
         painter.draw(bc, x, y, d, asp, ang, a, c, f)
-        addDirty(x, y, d, null)
+        addDirty(x, y, d, asp, ang, null)
         for (i in symm.indices) {
             val m = symm[i]
             painter.draw(bc, x, y, d, asp, ang, a, c, f, m, i + 1)
-            addDirty(x, y, d, m)
+            addDirty(x, y, d, asp, ang, m)
         }
+    }
+
+    /**
+     * Strichende-Vorschau in die Vorschau-Ebene ([overlay]). Tupfer werden dort (auf Transparent) genauso gezeichnet
+     * wie in den Puffer; die Anzeige legt die Ebene über den Puffer und mischt beide zusammen mit Strichdeckkraft und
+     * Mischmodus – „Über“ ist assoziativ, das Bild entspricht also dem Zeichnen in den Puffer.
+     */
+    private val previewSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
+        val pc = preview.canvas ?: return@DabConsumer
+        painter.draw(pc, x, y, d, asp, ang, a, c, f)
+    }
+
+    /** Strichende beim Absetzen ([commitTailOverlay]): in die Vorschau-Ebene, Bereich zählt zum Strich. */
+    private val finalTailSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
+        val pc = preview.canvas ?: return@DabConsumer
+        painter.draw(pc, x, y, d, asp, ang, a, c, f)
+        addDirty(x, y, d, asp, ang, null)
     }
 
     /** Ziel des Renderers: während eines Strichs nur aufzeichnen ([refreshLive] zeichnet), sonst sofort zeichnen. */
@@ -192,9 +248,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     /** Sammelt nur die Ausdehnung (für die Sicherung des Pufferbereichs unter dem Strichende). */
-    private val boundsSink = DabConsumer { x, y, d, _, _, _, _, _ ->
-        val r = d * 0.75f + 2f
-        tailBounds.union(x - r, y - r, x + r, y + r)
+    private val boundsSink = DabConsumer { x, y, d, asp, ang, _, _, _ ->
+        dabBounds(x, y, d, asp, ang, tmpRect)
+        tailBounds.union(tmpRect)
     }
 
     /** Wischen: direkt in der Ebene (Originalpixel werden vor jedem Tupfer kachelweise gesichert, siehe [protect]). */
@@ -231,8 +287,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             c.drawBitmap(l.bitmap, 0f, 0f, plainPaint)
             val sel = state.document?.selection?.path
             if (sel != null) { c.save(); c.clipPath(sel) }
-            if (!dirty.isEmpty) {
-                c.save(); c.clipRect(dirty)
+            liveArea.set(dirty)
+            if (preview.visible) liveArea.union(previewBounds)
+            if (!liveArea.isEmpty) {
+                c.save(); c.clipRect(liveArea)
                 drawBufferLive(c, buf)
                 c.restore()
             }
@@ -295,6 +353,11 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         chunkLen = if (deferDabs && painter.unionCapable && brush[BP.FLOW] >= 0.999f &&
             brush[BP.PRESSURE_OPACITY] <= 0f && brush[BP.PRESSURE_FLOW] <= 0f
         ) max(3f * dMax, 48f) else 0f
+        overlay = deferDabs && chunkLen <= 0f && symm.isEmpty()
+        heavyDabs = painter.pixelCost(dMax) > PREDICT_MAX_DAB_COST
+        predictionSlow = false
+        slowPreviews = 0
+        preview.hide()
 
         when (tool) {
             Tool.SMUDGE -> {
@@ -311,6 +374,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             }
             else -> {
                 ensureBuffer(doc.width, doc.height)
+                // Puffer ohne Transformation/Clip: große Tupfer streifenweise parallel zeichnen
+                painter.setBandTarget(0, bufferCanvas, buffer)
                 val heavy = brush.int(BP.RENDER_MODE) == RenderMode.HEAVY_GLAZE && tool == Tool.PAINT
                 mergePaint.alpha = if (heavy) 255 else (opacity * 255f + 0.5f).toInt().coerceIn(0, 255)
                 thresholdOn = brush.on(BP.ALPHA_THRESHOLD)
@@ -385,6 +450,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             layer?.drawOverride = null
             painter.flush()
             stash.discard()
+            preview.hide()
             clearBuffer()
             edit?.cancel()
         }
@@ -424,7 +490,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
      */
     private fun predictionAllowed(): Boolean {
         val b = renderer.brush
-        return b[BP.STREAMLINE] <= 0.6f && b[BP.STABILIZE] <= 0.05f && b[BP.MOTION_FILTER] <= 0.05f &&
+        return !heavyDabs && !predictionSlow && b[BP.STREAMLINE] <= 0.6f && b[BP.STABILIZE] <= 0.05f && b[BP.MOTION_FILTER] <= 0.05f &&
             state.prefs.motionPrediction && state.prefs.motionFilteringAmount <= 0.05f &&
             // Längen-Verjüngung (Finger) bezieht sich auf das echte Strichende – eine Vorhersage würde sie verschieben
             renderer.liveEndTaperLength <= 0f
@@ -441,6 +507,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
      * [final] (Absetzen, nach [StrokeRenderer.end]): restliche Tupfer fest zeichnen – exakt wie zuletzt angezeigt.
      */
     private fun refreshLive(final: Boolean) {
+        if (overlay) { refreshLiveOverlay(final); return }
         val bc = bufferCanvas ?: return
         val buf = buffer ?: return
         painter.flush()
@@ -477,10 +544,114 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             stashRegion(buf, tailBounds, null)
             for (m in symm) stashRegion(buf, tailBounds, m)
             if (jValid) stash.save(buf, jRect)
+            val t0 = System.nanoTime()
             drawSpan(committed, pn, total, taper, en)
+            notePreviewTime(System.nanoTime() - t0, en)
         } finally {
             renderer.endPreview()
         }
+    }
+
+    /**
+     * [refreshLive] mit Vorschau-Ebene ([overlay]): Der Puffer enthält nie Vorschau-Tupfer, es muss also nichts
+     * wiederhergestellt werden. Festgeschrieben wird wie in [refreshLive] (gleiche Tupfer, gleiche Reihenfolge), das
+     * Strichende wird nach jeder Eingabe neu in die (geleerte) Vorschau-Ebene gezeichnet.
+     */
+    private fun refreshLiveOverlay(final: Boolean) {
+        painter.flush()
+        preview.hide()
+        val l = renderer.dabs
+        if (final) {
+            commitTailOverlay()
+            return
+        }
+        val n = l.size
+        val limit = renderer.totalLength - renderer.liveEndTaperLength
+        var f = committed
+        while (f < n && l.dist[f] <= limit) f++
+        if (f > committed) {
+            drawSpan(committed, f, renderer.totalLength, false, 0)
+            committed = f
+        }
+        renderer.beginPreviewEnd()
+        try {
+            val pn = l.size
+            var en = 0
+            if (predN > 0 && pn > 0) {
+                extX[0] = renderer.headX; extY[0] = renderer.headY; en = 1
+                for (k in 0 until predN) { extX[en] = predX[k]; extY[en] = predY[k]; en++ }
+            }
+            if (committed >= pn && en == 0) return
+            val total = renderer.totalLength
+            val taper = renderer.tailTaper()
+            tailBounds.setEmpty()
+            renderer.emitTail(committed, total, taper, boundsSink, extX, extY, en)
+            if (tailBounds.isEmpty) return
+            val b = buffer ?: return
+            stashRect.set(
+                floor(tailBounds.left).toInt() - 1, floor(tailBounds.top).toInt() - 1,
+                ceil(tailBounds.right).toInt() + 1, ceil(tailBounds.bottom).toInt() + 1,
+            )
+            if (!stashRect.intersect(0, 0, b.width, b.height)) return
+            val t0 = System.nanoTime()
+            preview.begin(stashRect)
+            // große Tupfer dürfen streifenweise parallel in die Vorschau-Ebene gezeichnet werden
+            tileRect.set(0, 0, stashRect.width(), stashRect.height())
+            painter.setBandTarget(1, preview.canvas, preview.bitmapOrNull, -stashRect.left, -stashRect.top, tileRect)
+            try {
+                renderer.emitTail(committed, total, taper, previewSink, extX, extY, en, pn)
+                painter.flush()
+            } finally {
+                painter.setBandTarget(1, null, null)
+            }
+            preview.end()
+            notePreviewTime(System.nanoTime() - t0, en)
+            previewBounds.set(stashRect)
+        } finally {
+            renderer.endPreview()
+        }
+    }
+
+    /** Wertet die Zeit für das Zeichnen des Strichendes aus ([predictionSlow]); [en] > 0 = mit Vorhersage. */
+    private fun notePreviewTime(ns: Long, en: Int) {
+        if (en <= 0 || predictionSlow) return
+        slowPreviews = if (ns > PREDICT_BUDGET_NS) slowPreviews + 1 else 0
+        if (slowPreviews >= 2) predictionSlow = true
+    }
+
+    /**
+     * Absetzen mit Vorschau-Ebene: Das Strichende wird genauso wie in der Live-Anzeige erst in die (geleerte)
+     * Vorschau-Ebene gezeichnet und diese dann über den Puffer gelegt. Puffer + Ebene werden damit exakt so
+     * zusammengesetzt wie zuletzt angezeigt – auch in der Rundung der 8-Bit-Mischung (ein direktes Zeichnen in den
+     * Puffer wiche dort um wenige Stufen ab).
+     */
+    private fun commitTailOverlay() {
+        val l = renderer.dabs
+        val bc = bufferCanvas
+        val b = buffer
+        val total = renderer.totalLength
+        val taper = renderer.tailTaper()
+        if (bc == null || b == null || committed >= l.size) { committed = l.size; return }
+        tailBounds.setEmpty()
+        renderer.emitTail(committed, total, taper, boundsSink)
+        stashRect.set(
+            floor(tailBounds.left).toInt() - 1, floor(tailBounds.top).toInt() - 1,
+            ceil(tailBounds.right).toInt() + 1, ceil(tailBounds.bottom).toInt() + 1,
+        )
+        if (tailBounds.isEmpty || !stashRect.intersect(0, 0, b.width, b.height)) { committed = l.size; return }
+        preview.begin(stashRect)
+        tileRect.set(0, 0, stashRect.width(), stashRect.height())
+        painter.setBandTarget(1, preview.canvas, preview.bitmapOrNull, -stashRect.left, -stashRect.top, tileRect)
+        try {
+            renderer.emitTail(committed, total, taper, finalTailSink)
+            painter.flush()
+        } finally {
+            painter.setBandTarget(1, null, null)
+        }
+        preview.end()
+        preview.drawInto(bc, copyOverPaint)
+        preview.hide()
+        committed = l.size
     }
 
     /**
@@ -530,6 +701,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             return
         }
         if (!peeked) junction.peek(bc, changed)
+        // Puffer ist hier beschnitten → nicht streifenweise zeichnen (die Streifen kennen den Clip nicht)
+        painter.setBandTarget(0, null, null)
         // Tupfer des vorigen Abschnitts, die den Nahtbereich erreichen können
         val l = renderer.dabs
         var a0 = from
@@ -543,6 +716,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         renderer.emitTail(from, total, taper, drawSink, extX, extY, en, to)
         painter.flush()
         bc.restore()
+        painter.setBandTarget(0, bc, buffer)
     }
 
     private fun stashRegion(buf: Bitmap, r: RectF, m: Matrix?) {
@@ -651,7 +825,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
                 val b = strokeBrush
                 if (buf != null && !dirty.isEmpty) {
                     if (b != null && strokeTool == Tool.PAINT && StrokeEffects.needsPostPass(b)) {
-                        StrokeEffects.apply(buf, dirty, b, renderer.diameter)
+                        StrokeEffects.apply(buf, dirty, b, renderer.diameter, touchedFine, FINE)
                     }
                     // Originalpixel der berührten Kacheln sichern, bevor der Puffer in die Ebene gemischt wird
                     // (geschieht schon während des Strichs in [markTouched]; hier nur zur Sicherheit)
@@ -690,6 +864,17 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private fun drawBufferLive(c: Canvas, buf: Bitmap) {
         tiles.sync(buf, changed)
         changed.setEmpty()
+        if (preview.visible) {
+            // Puffer + Strichende-Vorschau zuerst vereinen, dann gemeinsam (wie beim Einmischen) mit Strichdeckkraft,
+            // Mischmodus und ggf. Alpha-Schwelle auftragen
+            val sc = c.saveLayer(liveArea, mergePaint)
+            val inner = if (thresholdOn) c.saveLayer(liveArea, thresholdPaint) else -1
+            if (!dirty.isEmpty) tiles.draw(c, dirty, livePaint)
+            preview.draw(c, livePaint)
+            if (inner >= 0) c.restoreToCount(inner)
+            c.restoreToCount(sc)
+            return
+        }
         if (thresholdOn) {
             val sc = c.saveLayer(null, mergePaint)
             tiles.draw(c, dirty, thresholdPaint)
@@ -721,7 +906,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             c.restore()
             return
         }
-        forEachTouchedTile(touchedFine, FINE) { tr ->
+        forEachTouchedRun(touchedFine, FINE) { tr ->
             c.save()
             c.clipRect(dirty)
             c.clipRect(tr)
@@ -746,6 +931,26 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
     }
 
+    /**
+     * Wie [forEachTouchedTile], fasst aber in einer Rasterzeile nebeneinanderliegende Kacheln zu einem Rechteck
+     * zusammen (weniger Zeichenaufrufe beim Einmischen/Leeren; jedes Pixel wird weiterhin genau einmal bearbeitet).
+     */
+    private inline fun forEachTouchedRun(set: java.util.BitSet, t: Int, fn: (Rect) -> Unit) {
+        val buf = buffer ?: return
+        val nx = (buf.width + t - 1) / t
+        var k = set.nextSetBit(0)
+        while (k >= 0) {
+            val row = k / nx
+            val rowEnd = (row + 1) * nx
+            // Ende des Laufs: erste nicht gesetzte Kachel bzw. Zeilenende
+            val e = minOf(set.nextClearBit(k), rowEnd)
+            val x0 = (k - row * nx) * t; val y0 = row * t
+            tileRect.set(x0, y0, minOf(buf.width, (e - row * nx) * t), minOf(buf.height, y0 + t))
+            if (!tileRect.isEmpty) fn(tileRect)
+            k = set.nextSetBit(e)
+        }
+    }
+
     private fun resetDirty() {
         dirty.setEmpty()
         touched.clear()
@@ -756,6 +961,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         predN = 0
         painter.flush()
         stash.discard()
+        preview.hide()
+        overlay = false
+        painter.setBandTarget(0, null, null)
+        painter.setBandTarget(1, null, null)
         junction.discard(); jNext.discard(); jValid = false
         deferDabs = false
         liveStale = false
@@ -789,16 +998,28 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val bc = bufferCanvas ?: return
         if (dirty.isEmpty) return
         // Nur berührte Kacheln enthalten etwas (der übrige Puffer ist schon leer)
-        forEachTouchedTile(touchedFine, FINE) { tr ->
+        forEachTouchedRun(touchedFine, FINE) { tr ->
             bc.drawRect(tr, clearPaint)
             tmpRect.set(tr)
             tiles.clear(tmpRect)
         }
     }
 
-    private fun addDirty(x: Float, y: Float, d: Float, m: Matrix?) {
-        val r = d * 0.75f + 2f
-        tmpRect.set(x - r, y - r, x + r, y + r)
+    /**
+     * Umschließendes Rechteck eines Tupfers: Die Form füllt höchstens das gedrehte Rechteck
+     * [d] × [d]·[asp] (siehe [DabPainter]); dazu Rand für Kantenglättung, Filterung und den Körnungs-Zwischenspeicher.
+     * Deutlich enger als ein für jede Drehung reichendes Quadrat – weniger Pixel für Anzeige-Kacheln, Undo,
+     * Vorschau-Ebene und Einmischen.
+     */
+    private fun dabBounds(x: Float, y: Float, d: Float, asp: Float, ang: Float, out: RectF) {
+        val cs = abs(cos(ang)); val sn = abs(sin(ang))
+        val ex = 0.5f * d * (cs + asp * sn) + DAB_MARGIN
+        val ey = 0.5f * d * (sn + asp * cs) + DAB_MARGIN
+        out.set(x - ex, y - ey, x + ex, y + ey)
+    }
+
+    private fun addDirty(x: Float, y: Float, d: Float, asp: Float, ang: Float, m: Matrix?) {
+        dabBounds(x, y, d, asp, ang, tmpRect)
         m?.mapRect(tmpRect)
         dirty.union(tmpRect)
         changed.union(tmpRect)
@@ -883,6 +1104,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             // Form ersetzt den Strich: Live-Strichende verwerfen, ab jetzt wird sofort gezeichnet
             painter.flush()
             stash.discard()
+            preview.hide()
             jValid = false
             deferDabs = false
             clearBuffer()
@@ -972,7 +1194,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val before = Bitmap.createBitmap(l.bitmap, r.left, r.top, r.width(), r.height()).copy(Bitmap.Config.ARGB_8888, true)
         Canvas(before).drawBitmap(after, (ls.r0.left - r.left).toFloat(), (ls.r0.top - r.top).toFloat(), restorePaint)
         if (!dirty.isEmpty) {
-            if (ls.tool == Tool.PAINT && StrokeEffects.needsPostPass(ls.brush)) StrokeEffects.apply(buf, dirty, ls.brush, ls.diameter)
+            if (ls.tool == Tool.PAINT && StrokeEffects.needsPostPass(ls.brush)) StrokeEffects.apply(buf, dirty, ls.brush, ls.diameter, touchedFine, FINE)
             mergeBuffer(l, buf, ls.selPath)
         }
         val afterBmp = Bitmap.createBitmap(l.bitmap, r.left, r.top, r.width(), r.height())
@@ -1034,6 +1256,12 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         const val LIFT_RATIO = 0.75f
         /** Mindestabstand (Dokumentpixel), ab dem der Abhebepunkt noch übernommen wird. */
         const val UP_MIN_MOVE = 1f
+        /** Tupfer-Aufwand ([DabPainter.pixelCost]), ab dem keine Bewegungsvorhersage gezeichnet wird. */
+        const val PREDICT_MAX_DAB_COST = 60_000f
+        /** Zeit für Strichende + Vorhersage (ns), ab der die Vorhersage abgeschaltet wird ([predictionSlow]). */
+        const val PREDICT_BUDGET_NS = 2_000_000L
+        /** Rand (Dokumentpixel) um die Form eines Tupfers in [dabBounds]. */
+        const val DAB_MARGIN = 4f
         /** Kantenlänge des feinen Kachelrasters für Einmischen/Leeren (Dokumentpixel). */
         const val FINE = 64
     }
@@ -1044,10 +1272,119 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         lastShape = null
         buffer?.recycle(); buffer = null; bufferCanvas = null
         stash.release(); junction.release(); jNext.release()
+        preview.release()
         tiles.release(); changed.setEmpty()
         painter.release()
         smudger.release()
     }
+}
+
+/**
+ * Vorschau-Ebene für das veränderliche Strichende: eine wiederverwendete Bitmap, die nur den Bereich [rect]
+ * (Dokumentpixel) abdeckt. [begin] leert sie und liefert über [canvas] eine Zeichenfläche in Dokumentkoordinaten,
+ * [end] schließt das Zeichnen ab, [draw] legt sie an ihre Dokumentposition. Bei jedem Bild wird nur dieser kleine
+ * Bereich neu gezeichnet und (auf der GPU) neu geladen. Die Bitmap wächst bei Bedarf und wird verkleinert, wenn sie
+ * deutlich größer als nötig ist (die GPU lädt bei jeder Änderung die ganze Bitmap).
+ */
+private class PreviewLayer {
+    private var bitmap: Bitmap? = null
+    private var bmpCanvas: Canvas? = null
+    /** Zeichenfläche (in Dokumentkoordinaten) zwischen [begin] und [end], sonst null. */
+    var canvas: Canvas? = null
+        private set
+    /** Belegter Bereich in Dokumentpixeln. */
+    val rect = Rect()
+    /** Die Bitmap (für [DabPainter.setBandTarget]). */
+    val bitmapOrNull: Bitmap? get() = bitmap
+    /** Enthält die Ebene gerade ein Strichende? */
+    var visible = false
+        private set
+    /** Bisher bemalter Bereich der Bitmap (wird vor dem nächsten Zeichnen geleert). */
+    private var usedW = 0
+    private var usedH = 0
+    /** Anzahl der Bilder in Folge, in denen die Bitmap deutlich zu groß war. */
+    private var oversized = 0
+    private val src = Rect()
+    private val dst = RectF()
+    private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
+
+    fun begin(r: Rect) {
+        val w = r.width(); val h = r.height()
+        var b = bitmap
+        // deutlich zu groß (mehr als die vierfache benötigte Fläche) → erst nach längerer Zeit verkleinern, damit
+        // wechselnde Größen nicht ständig neue Bitmaps erzeugen
+        oversized = if (b != null && b.width.toLong() * b.height > 4L * max(w, 64) * max(h, 64)) oversized + 1 else 0
+        val need = b == null || b.width < w || b.height < h || oversized > SHRINK_AFTER
+        if (need) {
+            val bw = ((w + 63) / 64) * 64; val bh = ((h + 63) / 64) * 64
+            // beim Vergrößern etwas Reserve, damit wachsende Strichenden nicht jedes Bild neu anlegen
+            val grow = b != null && oversized <= SHRINK_AFTER
+            val nw = if (grow) max(bw, b!!.width + b.width / 4) else bw
+            val nh = if (grow) max(bh, b!!.height + b.height / 4) else bh
+            bmpCanvas?.setBitmap(null)
+            b?.recycle()
+            b = Bitmap.createBitmap(nw, nh, Bitmap.Config.ARGB_8888)
+            bitmap = b
+            val bc = bmpCanvas
+            if (bc != null) bc.setBitmap(b) else bmpCanvas = Canvas(b)
+            usedW = 0; usedH = 0
+            oversized = 0
+        }
+        val bc = bmpCanvas!!
+        clearUsed()
+        rect.set(r)
+        usedW = w; usedH = h
+        bc.save()
+        // außerhalb des belegten Bereichs bleibt die Bitmap leer (Filterung an den Rändern, nächstes Leeren)
+        bc.clipRect(0, 0, w, h)
+        bc.translate(-r.left.toFloat(), -r.top.toFloat())
+        canvas = bc
+    }
+
+    fun end() {
+        canvas?.restore()
+        canvas = null
+        visible = true
+    }
+
+    /** Verwirft das Strichende (die Bitmap bleibt für das nächste Bild erhalten). */
+    fun hide() {
+        if (canvas != null) { canvas?.restore(); canvas = null }
+        visible = false
+    }
+
+    private fun clearUsed() {
+        val b = bitmap ?: return
+        if (usedW <= 0 || usedH <= 0) return
+        if (usedW.toLong() * usedH * 2 >= b.width.toLong() * b.height) b.eraseColor(0)
+        else bmpCanvas?.drawRect(0f, 0f, usedW.toFloat(), usedH.toFloat(), clearPaint)
+        usedW = 0; usedH = 0
+    }
+
+    fun draw(c: Canvas, paint: Paint) {
+        val b = bitmap ?: return
+        if (!visible) return
+        src.set(0, 0, rect.width(), rect.height())
+        dst.set(rect)
+        c.drawBitmap(b, src, dst, paint)
+    }
+
+    /** Legt die Ebene 1:1 (ganzzahlige Lage, ohne Filterung) über [c] (Dokumentkoordinaten). */
+    fun drawInto(c: Canvas, paint: Paint) {
+        val b = bitmap ?: return
+        if (!visible) return
+        src.set(0, 0, rect.width(), rect.height())
+        c.drawBitmap(b, src, rect, paint)
+    }
+
+    fun release() {
+        hide()
+        bmpCanvas?.setBitmap(null)
+        bitmap?.recycle(); bitmap = null; bmpCanvas = null
+        usedW = 0; usedH = 0; oversized = 0
+    }
+
+    private companion object { const val SHRINK_AFTER = 90 }
 }
 
 /**

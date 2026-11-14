@@ -176,7 +176,7 @@ fun GalleryScreen(state: EditorState) {
                     ImportKind.PSD -> { store.saveDetached(Importers.readPsd(ctx, uri), stackId); true }
                     ImportKind.IMAGE -> {
                         val bmp = Importers.decodeImage(ctx, uri)
-                        store.saveDetached(Importers.documentFromImage(bmp, Importers.displayName(ctx, uri)), stackId); true
+                        store.saveDetached(Importers.documentFromImage(bmp, Importers.displayName(ctx, uri), ctx), stackId); true
                     }
                     ImportKind.UNKNOWN -> false
                 }
@@ -190,7 +190,7 @@ fun GalleryScreen(state: EditorState) {
             val doc = withContext(Dispatchers.IO) {
                 // Fotos auf max. 16 MP begrenzen: große Handykamera-Bilder (50–200 MP) sonst zu speicherhungrig
                 val bmp = Importers.decodeImage(ctx, uri, maxPixels = 16_000_000L)
-                Importers.documentFromImage(bmp, Importers.displayName(ctx, uri)).also { store.saveDetached(it, stackId) }
+                Importers.documentFromImage(bmp, Importers.displayName(ctx, uri), ctx).also { store.saveDetached(it, stackId) }
             }
             state.openDocument(doc)
         }
