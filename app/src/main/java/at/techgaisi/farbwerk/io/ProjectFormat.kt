@@ -32,14 +32,17 @@ import java.util.zip.ZipOutputStream
  * ```
  * document.json        – alle Dokument- und Ebenenfelder, Zeichenhilfen, Hintergrund
  * thumb.png            – Vorschaubild (max. 512 px)
- * layers/<n>.png       – Ebenenpixel (Dokumentgröße, unpremultiplied PNG)
- * masks/<n>.png        – optionale Ebenenmasken (Weiß mit Alpha = Maskenwert)
+ * layers/<n>.fwl       – Ebenenpixel, schnelles Kachelformat ([LayerCodec], ab Version 2, interne Speicherung)
+ * layers/<n>.png       – Ebenenpixel als PNG (Version 1 und Export über [write])
+ * masks/<n>.fwl|png    – optionale Ebenenmasken (FWL: ALPHA_8 roh; PNG: Weiß mit Alpha = Maskenwert)
  * ```
- * Ebenen sind von unten (Index 0) nach oben gespeichert.
+ * Ebenen sind von unten (Index 0) nach oben gespeichert. Der Leser erkennt das Ebenenformat an der Endung.
  */
 internal object ProjectFormat {
     const val FORMAT = "farbwerk"
     const val VERSION = 1
+    /** Version der intern (mit [writeInternal]) geschriebenen Dateien. */
+    const val VERSION_FAST = 2
     const val DOC_ENTRY = "document.json"
     const val THUMB_ENTRY = "thumb.png"
     const val EXTENSION = "farbwerk"
@@ -207,6 +210,100 @@ internal object ProjectFormat {
         }
     }
 
+    /** Zähler einer [writeInternal]-Speicherung (für Messungen/Protokoll). */
+    class WriteStats {
+        /** [0] neu kodierte Kacheln, [1] übernommene Kacheln. */
+        val tiles = IntArray(2)
+        var layersReused = 0
+    }
+
+    /**
+     * Schreibt ein Projekt für den internen Speicher atomar ("<ziel>.tmp" → Umbenennen) im schnellen
+     * Kachelformat. Unveränderte Kacheln werden aus der bisherigen Datei [target] übernommen (Vergleich der
+     * Prüfsummen), nur Geänderte werden neu komprimiert. Darf im Hintergrund laufen.
+     */
+    fun writeInternal(target: File, json: JSONObject, layers: List<LayerData>, thumb: Bitmap?, stats: WriteStats? = null) {
+        target.parentFile?.mkdirs()
+        val tmp = File(target.parentFile, target.name + ".tmp")
+        val old = try { if (target.exists()) OldProject(target) else null } catch (t: Throwable) { null }
+        try {
+            val arr = json.optJSONArray("layers")
+            json.put("version", VERSION_FAST)
+            ZipOutputStream(BufferedOutputStream(FileOutputStream(tmp), 1 shl 16)).use { zip ->
+                zip.setLevel(Deflater.BEST_SPEED)
+                if (thumb != null) {
+                    val bytes = java.io.ByteArrayOutputStream(256 * 1024)
+                    thumb.compress(Bitmap.CompressFormat.PNG, 100, bytes)
+                    putStored(zip, THUMB_ENTRY, bytes.toByteArray())
+                }
+                layers.forEachIndexed { i, l ->
+                    val lo = arr?.optJSONObject(i)
+                    val id = lo?.optString("id").orEmpty()
+                    val blob = LayerCodec.encode(l.bitmap, old?.layer(id, false), stats?.tiles)
+                    putStored(zip, "layers/$i.fwl", blob)
+                    lo?.put("file", "layers/$i.fwl")
+                    val m = l.mask
+                    if (m != null) {
+                        putStored(zip, "masks/$i.fwl", LayerCodec.encode(m, old?.layer(id, true), stats?.tiles))
+                        lo?.put("mask", "masks/$i.fwl")
+                        lo?.put("maskConfig", if (m.config == Bitmap.Config.ALPHA_8) "ALPHA_8" else "ARGB_8888")
+                    }
+                }
+                // document.json zuletzt: enthält die endgültigen Eintragsnamen
+                zip.putNextEntry(ZipEntry(DOC_ENTRY))
+                zip.write(json.toString(1).toByteArray(Charsets.UTF_8))
+                zip.closeEntry()
+            }
+            // Alte Datei vor dem Umbenennen schließen (Windows: geöffnete Dateien lassen sich nicht ersetzen)
+            old?.close()
+            FileOutputStream(tmp, true).use { it.fd.sync() }
+            if (!tmp.renameTo(target)) {
+                target.delete()
+                if (!tmp.renameTo(target)) throw IOException("Umbenennen fehlgeschlagen: $target")
+            }
+        } finally {
+            old?.close()
+            if (tmp.exists()) tmp.delete()
+        }
+    }
+
+    /** Ungepackter ZIP-Eintrag (Inhalt ist bereits komprimiert). */
+    private fun putStored(zip: ZipOutputStream, name: String, bytes: ByteArray) {
+        val e = ZipEntry(name)
+        e.method = ZipEntry.STORED
+        e.size = bytes.size.toLong(); e.compressedSize = bytes.size.toLong()
+        e.crc = java.util.zip.CRC32().apply { update(bytes) }.value
+        zip.putNextEntry(e); zip.write(bytes); zip.closeEntry()
+    }
+
+    /** Bisherige Projektdatei: liefert die FWL-Daten einer Ebene/Maske anhand der Ebenen-ID. */
+    private class OldProject(file: File) {
+        private val zip = ZipFile(file)
+        private val entries = HashMap<String, String>()
+        @Volatile private var closed = false
+        init {
+            try {
+                val o = JSONObject(zip.getInputStream(zip.getEntry(DOC_ENTRY)).bufferedReader(Charsets.UTF_8).readText())
+                val arr = o.optJSONArray("layers") ?: JSONArray()
+                for (i in 0 until arr.length()) {
+                    val lo = arr.optJSONObject(i) ?: continue
+                    val id = lo.optString("id"); if (id.isEmpty()) continue
+                    lo.optString("file").takeIf { it.endsWith(".fwl") }?.let { entries[id] = it }
+                    lo.optString("mask").takeIf { it.endsWith(".fwl") }?.let { entries["m:$id"] = it }
+                }
+            } catch (t: Throwable) { zip.close(); throw t }
+        }
+        fun layer(id: String, mask: Boolean): LayerCodec.Parsed? {
+            if (closed || id.isEmpty()) return null
+            val name = entries[if (mask) "m:$id" else id] ?: return null
+            return try {
+                val e = zip.getEntry(name) ?: return null
+                LayerCodec.Parsed(zip.getInputStream(e).use { it.readBytes() })
+            } catch (t: Throwable) { null }
+        }
+        fun close() { if (!closed) { closed = true; try { zip.close() } catch (_: Throwable) {} } }
+    }
+
     // ------------------------------------------------------------------ Lesen
 
     fun readJson(file: File): JSONObject = ZipFile(file).use { zip ->
@@ -239,11 +336,16 @@ internal object ProjectFormat {
             inScaled = false
         }
         val arr = o.optJSONArray("layers") ?: JSONArray()
+        /** Liest einen Ebenen-/Maskeneintrag: FWL (schnell, bitgenau) oder PNG. */
+        fun readEntry(name: String): Bitmap? {
+            val entry = zip.getEntry(name) ?: return null
+            return if (name.endsWith(".fwl")) {
+                LayerCodec.decode(zip.getInputStream(entry).use { it.readBytes() })
+            } else zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, opts) }
+        }
         for (i in 0 until arr.length()) {
             val lo = arr.getJSONObject(i)
-            val bmp = zip.getEntry(lo.optString("file", "layers/$i.png"))?.let { entry ->
-                zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, opts) }
-            }
+            val bmp = readEntry(lo.optString("file", "layers/$i.png"))
             val layer = Layer(
                 lo.optString("name", "Ebene ${i + 1}"),
                 fitToSize(bmp, w, h),
@@ -264,15 +366,19 @@ internal object ProjectFormat {
                 layer.text = it
             }
             if (lo.has("mask")) {
-                zip.getEntry(lo.getString("mask"))?.let { entry ->
-                    val m = zip.getInputStream(entry).use { BitmapFactory.decodeStream(it, null, opts) }
-                    if (m != null) {
-                        val full = fitToSize(m, w, h)
-                        layer.mask = if (lo.optString("maskConfig") == "ALPHA_8") {
-                            val a = full.extractAlpha().copy(Bitmap.Config.ALPHA_8, true)
-                            full.recycle(); a
-                        } else full
+                val m = readEntry(lo.getString("mask"))
+                if (m != null && m.config == Bitmap.Config.ALPHA_8) {
+                    // FWL-Maske: bereits ALPHA_8 in Dokumentgröße
+                    layer.mask = if (m.width == w && m.height == h) m else {
+                        val a = Bitmap.createBitmap(w, h, Bitmap.Config.ALPHA_8)
+                        Canvas(a).drawBitmap(m, 0f, 0f, null); m.recycle(); a
                     }
+                } else if (m != null) {
+                    val full = fitToSize(m, w, h)
+                    layer.mask = if (lo.optString("maskConfig") == "ALPHA_8") {
+                        val a = full.extractAlpha().copy(Bitmap.Config.ALPHA_8, true)
+                        full.recycle(); a
+                    } else full
                 }
             }
             doc.layers.add(layer)
@@ -322,7 +428,13 @@ internal object ProjectFormat {
                         if (entry.name == DOC_ENTRY || entry.isDirectory) continue
                         // Schutz vor Pfad-Tricks in fremden Archiven
                         if (entry.name.contains("..")) continue
-                        out.putNextEntry(ZipEntry(entry.name))
+                        val ne = ZipEntry(entry.name)
+                        if (entry.method == ZipEntry.STORED && entry.size >= 0 && entry.crc >= 0) {
+                            // Ungepackte Einträge (FWL-Ebenen, Miniatur) ungepackt übernehmen
+                            ne.method = ZipEntry.STORED
+                            ne.size = entry.size; ne.compressedSize = entry.size; ne.crc = entry.crc
+                        }
+                        out.putNextEntry(ne)
                         inZip.getInputStream(entry).use { ins ->
                             while (true) {
                                 val n = ins.read(buf); if (n < 0) break

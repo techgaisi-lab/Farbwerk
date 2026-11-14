@@ -11,6 +11,8 @@ import android.util.Log
 import android.util.LruCache
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableStateMapOf
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import at.techgaisi.farbwerk.model.ArtDocument
 import at.techgaisi.farbwerk.render.Compositor
@@ -19,8 +21,10 @@ import java.io.File
 import java.io.FileOutputStream
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
@@ -50,9 +54,13 @@ data class StackInfo(val id: String, val name: String, val created: Long)
  * filesDir/projects/<id>/meta.json          – Kurzinfo für die Galerie (Name, Größe, Zeit)
  * filesDir/projects/<id>/thumb.png          – Vorschaubild (max. 512 px)
  * ```
- * [save] kopiert die Ebenen auf dem Main-Thread und schreibt im Hintergrund (ein serieller Thread),
- * immer erst in eine temporäre Datei, die danach umbenannt wird – ein Absturz hinterlässt nie
- * ein halbes Projekt.
+ * [save] erledigt auf dem Main-Thread nur die Metadaten (und bei geöffnetem Werk die Miniatur); Pixel werden
+ * im Hintergrund (ein serieller Thread + Kodier-Pool) im schnellen Kachelformat geschrieben, nur geänderte
+ * Kacheln werden neu komprimiert ([LayerCodec]). Geschrieben wird immer erst in eine temporäre Datei, die danach
+ * umbenannt wird – ein Absturz hinterlässt nie ein halbes Projekt.
+ *
+ * Solange ein Projekt gespeichert wird, liefert [list] seine Kurzinfo aus dem Speicher und [saving] enthält
+ * seine ID (Galerie: „Wird gespeichert …“). [load] wartet auf ein laufendes Speichern.
  */
 class ProjectStore(private val context: Context) {
     private val root = File(context.filesDir, "projects").apply { mkdirs() }
@@ -69,11 +77,44 @@ class ProjectStore(private val context: Context) {
     }
     private val indexLock = Any()
 
+    /** Kurzinfo von Projekten, deren Speichern noch läuft (Galerie zeigt sie sofort an). */
+    private val pendingInfo = ConcurrentHashMap<String, ProjectInfo>()
+    /** Geschlossene Dokumente, deren Speichern noch läuft (erneutes Öffnen nutzt sie direkt). */
+    private val detachedDocs = ConcurrentHashMap<String, ArtDocument>()
+    /** Miniatur eines geschlossenen Dokuments wird gerade gerendert. */
+    private val thumbReady = ConcurrentHashMap<String, CountDownLatch>()
+
     /** Wird nach jeder abgeschlossenen Speicher-/Löschoperation erhöht (Galerie beobachtet das). */
     var changeCount by mutableIntStateOf(0)
         private set
 
+    /** IDs der Projekte, die gerade gespeichert werden (nur auf dem Main-Thread verändert). */
+    val saving = mutableStateMapOf<String, Int>()
+
+    /** Letzter Speicherfehler (Galerie zeigt ihn kurz an); null = keiner. */
+    var saveError by mutableStateOf<String?>(null)
+        private set
+    fun clearSaveError() { saveError = null }
+
+    /** Zähler der zuletzt abgeschlossenen Speicherung (Messung/Protokoll). */
+    @Volatile internal var lastWriteStats: ProjectFormat.WriteStats? = null
+        private set
+
     private fun notifyChanged() = main.post { changeCount++ }
+
+    private fun markSaving(id: String, delta: Int) {
+        val n = (saving[id] ?: 0) + delta
+        if (n <= 0) saving.remove(id) else saving[id] = n
+    }
+
+    /**
+     * Wartet höchstens [timeoutMs], bis alle laufenden Speichervorgänge fertig sind (App-Ende). Liefert true,
+     * wenn nichts mehr aussteht.
+     */
+    fun awaitIdle(timeoutMs: Long): Boolean {
+        if (Thread.currentThread().name == "farbwerk-store") return false
+        return try { worker.submit {}.get(timeoutMs, TimeUnit.MILLISECONDS); true } catch (_: Throwable) { false }
+    }
 
     private fun dir(id: String) = File(root, id)
     fun projectFile(id: String) = File(dir(id), "project.${ProjectFormat.EXTENSION}")
@@ -84,21 +125,21 @@ class ProjectStore(private val context: Context) {
         try { pending[id]?.get() } catch (t: Throwable) { Log.e(TAG, "pending save", t) }
     }
 
-    private fun awaitAll() {
-        if (Thread.currentThread().name == "farbwerk-store") return
-        try { worker.submit {}.get() } catch (_: Throwable) {}
-    }
-
     // =================================================================== Liste
 
-    /** Alle Projekte, neueste zuerst. Wartet auf laufende Speichervorgänge. */
+    /**
+     * Alle Projekte, neueste zuerst. Wartet **nicht** auf laufende Speichervorgänge: deren Kurzinfo kommt aus
+     * dem Speicher (auch für neue Werke, die noch keine Datei haben).
+     */
     fun list(): List<ProjectInfo> {
-        awaitAll()
         val members = readIndex().members
         val out = ArrayList<ProjectInfo>()
+        val inFlight = HashMap(pendingInfo)
+        inFlight.values.forEach { out += it.copy(stackId = members[it.id]) }
         root.listFiles()?.forEach { d ->
             if (!d.isDirectory) return@forEach
             val id = d.name
+            if (inFlight.containsKey(id)) return@forEach
             if (!projectFile(id).exists()) return@forEach
             val meta = try { JSONObject(metaFile(id).readText()) } catch (_: Exception) { rebuildMeta(id) }
                 ?: return@forEach
@@ -137,10 +178,20 @@ class ProjectStore(private val context: Context) {
     // =================================================================== Speichern
 
     /**
-     * Speichert [doc], falls sich seit dem letzten Speichern etwas geändert hat.
-     * Muss auf dem Main-Thread aufgerufen werden (kopiert die Ebenen); kodiert im Hintergrund.
+     * Speichert [doc], falls sich seit dem letzten Speichern etwas geändert hat. Auf dem Main-Thread aufrufen.
+     *
+     * Der Main-Thread-Anteil ist klein (Metadaten, bei geöffnetem Werk die Miniatur); die Pixel werden im
+     * Hintergrund direkt aus den Ebenen gelesen – je Ebene in einem Zug ([LayerCodec.encode]), ohne Kopien
+     * der ganzen Ebenen auf dem Main-Thread.
+     *
+     * [detached] = true: Das Dokument wird gerade geschlossen und danach nicht mehr verändert. Dann rendert auch
+     * die Miniatur im Hintergrund, und ein erneutes Öffnen vor Ende des Speicherns bekommt dasselbe Dokument.
+     *
+     * Bei geöffnetem Werk ([detached] = false) liest der Hintergrund die Ebenen, während weitergemalt werden kann:
+     * Alles bis zum Aufruf ist sicher enthalten; ein Strich, der genau während des Lesens einer Ebene entsteht,
+     * landet ggf. erst im nächsten Speichern (das Dokument bleibt dafür nicht „sauber“ markiert, siehe unten).
      */
-    fun save(doc: ArtDocument) {
+    fun save(doc: ArtDocument, detached: Boolean = false) {
         val sig = ProjectFormat.toJson(doc, withTimes = false).toString()
         val file = projectFile(doc.id)
         val known = lastSignature[doc.id]
@@ -148,38 +199,49 @@ class ProjectStore(private val context: Context) {
         if (!doc.dirty && known != null) doc.modified = System.currentTimeMillis()
         lastSignature[doc.id] = sig
         val json = ProjectFormat.toJson(doc)
-        val thumb = renderThumbnail(doc)
-
-        val copies = ArrayList<ProjectFormat.LayerData>(doc.layers.size)
-        try {
-            for (l in doc.layers) {
-                val m = l.mask
-                copies += ProjectFormat.LayerData(
-                    l.bitmap.copy(Bitmap.Config.ARGB_8888, false),
-                    m?.copy(m.config ?: Bitmap.Config.ARGB_8888, false),
-                )
-            }
-        } catch (oom: OutOfMemoryError) {
-            // Zu wenig Speicher für Kopien: synchron mit den Originalen schreiben.
-            copies.forEach { it.bitmap.recycle(); it.mask?.recycle() }
-            Log.w(TAG, "Speichern ohne Kopie (OOM)")
-            awaitPending(doc.id)
-            writeProject(doc.id, json, doc.layers.map { ProjectFormat.LayerData(it.bitmap, it.mask) }, thumb)
-            doc.dirty = false
-            notifyChanged()
-            return
-        }
-        doc.dirty = false
         val id = doc.id
+        // Momentaufnahme der Ebenen-Referenzen (Bitmaps selbst werden im Hintergrund gelesen)
+        val layers = doc.layers.map { ProjectFormat.LayerData(it.bitmap, it.mask) }
+        val info = ProjectInfo(
+            id = id, name = doc.name, width = doc.width, height = doc.height, modified = doc.modified,
+            layerCount = doc.layers.size, created = doc.created,
+        )
+        var thumb: Bitmap? = null
+        var latch: CountDownLatch? = null
+        if (detached) {
+            latch = CountDownLatch(1)
+            thumbReady[id] = latch
+            thumbs.remove(id)
+            detachedDocs[id] = doc
+        } else {
+            thumb = renderThumbnail(doc)
+            thumb?.let { thumbs.put(id, it) }
+        }
+        pendingInfo[id] = info
+        markSaving(id, +1)
+        doc.dirty = false
         val f = worker.submit {
+            var ok = false
             try {
-                writeProject(id, json, copies, thumb)
+                val t = thumb ?: renderThumbnail(doc)?.also { thumbs.put(id, it) }
+                latch?.countDown()
+                val stats = ProjectFormat.WriteStats()
+                writeProject(id, json, layers, t, stats)
+                lastWriteStats = stats
+                ok = true
             } catch (t: Throwable) {
+                // Speichern darf die App nie beenden (z. B. Speicher voll / zu wenig RAM)
                 Log.e(TAG, "save $id", t)
                 lastSignature.remove(id)
-                main.post { doc.dirty = true }
+                if (detached) doc.dirty = true else main.post { doc.dirty = true }
+                main.post { saveError = "„${doc.name}“ konnte nicht gespeichert werden" }
             } finally {
-                copies.forEach { it.bitmap.recycle(); it.mask?.recycle() }
+                latch?.countDown()
+                if (latch != null) thumbReady.remove(id, latch)
+                // Bei einem Fehler bleibt ein geschlossenes Dokument im Speicher (Öffnen holt es zurück)
+                if (ok || !detached) pendingInfo.remove(id, info)
+                if (ok) detachedDocs.remove(id, doc)
+                main.post { markSaving(id, -1) }
                 notifyChanged()
             }
         }
@@ -199,13 +261,16 @@ class ProjectStore(private val context: Context) {
         notifyChanged()
     }
 
-    private fun writeProject(id: String, json: JSONObject, layers: List<ProjectFormat.LayerData>, thumb: Bitmap?) {
+    private fun writeProject(
+        id: String, json: JSONObject, layers: List<ProjectFormat.LayerData>, thumb: Bitmap?,
+        stats: ProjectFormat.WriteStats? = null,
+    ) {
         dir(id).mkdirs()
-        ProjectFormat.write(projectFile(id), json, layers, thumb)
+        ProjectFormat.writeInternal(projectFile(id), json, layers, thumb, stats)
         if (thumb != null) {
             val tmp = File(dir(id), "thumb.png.tmp")
             FileOutputStream(tmp).use { thumb.compress(Bitmap.CompressFormat.PNG, 100, it) }
-            tmp.renameTo(thumbFile(id))
+            if (!tmp.renameTo(thumbFile(id))) { thumbFile(id).delete(); tmp.renameTo(thumbFile(id)) }
             thumbs.put(id, thumb)
         }
         writeMeta(id, json)
@@ -230,9 +295,18 @@ class ProjectStore(private val context: Context) {
 
     // =================================================================== Laden
 
-    /** Lädt ein Projekt vollständig (auf einem Hintergrund-Thread aufrufen). */
+    /**
+     * Lädt ein Projekt vollständig (auf einem Hintergrund-Thread aufrufen). Läuft gerade das Speichern eines
+     * geschlossenen Dokuments, wird darauf gewartet und dasselbe Dokument zurückgegeben (kein Neu-Laden nötig).
+     */
     fun load(id: String): ArtDocument? {
+        val inMemory = detachedDocs[id]
         awaitPending(id)
+        if (inMemory != null) {
+            detachedDocs.remove(id, inMemory)
+            if (!inMemory.dirty) lastSignature[id] = ProjectFormat.toJson(inMemory, withTimes = false).toString()
+            return inMemory
+        }
         val f = projectFile(id)
         if (!f.exists()) return null
         return try {
@@ -244,9 +318,10 @@ class ProjectStore(private val context: Context) {
         }
     }
 
+    /** Vorschaubild (Cache, sonst Datei). Wartet nur auf eine gerade entstehende Miniatur, nie aufs Speichern. */
     fun thumbnail(id: String): Bitmap? {
+        thumbReady[id]?.let { try { it.await(5, TimeUnit.SECONDS) } catch (_: InterruptedException) {} }
         thumbs.get(id)?.let { return it }
-        awaitPending(id)
         val b = try {
             BitmapFactory.decodeFile(thumbFile(id).path) ?: ProjectFormat.readThumb(projectFile(id))
         } catch (_: Throwable) { null }
@@ -258,6 +333,7 @@ class ProjectStore(private val context: Context) {
 
     fun delete(id: String) {
         awaitPending(id)
+        pendingInfo.remove(id); detachedDocs.remove(id)
         dir(id).deleteRecursively()
         thumbs.remove(id)
         lastSignature.remove(id)

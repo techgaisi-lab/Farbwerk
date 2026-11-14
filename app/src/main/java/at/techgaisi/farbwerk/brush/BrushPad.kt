@@ -130,12 +130,15 @@ class BrushPad(val width: Int, val height: Int) {
         val tilt = if (usePreviewSettings) Math.toRadians((90f - brush[BP.PREVIEW_TILT]).toDouble()).toFloat()
             .takeIf { brush[BP.PREVIEW_TILT] > 0.5f } ?: 0f else 0f
         val wet = !usePreviewSettings || brush.on(BP.PREVIEW_WET)
+        // Ende-Verjüngung entsteht mit dem Stift durch das Nachlassen des Drucks beim Abheben (wie auf der Leinwand)
+        val release = brush[BP.TAPER_END] > 0f || (brush.on(BP.TAPER_LINK) && brush[BP.TAPER_START] > 0f)
         var t = 0L
         for (i in 0..steps) {
             val u = i / steps.toFloat()
             val x = x0 + (x1 - x0) * u
             val y = height / 2f + sin(u * 2f * PI.toFloat()) * amp * 0.75f
-            val p = ((pMin + (1f - pMin) * sin(u * PI.toFloat())) * pScale).coerceIn(0.05f, 1f)
+            var p = ((pMin + (1f - pMin) * sin(u * PI.toFloat())) * pScale).coerceIn(0.05f, 1f)
+            if (release && u > RELEASE_FROM) p = (p * (1f - u) / (1f - RELEASE_FROM)).coerceAtLeast(0.01f)
             t += 8
             if (i == 0) begin(brush, diameter, opacity, color, x, y, p, t, stylus = true, tilt = tilt, wet = wet)
             else move(x, y, p, t, tilt)
@@ -154,5 +157,10 @@ class BrushPad(val width: Int, val height: Int) {
 
     fun release() {
         base.recycle(); buffer.recycle(); painter.release()
+    }
+
+    private companion object {
+        /** Anteil des Probestrichs, ab dem der Druck wie beim Abheben ausläuft. */
+        const val RELEASE_FROM = 0.86f
     }
 }

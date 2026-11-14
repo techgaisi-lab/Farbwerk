@@ -52,17 +52,26 @@ class LayerPixelsAction(
 /**
  * Wie [LayerPixelsAction], aber für mehrere Teilbereiche (z. B. nur die von einem Pinselstrich veränderten Kacheln
  * statt des ganzen umschließenden Rechtecks).
+ *
+ * Ohne [after] wird der Zustand „nachher“ erst beim ersten Rückgängigmachen aus der Ebene gelesen: Dann steht die
+ * Ebene (Verlauf in umgekehrter Reihenfolge) genau im Zustand nach dieser Aktion. Das spart beim Absetzen eines
+ * Strichs das Kopieren aller Kacheln. Für das Speicherlimit wird „nachher“ trotzdem gleich mitgezählt.
  */
 class LayerTilesAction(
     override val label: String,
     private val layer: Layer,
     private val rects: List<Rect>,
     private val before: List<Bitmap>,
-    private val after: List<Bitmap>,
+    after: List<Bitmap>? = null,
 ) : UndoAction {
-    override val bytes: Long = before.sumOf { it.allocationByteCount.toLong() } + after.sumOf { it.allocationByteCount.toLong() }
-    override fun undo() = put(before)
-    override fun redo() = put(after)
+    private var after: List<Bitmap>? = after
+    override val bytes: Long = before.sumOf { it.allocationByteCount.toLong() } *
+        (if (after == null) 2 else 1) + (after?.sumOf { it.allocationByteCount.toLong() } ?: 0L)
+    override fun undo() {
+        if (after == null) after = rects.map { Bitmap.createBitmap(layer.bitmap, it.left, it.top, it.width(), it.height()) }
+        put(before)
+    }
+    override fun redo() { after?.let { put(it) } }
     private fun put(src: List<Bitmap>) {
         val c = Canvas(layer.bitmap)
         val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
@@ -261,9 +270,8 @@ class PixelEdit internal constructor(
         saved.clear()
         if (rects.isEmpty()) { state.invalidate(); return }
         doc.selection?.let { sel -> for (i in rects.indices) applySelection(sel, rects[i], bs[i]) }
-        val after = ArrayList<Bitmap>(rects.size)
-        for (tr in rects) after += Bitmap.createBitmap(layer.bitmap, tr.left, tr.top, tr.width(), tr.height())
-        state.undo.push(LayerTilesAction(label, layer, rects, bs, after))
+        // „nachher“ liest die Aktion erst beim Rückgängigmachen (siehe LayerTilesAction)
+        state.undo.push(LayerTilesAction(label, layer, rects, bs))
         state.invalidate()
     }
 

@@ -33,6 +33,8 @@ class FloatBuf(cap: Int = 256) {
     }
     operator fun get(i: Int) = data[i]
     fun clear() { size = 0 }
+    /** Verwirft alles ab Index [n] (n ≤ size). */
+    fun truncate(n: Int) { if (n in 0 until size) size = n }
 }
 
 /** Aufgezeichnete Tupfer eines Strichs (spaltenweise, ohne Objekte pro Tupfer). */
@@ -63,6 +65,9 @@ class DabList {
     }
 
     fun clear() { size = 0 }
+
+    /** Verwirft alle Tupfer ab Index [n] (n ≤ size). */
+    fun truncate(n: Int) { if (n in 0 until size) size = n }
 }
 
 /**
@@ -73,6 +78,15 @@ class DabList {
  *
  * Wird von der Leinwand-Engine, der Bibliotheksvorschau und dem Pinsel-Studio gemeinsam benutzt.
  * Keine Allokationen pro Eingabepunkt.
+ *
+ * Ende-Verjüngung: Mit dem Stift wirkt sie über den Druck beim Abheben ([releaseFactor]) – wie bei einem echten
+ * Stift entsteht die Spitze, während der Druck abfällt. Jeder Tupfer ist damit bei seiner Ausgabe endgültig;
+ * nichts muss nachträglich umgezeichnet werden. Nur ohne Druck (Finger, Maus) wird über eine feste Länge am Ende
+ * verjüngt ([liveEndTaperLength], [emitTail]); bei Formen mit bekannter Länge (QuickShape) sofort beim Ausgeben.
+ *
+ * Vorschau des Strichendes: [beginPreviewEnd] führt [end] probeweise aus (die Tupfer stehen dann bis [endPreview]
+ * in [dabs]) und stellt danach den vorherigen Zustand exakt wieder her. Die Live-Ansicht zeigt so genau das
+ * Strichende, das beim Absetzen an dieser Stelle entsteht.
  */
 class StrokeRenderer {
     // ------------------------------------------------------------ Konfiguration
@@ -169,6 +183,17 @@ class StrokeRenderer {
     private var expr = 0f
     /** Durchgehender Strich (solide Spitze ohne Streuung/Stempelabstand) → Mindest-Tupferdichte. */
     private var continuous = false
+    /** Ende-Verjüngung über den abfallenden Druck (Stift) statt über eine feste Länge. */
+    private var releaseTaper = false
+    /** Anteil des bisher höchsten Drucks, unter dem die Ende-Verjüngung einsetzt. */
+    private var releaseK = 0.5f
+    /** Bisher höchster (geglätteter) Druck des Strichs. */
+    private var pPeak = 0f
+
+    // Vorschau des Strichendes (siehe Klassenbeschreibung)
+    private var previewing = false
+    private var previewFrom = 0
+    private val snap = Snapshot()
 
     // ------------------------------------------------------------ Strich-API
 
@@ -276,14 +301,87 @@ class StrokeRenderer {
 
     // ------------------------------------------------------------ Ende-Verjüngung (nachträglich)
 
-    /** true, wenn das Strichende nach dem Absetzen noch verjüngt werden muss. */
-    fun needsEndTaper(): Boolean = taperOn && taperEndLen > 0f && knownTotalLength <= 0f && dabs.size > 1
+    /**
+     * true, wenn das Strichende nach dem Absetzen noch über eine feste Länge verjüngt werden muss (nur ohne Druck –
+     * mit dem Stift verjüngt der abfallende Druck das Ende bereits beim Ausgeben der Tupfer).
+     */
+    fun needsEndTaper(): Boolean = liveEndTaperLength > 0f && dabs.size > 1
 
     /**
-     * Länge (Dokumentpixel), über die das Strichende verjüngt wird, wenn die Verjüngung live – während des
-     * Strichs – angewandt wird; 0 = keine Ende-Verjüngung (oder Form mit bekannter Länge).
+     * Länge (Dokumentpixel), über die das Strichende nachträglich verjüngt wird (Finger/Maus); 0 = keine solche
+     * Verjüngung (Stift mit Druck-Verjüngung, Form mit bekannter Länge oder keine Ende-Verjüngung).
      */
-    val liveEndTaperLength: Float get() = if (taperOn && taperEndLen > 0f && knownTotalLength <= 0f) taperEndLen else 0f
+    val liveEndTaperLength: Float
+        get() = if (taperOn && taperEndLen > 0f && !releaseTaper && knownTotalLength <= 0f) taperEndLen else 0f
+
+    /** Wird das (veränderliche) Strichende gerade über die feste Länge verjüngt? Wie [needsEndTaper]. */
+    fun tailTaper(): Boolean = needsEndTaper()
+
+    /**
+     * Probelauf von [end] für die Live-Ansicht: Die Tupfer, die beim Absetzen jetzt noch entstünden (Aufholen der
+     * Glättung, letztes Kurvenstück), stehen danach in [dabs] ab dem zurückgegebenen Index. [sink] wird dabei nicht
+     * aufgerufen. Danach unbedingt [endPreview] aufrufen – erst das stellt den Zustand wieder her.
+     */
+    fun beginPreviewEnd(): Int {
+        if (previewing) endPreview()
+        snap.save(this)
+        previewing = true
+        previewFrom = dabs.size
+        val keep = sink
+        sink = null
+        try { end() } finally { sink = keep }
+        return previewFrom
+    }
+
+    /** Beendet [beginPreviewEnd]: Vorschau-Tupfer verwerfen, Zustand exakt wiederherstellen. */
+    fun endPreview() {
+        if (!previewing) return
+        previewing = false
+        snap.restore(this)
+    }
+
+    /** Veränderlicher Zustand, den [end] berührt (für [beginPreviewEnd]/[endPreview]). */
+    private class Snapshot {
+        val stabX = FloatArray(64); val stabY = FloatArray(64)
+        var stabCount = 0; var stabPos = 0
+        var smX = 0f; var smY = 0f
+        val wx = FloatArray(4); val wy = FloatArray(4); val wp = FloatArray(4); val wt = FloatArray(4); val wo = FloatArray(4)
+        var wCount = 0
+        var pathN = 0; var dabN = 0
+        var headX = 0f; var headY = 0f; var headD = 0f
+        var segPa = 0f; var segPb = 0f; var segTa = 0f; var segTb = 0f; var segOa = 0f; var segOb = 0f
+        var distAlong = 0f; var distToNext = 0f; var prevPressD = 0f; var prevPressDist = 0f; var lastStep = 0f
+        var carR = 0f; var carG = 0f; var carB = 0f
+        var rng = 0L; var pPeak = 0f; var taperOn = false
+
+        fun save(r: StrokeRenderer) {
+            r.stabX.copyInto(stabX); r.stabY.copyInto(stabY); stabCount = r.stabCount; stabPos = r.stabPos
+            smX = r.smX; smY = r.smY
+            r.wx.copyInto(wx); r.wy.copyInto(wy); r.wp.copyInto(wp); r.wt.copyInto(wt); r.wo.copyInto(wo)
+            wCount = r.wCount
+            pathN = r.pathX.size; dabN = r.dabs.size
+            headX = r.headX; headY = r.headY; headD = r.headDiameter
+            segPa = r.segPa; segPb = r.segPb; segTa = r.segTa; segTb = r.segTb; segOa = r.segOa; segOb = r.segOb
+            distAlong = r.distAlong; distToNext = r.distToNext; prevPressD = r.prevPressD; prevPressDist = r.prevPressDist
+            lastStep = r.lastStep
+            carR = r.carR; carG = r.carG; carB = r.carB
+            rng = r.rng; pPeak = r.pPeak; taperOn = r.taperOn
+        }
+
+        fun restore(r: StrokeRenderer) {
+            stabX.copyInto(r.stabX); stabY.copyInto(r.stabY); r.stabCount = stabCount; r.stabPos = stabPos
+            r.smX = smX; r.smY = smY
+            wx.copyInto(r.wx); wy.copyInto(r.wy); wp.copyInto(r.wp); wt.copyInto(r.wt); wo.copyInto(r.wo)
+            r.wCount = wCount
+            r.pathX.truncate(pathN); r.pathY.truncate(pathN); r.dabs.truncate(dabN)
+            r.headX = headX; r.headY = headY; r.headDiameter = headD
+            r.segPa = segPa; r.segPb = segPb; r.segTa = segTa; r.segTb = segTb; r.segOa = segOa; r.segOb = segOb
+            r.distAlong = distAlong; r.distToNext = distToNext; r.prevPressD = prevPressD; r.prevPressDist = prevPressDist
+            r.lastStep = lastStep
+            r.carR = carR; r.carG = carG; r.carB = carB
+            r.rng = rng; r.pPeak = pPeak; r.taperOn = taperOn
+        }
+    }
 
     /** Gibt alle Tupfer erneut aus, wobei das Ende verjüngt wird (z. B. Pinselvorschau). */
     fun replayWithEndTaper(out: DabConsumer) = emitTail(0, distAlong, true, out)
@@ -372,6 +470,18 @@ class StrokeRenderer {
         }
     }
 
+    /**
+     * Ende-Verjüngung mit dem Stift: Fällt der Druck unter einen Anteil ([releaseK], aus „Ende“) des bisher höchsten
+     * Drucks, wird der Tupfer verjüngt – beim Abheben läuft der Strich so in eine Spitze aus, ohne dass bereits
+     * gezeichnete Tupfer später geändert werden müssten. Am Strichanfang (Druck steigt noch) wirkt sie nicht.
+     */
+    private fun releaseFactor(p: Float): Float {
+        if (p > pPeak) pPeak = p
+        val thr = pPeak * releaseK
+        if (thr <= 0.001f || p >= thr) return 1f
+        return (p / thr).coerceIn(0f, 1f).pow(taperExp)
+    }
+
     private fun endFactor(total: Float, dist: Float): Float {
         if (taperEndLen <= 0f) return 1f
         val u = ((total - dist) / taperEndLen).coerceIn(0f, 1f)
@@ -415,6 +525,10 @@ class StrokeRenderer {
             taperSizeAmt = b[BP.TOUCH_TAPER_SIZE]; taperOpAmt = b[BP.TOUCH_TAPER_OPACITY]; taperPressAmt = 0f
         }
         taperOn = tStart > 0f || tEnd > 0f
+        releaseTaper = stylus && tEnd > 0f
+        releaseK = (0.25f + 0.75f * tEnd).coerceAtMost(0.9f)
+        pPeak = 0f
+        previewing = false
         val base = diameter * 8f + 150f * detailScale
         taperStartLen = tStart * base
         taperEndLen = tEnd * base
@@ -559,6 +673,7 @@ class StrokeRenderer {
         if (taperOn && !closedShape) {
             if (taperStartLen > 0f) tf = min(tf, (distAlong / taperStartLen).coerceIn(0f, 1f).pow(taperExp))
             if (knownTotalLength > 0f) tf = min(tf, endFactor(knownTotalLength, distAlong))
+            else if (releaseTaper) tf = min(tf, releaseFactor(p))
             if (taperPressAmt > 0f) tf += (1f - tf) * taperPressAmt * p
         }
 

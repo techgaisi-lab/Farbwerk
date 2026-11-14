@@ -33,11 +33,18 @@ import kotlin.math.max
  * Radieren, SRC_ATOP bei Alpha-Sperre). Beim Absetzen wird der Puffer einmal mit der eingestellten Deckkraft in die
  * Ebene gemischt – ein Strich überschreitet also nie die eingestellte Deckkraft.
  *
- * Live = Ergebnis: Endgültige Tupfer werden fest in den Puffer gezeichnet. Das noch veränderliche Strichende
- * (Ende-Verjüngung, bei harten Spitzen ein kurzes Stück für saubere Kanten) und die Bewegungsvorhersage werden vor
- * jedem Bild neu in den Puffer gezeichnet ([refreshLive]) – der darunterliegende Pufferinhalt wird vorher gesichert
- * und danach wiederhergestellt ([TailStash]). Die Live-Ansicht zeigt so schon während des Malens genau den Strich,
- * der beim Absetzen entsteht (inkl. verjüngter Spitze, gleiche Deckkraft), statt nachträglich umzuzeichnen.
+ * Live = Ergebnis: Tupfer werden fest in den Puffer gezeichnet, sobald sie entstehen – mit dem Stift verjüngt der
+ * abfallende Druck das Ende bereits beim Ausgeben ([StrokeRenderer]), es muss also nichts umgezeichnet werden. Nur
+ * ein kleiner, noch veränderlicher Rest wird vor jedem Bild neu in den Puffer gezeichnet ([refreshLive]):
+ *  - das Strichende, das beim Absetzen jetzt entstünde ([StrokeRenderer.beginPreviewEnd]: Aufholen der Glättung,
+ *    letztes Kurvenstück) – beim Absetzen entsteht genau dieses Ende, nichts springt,
+ *  - bei harten Spitzen das noch nicht festgeschriebene, vereinigt gezeichnete Stück (saubere Kanten),
+ *  - ohne Druck (Finger) die Ende-Verjüngung über die feste Länge,
+ *  - die Bewegungsvorhersage (höchstens ein Bild voraus, beim Abheben abgeschaltet, siehe [onPredicted]).
+ * Der darunterliegende Pufferinhalt wird vorher gesichert und danach wiederhergestellt ([TailStash]).
+ *
+ * Absetzen: Die Originalpixel der berührten Undo-Kacheln werden schon während des Strichs gesichert ([markTouched]),
+ * Einmischen und Leeren des Puffers laufen über ein feines Kachelraster ([FINE]) – nur dort, wo der Strich ist.
  * Wischen: arbeitet direkt auf der Ebene (siehe [Smudger]).
  *
  * QuickShape: Nach dem Halten wird der Strich durch eine perfekte Form ersetzt; solange gehalten wird,
@@ -67,6 +74,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
      * Einmischen, Undo-Sicherung und Leeren beschränken sich darauf statt auf das ganze umschließende Rechteck.
      */
     private val touched = java.util.BitSet()
+    /** Wie [touched], aber im feinen Raster [FINE] (Einmischen und Leeren des Puffers). */
+    private val touchedFine = java.util.BitSet()
     private val tileRect = Rect()
     private val tmpRect = RectF()
     private val tmpPts = FloatArray(2)
@@ -111,6 +120,15 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private var lastMoveY = 0f
     private var lastX = 0f
     private var lastY = 0f
+    /** Zuletzt an den Renderer übergebener Punkt (nach Zeichenassistent) und seine Stiftwerte. */
+    private var lastAx = 0f
+    private var lastAy = 0f
+    private var lastPress = 1f
+    private var lastTilt = 0f
+    private var lastOrient = 0f
+    private var lastTime = 0L
+    /** Langsam abklingendes Maximum des Rohdrucks (Abheben erkennen → keine Vorhersage). */
+    private var pressMax = 0f
 
     // Bewegungsvorhersage (nur Vorschau, wird nie festgeschrieben)
     private var predN = 0
@@ -308,6 +326,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
         active = true
         lastX = p.x; lastY = p.y
+        lastAx = p.x; lastAy = p.y
+        lastPress = p.pressure; lastTilt = p.tilt; lastOrient = p.orientation; lastTime = p.time
+        pressMax = p.pressure
         assist.begin(doc, p.x, p.y)
         renderer.begin(p.x, p.y, p.pressure, p.tilt, p.orientation, p.time, p.isStylus)
     }
@@ -333,6 +354,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             val p = points[i]
             assist.map(p.x, p.y, apt)
             renderer.add(apt[0], apt[1], p.pressure, p.tilt, p.orientation, p.time)
+            lastAx = apt[0]; lastAy = apt[1]
+            lastPress = p.pressure; lastTilt = p.tilt; lastOrient = p.orientation; lastTime = p.time
+            pressMax = max(p.pressure, pressMax - PRESS_DECAY)
         }
         val last = points.last()
         lastX = last.x; lastY = last.y
@@ -343,8 +367,13 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         predN = 0
         if (!active) { reset(); return }
         if (shape == null) {
+            // Der Abhebepunkt bringt meist nichts Neues (gleiche Stelle, oft unzuverlässiger Druck): nur übernehmen,
+            // wenn er weiter weg liegt – dann mit den Stiftwerten des letzten echten Punkts. So entsteht beim Absetzen
+            // genau das Strichende, das zuletzt angezeigt wurde.
             assist.map(p.x, p.y, apt)
-            renderer.add(apt[0], apt[1], p.pressure, p.tilt, p.orientation, p.time)
+            if (hypot(apt[0] - lastAx, apt[1] - lastAy) >= UP_MIN_MOVE) {
+                renderer.add(apt[0], apt[1], lastPress, lastTilt, lastOrient, max(p.time, lastTime + 1))
+            }
             renderer.end()
             if (deferDabs) refreshLive(final = true)
         }
@@ -363,12 +392,24 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         state.invalidate()
     }
 
+    /**
+     * Bewegungsvorhersage: nur Vorschau (wird mit dem nächsten Bild verworfen und nie festgeschrieben), höchstens
+     * [PREDICT_HORIZON_MS] voraus. Sobald der Druck abfällt (Abheben), gibt es keine Vorhersage mehr – sonst würde die
+     * Spitze beim Absetzen um das vorhergesagte Stück zurückspringen.
+     */
     override fun onPredicted(points: List<InputPoint>) {
         val had = predN > 0
         predN = 0
-        if (active && shape == null && strokeTool != Tool.SMUDGE && !assist.active && points.isNotEmpty() && predictionAllowed()) {
-            val n = minOf(points.size, MAX_PREDICTED)
-            for (i in 0 until n) { predX[i] = points[i].x; predY[i] = points[i].y }
+        if (active && shape == null && strokeTool != Tool.SMUDGE && !assist.active && points.isNotEmpty() &&
+            predictionAllowed() && !lifting()
+        ) {
+            val horizon = lastTime + PREDICT_HORIZON_MS
+            var n = 0
+            for (i in points.indices) {
+                val q = points[i]
+                if (q.time > horizon || n >= MAX_PREDICTED) break
+                predX[n] = q.x; predY[n] = q.y; n++
+            }
             predN = n
         }
         if (had || predN > 0) {
@@ -384,15 +425,20 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private fun predictionAllowed(): Boolean {
         val b = renderer.brush
         return b[BP.STREAMLINE] <= 0.6f && b[BP.STABILIZE] <= 0.05f && b[BP.MOTION_FILTER] <= 0.05f &&
-            state.prefs.motionPrediction && state.prefs.motionFilteringAmount <= 0.05f
+            state.prefs.motionPrediction && state.prefs.motionFilteringAmount <= 0.05f &&
+            // Längen-Verjüngung (Finger) bezieht sich auf das echte Strichende – eine Vorhersage würde sie verschieben
+            renderer.liveEndTaperLength <= 0f
     }
+
+    /** Stift wird gerade abgehoben (Druck deutlich unter dem jüngsten Maximum)? */
+    private fun lifting(): Boolean = renderer.stylus && lastPress < pressMax * LIFT_RATIO
 
     /**
      * Aktualisiert das veränderliche Strichende im Puffer (siehe Klassenbeschreibung):
      *  1. vorher gezeichnetes Strichende wiederherstellen (gesicherter Pufferinhalt),
-     *  2. Tupfer, die sich nicht mehr ändern können (außerhalb der Ende-Verjüngung), fest zeichnen,
-     *  3. Pufferbereich unter dem neuen Strichende sichern und Strichende + Fortsetzung (Kopf, Vorhersage) zeichnen.
-     * [final] (Absetzen): restliche Tupfer mit der endgültigen Verjüngung fest zeichnen, keine Vorhersage.
+     *  2. Tupfer, die sich nicht mehr ändern können, fest zeichnen (mit dem Stift: alle; harte Spitzen in Abschnitten),
+     *  3. Strichende-Vorschau ([StrokeRenderer.beginPreviewEnd]) + Vorhersage: Pufferbereich darunter sichern, zeichnen.
+     * [final] (Absetzen, nach [StrokeRenderer.end]): restliche Tupfer fest zeichnen – exakt wie zuletzt angezeigt.
      */
     private fun refreshLive(final: Boolean) {
         val bc = bufferCanvas ?: return
@@ -400,36 +446,41 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         painter.flush()
         stash.restore(bc, changed)
         val l = renderer.dabs
-        val n = l.size
-        val total = renderer.totalLength
         if (final) {
-            drawSpan(committed, n, total, renderer.needsEndTaper(), 0)
-            committed = n
+            drawSpan(committed, l.size, renderer.totalLength, renderer.tailTaper(), 0)
+            committed = l.size
             return
         }
         // 2. endgültige Tupfer festschreiben
-        val limit = total - renderer.liveEndTaperLength
+        val n = l.size
+        val limit = renderer.totalLength - renderer.liveEndTaperLength
         var f = committed
         while (f < n && l.dist[f] <= limit) f++
         if (f > committed && (chunkLen <= 0f || l.dist[f - 1] - l.dist[committed] >= chunkLen)) {
-            commitSpan(f, total)
+            commitSpan(f, renderer.totalLength)
         }
-        // 3. Strichende + Fortsetzung (Kopf + Vorhersage)
-        var en = 0
-        if (predN > 0 && n > 0) {
-            extX[0] = renderer.headX; extY[0] = renderer.headY; en = 1
-            for (k in 0 until predN) { extX[en] = predX[k]; extY[en] = predY[k]; en++ }
+        // 3. Strichende-Vorschau + Fortsetzung (Vorhersage)
+        renderer.beginPreviewEnd()
+        try {
+            val pn = l.size
+            var en = 0
+            if (predN > 0 && pn > 0) {
+                extX[0] = renderer.headX; extY[0] = renderer.headY; en = 1
+                for (k in 0 until predN) { extX[en] = predX[k]; extY[en] = predY[k]; en++ }
+            }
+            if (committed >= pn && en == 0) return
+            val total = renderer.totalLength
+            val taper = renderer.tailTaper()
+            tailBounds.setEmpty()
+            renderer.emitTail(committed, total, taper, boundsSink, extX, extY, en)
+            if (tailBounds.isEmpty) return
+            stashRegion(buf, tailBounds, null)
+            for (m in symm) stashRegion(buf, tailBounds, m)
+            if (jValid) stash.save(buf, jRect)
+            drawSpan(committed, pn, total, taper, en)
+        } finally {
+            renderer.endPreview()
         }
-        val liveTotal = if (en > 0) max(total, renderer.lastDabDist + renderer.extensionLength(extX, extY, en)) else total
-        val taper = renderer.liveEndTaperLength > 0f
-        if (committed >= n && en == 0) return
-        tailBounds.setEmpty()
-        renderer.emitTail(committed, liveTotal, taper, boundsSink, extX, extY, en)
-        if (tailBounds.isEmpty) return
-        stashRegion(buf, tailBounds, null)
-        for (m in symm) stashRegion(buf, tailBounds, m)
-        if (jValid) stash.save(buf, jRect)
-        drawSpan(committed, n, liveTotal, taper, en)
     }
 
     /**
@@ -603,7 +654,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
                         StrokeEffects.apply(buf, dirty, b, renderer.diameter)
                     }
                     // Originalpixel der berührten Kacheln sichern, bevor der Puffer in die Ebene gemischt wird
-                    forEachTouchedTile { tr -> e.protect(tr.left, tr.top, tr.right, tr.bottom) }
+                    // (geschieht schon während des Strichs in [markTouched]; hier nur zur Sicherheit)
+                    forEachTouchedTile(touched, PixelEdit.TILE) { tr -> e.protect(tr.left, tr.top, tr.right, tr.bottom) }
                     mergeBuffer(l, buf, state.document?.selection?.path)
                 }
                 l.drawOverride = null
@@ -655,8 +707,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     /**
-     * Mischt den Puffer in die Ebene – je berührter Kachel (außerhalb ist der Puffer leer, und ein leerer Puffer
-     * verändert die Ebene in keinem der Mischmodi). Mit Auswahl in einem Durchgang wie bisher: Die Kantenglättung
+     * Mischt den Puffer in die Ebene – je berührter Kachel des feinen Rasters [FINE] (außerhalb ist der Puffer leer,
+     * und ein leerer Puffer verändert die Ebene in keinem der Mischmodi). Mit Auswahl in einem Durchgang wie bisher: Die Kantenglättung
      * des Auswahlpfads als Clip hängt in Skia vom Clip-Rechteck ab und wäre an Kachelgrenzen minimal anders.
      */
     private fun mergeBuffer(l: Layer, buf: Bitmap, sel: android.graphics.Path?) {
@@ -669,7 +721,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             c.restore()
             return
         }
-        forEachTouchedTile { tr ->
+        forEachTouchedTile(touchedFine, FINE) { tr ->
             c.save()
             c.clipRect(dirty)
             c.clipRect(tr)
@@ -678,23 +730,26 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
     }
 
-    /** Ruft [fn] für jede berührte Kachel (Rechteck in Dokumentpixeln, auf den Puffer begrenzt) auf. */
-    private inline fun forEachTouchedTile(fn: (Rect) -> Unit) {
+    /**
+     * Ruft [fn] für jede in [set] markierte Kachel des Rasters [t] (Rechteck in Dokumentpixeln, auf den Puffer
+     * begrenzt) auf.
+     */
+    private inline fun forEachTouchedTile(set: java.util.BitSet, t: Int, fn: (Rect) -> Unit) {
         val buf = buffer ?: return
-        val t = PixelEdit.TILE
         val nx = (buf.width + t - 1) / t
-        var k = touched.nextSetBit(0)
+        var k = set.nextSetBit(0)
         while (k >= 0) {
             val x0 = (k % nx) * t; val y0 = (k / nx) * t
             tileRect.set(x0, y0, minOf(buf.width, x0 + t), minOf(buf.height, y0 + t))
             if (!tileRect.isEmpty) fn(tileRect)
-            k = touched.nextSetBit(k + 1)
+            k = set.nextSetBit(k + 1)
         }
     }
 
     private fun resetDirty() {
         dirty.setEmpty()
         touched.clear()
+        touchedFine.clear()
     }
 
     private fun reset() {
@@ -734,7 +789,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val bc = bufferCanvas ?: return
         if (dirty.isEmpty) return
         // Nur berührte Kacheln enthalten etwas (der übrige Puffer ist schon leer)
-        forEachTouchedTile { tr ->
+        forEachTouchedTile(touchedFine, FINE) { tr ->
             bc.drawRect(tr, clearPaint)
             tmpRect.set(tr)
             tiles.clear(tmpRect)
@@ -750,14 +805,28 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         markTouched(tmpRect)
     }
 
+    /**
+     * Markiert die von [r] berührten Kacheln. Neu berührte Undo-Kacheln werden sofort gesichert: Beim Malen/Radieren
+     * bleibt die Ebene bis zum Absetzen unverändert, ihr aktueller Inhalt ist also das Original – so verteilt sich
+     * das Sichern auf den Strich, statt beim Absetzen auf einmal anzufallen.
+     */
     private fun markTouched(r: RectF) {
         val buf = buffer ?: return
-        val t = PixelEdit.TILE
         val l = max(0, floor(r.left).toInt()); val tp = max(0, floor(r.top).toInt())
         val rr = minOf(buf.width, ceil(r.right).toInt()); val bb = minOf(buf.height, ceil(r.bottom).toInt())
         if (l >= rr || tp >= bb) return
+        val t = PixelEdit.TILE
         val nx = (buf.width + t - 1) / t
-        for (j in tp / t..(bb - 1) / t) touched.set(j * nx + l / t, j * nx + (rr - 1) / t + 1)
+        val e = edit
+        for (j in tp / t..(bb - 1) / t) {
+            val row = j * nx
+            for (i in l / t..(rr - 1) / t) {
+                val k = row + i
+                if (!touched.get(k)) { touched.set(k); e?.protectTile(k) }
+            }
+        }
+        val nf = (buf.width + FINE - 1) / FINE
+        for (j in tp / FINE..(bb - 1) / FINE) touchedFine.set(j * nf + l / FINE, j * nf + (rr - 1) / FINE + 1)
     }
 
     /** Drehwinkel einer Symmetrie-Matrix (für die Ausrichtung beim Wischen). */
@@ -957,6 +1026,16 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private companion object {
         const val EDIT_SHAPE_LABEL = "Form bearbeiten"
         const val MAX_PREDICTED = 32
+        /** Vorhersagehorizont (ms): höchstens ein Bild (120 Hz) voraus. */
+        const val PREDICT_HORIZON_MS = 8L
+        /** Abklingen des Druckmaximums pro Eingabepunkt. */
+        const val PRESS_DECAY = 0.02f
+        /** Druck unter diesem Anteil des jüngsten Maximums = Abheben (keine Vorhersage mehr). */
+        const val LIFT_RATIO = 0.75f
+        /** Mindestabstand (Dokumentpixel), ab dem der Abhebepunkt noch übernommen wird. */
+        const val UP_MIN_MOVE = 1f
+        /** Kantenlänge des feinen Kachelrasters für Einmischen/Leeren (Dokumentpixel). */
+        const val FINE = 64
     }
 
     /** Gibt Speicher frei (z. B. beim Schließen eines Dokuments). */

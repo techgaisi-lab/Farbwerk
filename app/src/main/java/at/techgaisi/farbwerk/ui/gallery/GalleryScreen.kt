@@ -154,6 +154,8 @@ fun GalleryScreen(state: EditorState) {
         selected.retainAll { id -> p.any { it.id == id } }
     }
     LaunchedEffect(message) { if (message != null) { delay(2200); message = null } }
+    // Fehler beim Speichern im Hintergrund melden (das Werk bleibt im Speicher und lässt sich erneut öffnen)
+    LaunchedEffect(store.saveError) { store.saveError?.let { toast(it); store.clearSaveError() } }
 
     val openStack = stacks.firstOrNull { it.id == openStackId }
     LaunchedEffect(stacks, loaded) {
@@ -643,6 +645,8 @@ private fun ProjectTile(
                     }
             ) {
                 Thumbnail(thumb, info.width, info.height, Modifier.fillMaxSize(), highlight) {
+                    // Speichern läuft noch im Hintergrund: dezenter Hinweis unten links
+                    if (state.store.saving.containsKey(info.id)) SavingBadge(Modifier.align(Alignment.BottomStart))
                     if (selectMode) {
                         if (selected) Box(Modifier.fillMaxSize().background(Color(0x33000000)))
                         Box(
@@ -664,6 +668,16 @@ private fun ProjectTile(
             TileCaption(info.name, "${info.width} × ${info.height}px", onTitleClick = if (selectMode) null else onRename)
         }
     }
+}
+
+/** Kleiner Hinweis „Wird gespeichert …“ auf der Miniatur, solange das Speichern im Hintergrund läuft. */
+@Composable
+private fun SavingBadge(modifier: Modifier = Modifier) {
+    Text(
+        "Wird gespeichert …", color = Color.White, fontSize = 10.sp, maxLines = 1,
+        modifier = modifier.padding(5.dp).clip(RoundedCornerShape(4.dp)).background(Color(0x99000000))
+            .padding(horizontal = 6.dp, vertical = 2.dp),
+    )
 }
 
 @Composable

@@ -241,7 +241,13 @@ class EditorState(val context: Context) {
         invalidate()
     }
 
-    /** Speichert und kehrt zur Galerie zurück. Verlauf wird (wie im Original) gelöscht. */
+    /**
+     * Speichert und kehrt zur Galerie zurück. Verlauf wird (wie im Original) gelöscht.
+     *
+     * Die Galerie erscheint sofort: Auf dem Main-Thread werden nur offene Werkzeug-Sitzungen abgeschlossen und
+     * die Metadaten erfasst. Das geschlossene Dokument wird danach nicht mehr verändert und direkt im Hintergrund
+     * gespeichert (Miniatur zuerst, dann nur geänderte Kacheln) – ohne Kopien der Ebenen.
+     */
     fun closeToGallery() {
         canvasView?.abortStroke()
         at.techgaisi.farbwerk.ui.text.TextEditing.session?.done()
@@ -255,8 +261,22 @@ class EditorState(val context: Context) {
         tool = Tool.PAINT
         eyedropperArmed = false
         copyPasteMenuVisible = false
-        saveNow()
+        val d = document
+        // Laufendes „Form bearbeiten“ übernehmen und den Pinsel lösen, bevor das Dokument übergeben wird –
+        // danach greift nichts mehr auf seine Ebenen zu.
+        try { brushEngine.commitPendingShapeEdit() } catch (t: Throwable) { android.util.Log.e("Farbwerk", "Form übernehmen", t) }
         brushEngine.release()
+        if (d != null) {
+            try {
+                store.save(d, detached = true)
+            } catch (t: Throwable) {
+                // Nicht schließen, sonst wäre das Werk verloren – im Editor bleiben
+                android.util.Log.e("Farbwerk", "Speichern fehlgeschlagen", t)
+                d.dirty = true
+                flash("Speichern fehlgeschlagen")
+                return
+            }
+        }
         document = null
         undo.clear()
         openPanel = Panel.NONE
@@ -277,6 +297,7 @@ class EditorState(val context: Context) {
         quickMenuAt = null
     }
 
+    /** Speichert das geöffnete Werk im Hintergrund (Main-Thread-Anteil: Metadaten + Miniatur). */
     fun saveNow() {
         val d = document ?: return
         // Laufendes „Form bearbeiten“ übernehmen – die Ebene enthält sonst den Zustand ohne Form

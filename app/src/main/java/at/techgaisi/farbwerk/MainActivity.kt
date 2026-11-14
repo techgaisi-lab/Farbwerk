@@ -69,6 +69,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onPause() {
         super.onPause()
+        // Speichert im Hintergrund weiter (Kachelformat, nur Geändertes) – der Main-Thread wartet nicht
         if (::state.isInitialized) state.saveNow()
+    }
+
+    override fun onDestroy() {
+        // App wird beendet: laufendes Speichern zu Ende führen, bevor der Prozess verschwinden kann
+        // (Desktop beendet den Prozess direkt danach). Wartet nur, wenn wirklich etwas aussteht.
+        if (::state.isInitialized) state.store.awaitIdle(20_000)
+        super.onDestroy()
     }
 }
