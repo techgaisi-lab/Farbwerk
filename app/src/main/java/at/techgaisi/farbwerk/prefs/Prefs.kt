@@ -26,7 +26,11 @@ class Prefs(context: Context) {
     var pressureCurve by mutableStateOf(
         sp.getString("pressureCurve", "0.25,0.25,0.75,0.75")!!.split(",").map { it.toFloat() }
     )
-    var pressureSmoothing by mutableFloatStateOf(sp.getFloat("pressureSmoothing", 0.1f))
+    /**
+     * Druckglättung 0..1 (Zeitkonstante bis 80 ms, siehe StrokeRenderer). Standard [DEFAULT_PRESSURE_SMOOTHING];
+     * ältere, niedrigere gespeicherte Werte werden einmalig angehoben (S-Pen-Rauschen → gezackte Strichkanten).
+     */
+    var pressureSmoothing by mutableFloatStateOf(migratedPressureSmoothing())
     var motionFilteringAmount by mutableFloatStateOf(sp.getFloat("motionFilter", 0f))
     var holdDelayMs by mutableIntStateOf(sp.getInt("holdDelay", 450))
     var quickShapeDelayMs by mutableIntStateOf(sp.getInt("qsDelay", 650))
@@ -166,9 +170,20 @@ class Prefs(context: Context) {
         return bez(t, c[1], c[3]).coerceIn(0f, 1f)
     }
 
+    /** Einmalige Migration: gespeicherte Druckglättung unter dem neuen Standard auf den Standard anheben. */
+    private fun migratedPressureSmoothing(): Float {
+        val stored = sp.getFloat("pressureSmoothing", DEFAULT_PRESSURE_SMOOTHING)
+        if (sp.getInt("pressureSmoothingVersion", 0) >= 2) return stored
+        val v = if (stored < DEFAULT_PRESSURE_SMOOTHING) DEFAULT_PRESSURE_SMOOTHING else stored
+        sp.edit().putFloat("pressureSmoothing", v).putInt("pressureSmoothingVersion", 2).apply()
+        return v
+    }
+
     companion object {
         /** Höchstzahl der Größen- bzw. Deckkraftmarken je Pinsel und Werkzeug. */
         const val MAX_MARKS = 4
+        /** Standard der Druckglättung (≈ 28 ms Zeitkonstante): glättet S-Pen-Rauschen, ohne den Druckaufbau zu bremsen. */
+        const val DEFAULT_PRESSURE_SMOOTHING = 0.35f
     }
 
     private fun bez(t: Float, p1: Float, p2: Float): Float {

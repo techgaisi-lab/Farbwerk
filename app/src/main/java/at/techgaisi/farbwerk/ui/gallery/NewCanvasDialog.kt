@@ -73,8 +73,24 @@ import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.roundToInt
 
-/** Ergebnis des Dialogs "Neue Leinwand". */
-data class CanvasSpec(val name: String, val width: Int, val height: Int, val dpi: Int, val background: Int)
+/**
+ * Ergebnis des Dialogs "Neue Leinwand". [width]/[height]/[dpi] sind die gewählten (logischen) Maße; [detail] ist
+ * die Feinberechnung (1 oder 2) – die Leinwand wird mit [pixelWidth] × [pixelHeight] Pixeln angelegt.
+ */
+data class CanvasSpec(
+    val name: String, val width: Int, val height: Int, val dpi: Int, val background: Int, val detail: Int = 1,
+) {
+    val pixelWidth: Int get() = width * detail
+    val pixelHeight: Int get() = height * detail
+    val pixelDpi: Int get() = (dpi * detail).coerceAtMost(4800)
+}
+
+/** Feinberechnung 2× ist möglich, wenn die doppelten Maße in die Leinwandgrenzen passen (≤ 8192 px, ≤ 25 MP). */
+fun highQualityPossible(w: Int, h: Int): Boolean =
+    w * 2 <= Importers.MAX_SIDE && h * 2 <= Importers.MAX_SIDE && (w * 2L) * (h * 2L) <= Importers.MAX_CANVAS_PIXELS
+
+/** Merkt sich die Wahl „Hohe Qualität (2×)“ für die laufende Sitzung (Standard: an). */
+internal object NewCanvasMemory { var highQuality by mutableStateOf(true) }
 
 /** Lokale Optik-Werte der Galerie (UI_SPEC §0, §3, §9) – bewusst nicht in Theme.kt. */
 internal object GalleryTokens {
@@ -159,22 +175,56 @@ fun NewCanvasDialog(onDismiss: () -> Unit, onCreate: (CanvasSpec) -> Unit) {
                 contentAlignment = Alignment.Center
             ) { FolderPlusIcon(Modifier.size(width = 24.dp, height = 20.dp)) }
         }
+        HighQualityRow()
+        Hairline()
 
         Column(Modifier.verticalScroll(rememberScrollState()).padding(bottom = 8.dp)) {
             // Erste Zeile abgesetzt
-            TemplateRow(templates.first()) { dismiss { onCreate(spec(templates.first())) } }
+            val hq = NewCanvasMemory.highQuality
+            TemplateRow(templates.first(), hq) { dismiss { onCreate(spec(templates.first(), hq)) } }
             Spacer(Modifier.height(18.dp))
             Hairline()
             templates.drop(1).forEachIndexed { i, t ->
                 if (i > 0) Hairline()
-                TemplateRow(t) { dismiss { onCreate(spec(t)) } }
+                TemplateRow(t, hq) { dismiss { onCreate(spec(t, hq)) } }
             }
         }
     }
 }
 
 private fun px(w: Int, h: Int) = "$w × ${h}px"
-private fun spec(t: Template) = CanvasSpec("Ohne Titel", t.w, t.h, t.dpi, 0xFFFFFFFF.toInt())
+private fun detailFor(w: Int, h: Int, hq: Boolean) = if (hq && highQualityPossible(w, h)) 2 else 1
+private fun spec(t: Template, hq: Boolean) =
+    CanvasSpec("Ohne Titel", t.w, t.h, t.dpi, 0xFFFFFFFF.toInt(), detailFor(t.w, t.h, hq))
+
+/** Schalter „Hohe Qualität (2×)“: Leinwand intern mit doppelter Auflösung (Pinsel wirken gleich groß). */
+@Composable
+private fun HighQualityRow() {
+    val on = NewCanvasMemory.highQuality
+    Row(
+        Modifier.fillMaxWidth().clickable { NewCanvasMemory.highQuality = !on }
+            .padding(start = 16.dp, end = 12.dp, top = 4.dp, bottom = 8.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Column(Modifier.weight(1f)) {
+            Text("Hohe Qualität (2×)", color = GalleryTokens.textPrimary, fontSize = 14.sp)
+            Text("Doppelte Auflösung – auch stark gezoomt scharf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
+                maxLines = 1, overflow = TextOverflow.Ellipsis)
+        }
+        MiniSwitch(on)
+    }
+}
+
+/** Kleiner Schalter im Stil der Galerie. */
+@Composable
+private fun MiniSwitch(on: Boolean) {
+    Box(
+        Modifier.size(width = 40.dp, height = 24.dp).clip(RoundedCornerShape(12.dp))
+            .background(if (on) GalleryTokens.accent else GalleryTokens.panelInset)
+            .padding(3.dp),
+        contentAlignment = if (on) Alignment.CenterEnd else Alignment.CenterStart
+    ) { Box(Modifier.size(18.dp).clip(CircleShape).background(Color.White)) }
+}
 
 @Composable
 private fun Hairline() {
@@ -182,7 +232,10 @@ private fun Hairline() {
 }
 
 @Composable
-private fun TemplateRow(t: Template, onClick: () -> Unit) {
+private fun TemplateRow(t: Template, hq: Boolean, onClick: () -> Unit) {
+    // Pixel-Vorlagen zeigen die tatsächlich angelegten Pixelmaße
+    val k = detailFor(t.w, t.h, hq)
+    val pill = if (t.pill == px(t.w, t.h)) px(t.w * k, t.h * k) else t.pill
     Row(
         Modifier.fillMaxWidth().height(34.dp).clickable(onClick = onClick).padding(start = 16.dp, end = 12.dp),
         verticalAlignment = Alignment.CenterVertically
@@ -194,7 +247,7 @@ private fun TemplateRow(t: Template, onClick: () -> Unit) {
             Modifier.width(104.dp).clip(RoundedCornerShape(5.dp)).background(GalleryTokens.panelInset)
                 .padding(vertical = 3.dp),
             contentAlignment = Alignment.Center
-        ) { Text(t.pill, color = GalleryTokens.textPrimary, fontSize = 11.sp, maxLines = 1) }
+        ) { Text(pill, color = GalleryTokens.textPrimary, fontSize = 11.sp, maxLines = 1) }
     }
 }
 
@@ -342,11 +395,13 @@ private fun CustomCanvasDialog(onBack: () -> Unit, onCreate: (CanvasSpec) -> Uni
         wPx.toLong() * hPx > Importers.MAX_CANVAS_PIXELS -> "Zu groß (max. 25 Megapixel)"
         else -> null
     }
+    val hq = NewCanvasMemory.highQuality
+    val detail = if (error == null) detailFor(wPx, hPx, hq) else 1
 
     fun fmt(v: Float) = if (unit == SizeUnit.PX) v.roundToInt().toString() else String.format(Locale.GERMANY, "%.1f", v)
 
     FwDialog("Eigene Leinwand", onBack, confirmLabel = "Erstellen", confirmEnabled = error == null,
-        dismissLabel = "Zurück", onConfirm = { onCreate(CanvasSpec(name.trim().ifEmpty { "Ohne Titel" }, wPx, hPx, dpi, bg)) }) {
+        dismissLabel = "Zurück", onConfirm = { onCreate(CanvasSpec(name.trim().ifEmpty { "Ohne Titel" }, wPx, hPx, dpi, bg, detail)) }) {
         Column(Modifier.padding(horizontal = 20.dp)) {
             FwTextField(name, { name = it }, "Name", Modifier.fillMaxWidth())
             Spacer(Modifier.height(12.dp))
@@ -367,7 +422,23 @@ private fun CustomCanvasDialog(onBack: () -> Unit, onCreate: (CanvasSpec) -> Uni
             Spacer(Modifier.height(8.dp))
             FwTextField(dpiText, { dpiText = it.filter(Char::isDigit).take(4) }, "DPI", Modifier.fillMaxWidth(), number = true)
             Spacer(Modifier.height(10.dp))
-            Text(if (error != null) error else "$wPx × $hPx px · max. ${CanvasOps.maxLayers(LocalContext.current, wPx, hPx)} Ebenen",
+            Row(Modifier.fillMaxWidth().clickable { NewCanvasMemory.highQuality = !hq }.padding(vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Hohe Qualität (2×)", color = ui.text, fontSize = 15.sp)
+                    Text(
+                        when {
+                            !hq -> "Aus"
+                            error == null && detail == 1 -> "Bei dieser Größe nicht möglich (max. 8192 px, 25 MP)"
+                            else -> "Doppelte Auflösung – auch stark gezoomt scharf"
+                        },
+                        color = ui.textMuted, fontSize = 12.sp,
+                    )
+                }
+                MiniSwitch(hq)
+            }
+            Spacer(Modifier.height(6.dp))
+            Text(if (error != null) error else "${wPx * detail} × ${hPx * detail} px · max. ${CanvasOps.maxLayers(LocalContext.current, wPx * detail, hPx * detail)} Ebenen",
                 color = if (error != null) Color(0xFFFF5A52) else ui.textMuted, fontSize = 12.sp)
             Spacer(Modifier.height(12.dp))
             Row(verticalAlignment = Alignment.CenterVertically) {

@@ -6,6 +6,7 @@ import android.graphics.BlendMode
 import android.graphics.Canvas
 import android.graphics.Matrix
 import android.graphics.Paint
+import android.graphics.Path
 import android.graphics.PorterDuff
 import android.graphics.PorterDuffXfermode
 import android.graphics.Rect
@@ -20,6 +21,12 @@ import kotlin.math.ceil
  *
  * Zusatzinformationen pro Tupfer stecken in den `flags` (siehe [encodeFlags]), damit die Tupfer-Schnittstelle
  * [DabConsumer] unverändert bleibt.
+ *
+ * Vereinigung ([union]): Deckende, harte runde Tupfer (analytisch, ohne Körnung/Unschärfe) werden gesammelt und
+ * als EIN Pfad gefüllt (Füllregel „non-zero“ → Vereinigung der Formen). Ohne das addieren sich die
+ * kantenglättenden Halbtöne von Dutzenden überlappender Tupfer zu fast deckenden Pixeln – die Kante wird
+ * treppig („pixelig“). Gesammelte Tupfer werden mit [flush] gezeichnet (auch automatisch, sobald ein anderer
+ * Tupfer, eine andere Farbe oder ein anderes Ziel kommt).
  */
 class DabPainter {
     private val m = Matrix()
@@ -36,11 +43,25 @@ class DabPainter {
     private var scratch: Bitmap? = null
     private var scratchCanvas: Canvas? = null
 
+    /** Deckende harte Tupfer als Vereinigung zeichnen (siehe Klassenbeschreibung). Danach [flush] aufrufen. */
+    var union = false
+        set(v) { if (!v) flush(); field = v }
+    /** Pinsel kann vereinigt gezeichnet werden (harte analytische Spitze ohne Körnung). Nach [setup] gültig. */
+    var unionCapable = false
+        private set
+    private var unionCanvas: Canvas? = null
+    private var unionColor = 0
+    private var unionCount = 0
+    private val unionPaths = ArrayList<Path>()
+    private val unionTmp = Path()
+    private val unionMatrix = Matrix()
+
     private var baseShape: Bitmap = BrushTextures.shape(0)
     private var analyticHard = false
     private var grainShader: BitmapShader? = null
     private var grainMask: Bitmap? = null
     private var grainScale = 1f
+    private var detail = 1f
     private var grainMoving = false
     private var grainMovement = 1f
     private var grainZoom = 0f
@@ -49,8 +70,12 @@ class DabPainter {
     private var offX = 0f
     private var offY = 0f
 
-    /** Übernimmt Form und Körnung des Pinsels. Vor jedem Strich aufrufen. */
-    fun setup(brush: Brush) {
+    /**
+     * Übernimmt Form und Körnung des Pinsels. Vor jedem Strich aufrufen. [detailScale] = Feinberechnung des
+     * Dokuments: die im Dokument feste Körnung wird mitskaliert, damit sie physisch gleich groß bleibt.
+     */
+    fun setup(brush: Brush, detailScale: Float = 1f) {
+        detail = detailScale.coerceAtLeast(0.01f)
         val idx = brush.int(BP.SHAPE_KIND)
         val img = brush.shapeImage
         baseShape = img ?: BrushTextures.shape(idx)
@@ -70,12 +95,13 @@ class DabPainter {
             grainPaint.shader = grainShader
         }
         grainPaint.isFilterBitmap = brush.int(BP.GRAIN_FILTER) != 0
-        grainScale = brush[BP.GRAIN_SCALE]
+        grainScale = brush[BP.GRAIN_SCALE] * detail
         grainMoving = brush.int(BP.GRAIN_MODE) == 1
         grainMovement = brush[BP.GRAIN_MOVEMENT]
         grainZoom = brush[BP.GRAIN_ZOOM]
         grainRotation = brush[BP.GRAIN_ROTATION]
         baseDepth = brush[BP.GRAIN_DEPTH]
+        unionCapable = analyticHard && (grainShader == null || baseDepth <= 0.004f) && brush[BP.WET_BLUR] <= 0f
         if (brush.on(BP.GRAIN_OFFSET_JITTER)) {
             offX = (Math.random() * BrushImages.SIZE).toFloat(); offY = (Math.random() * BrushImages.SIZE).toFloat()
         } else { offX = 0f; offY = 0f }
@@ -85,15 +111,66 @@ class DabPainter {
      * Zeichnet einen Tupfer mit Mittelpunkt ([x],[y]).
      * @param angle Drehung in Radiant
      * @param flags siehe [encodeFlags]
+     * @param m optionale zusätzliche Abbildung (Symmetrie-Kopie); [slot] trennt die Vereinigungspfade je Kopie
      */
     fun draw(
         c: Canvas, x: Float, y: Float, diam: Float, aspect: Float, angle: Float,
-        alpha: Float, color: Int, flags: Int,
+        alpha: Float, color: Int, flags: Int, m: Matrix? = null, slot: Int = 0,
     ) {
         if (alpha <= 0.002f || diam <= 0.05f) return
         val g = grainShader
         val depth = if (flags and FLAG_DEPTH != 0) ((flags shr 8) and 0xFF) / 255f else baseDepth
-        if (g == null || depth <= 0.004f) {
+        val noGrain = g == null || depth <= 0.004f
+        if (union && noGrain && analyticHard && ((flags shr 16) and 0x7) == 0 && (alpha * 255f + 0.5f).toInt() >= 255) {
+            appendUnion(c, x, y, diam, aspect, angle, color, m, slot)
+            return
+        }
+        flush()
+        if (m != null) {
+            c.save(); c.concat(m)
+            drawSingle(c, x, y, diam, aspect, angle, alpha, color, flags, noGrain, depth)
+            c.restore()
+        } else drawSingle(c, x, y, diam, aspect, angle, alpha, color, flags, noGrain, depth)
+    }
+
+    /** Zeichnet alle gesammelten Vereinigungs-Tupfer (siehe [union]). */
+    fun flush() {
+        val c = unionCanvas ?: return
+        ovalPaint.color = unionColor or (0xFF shl 24)
+        for (p in unionPaths) if (!p.isEmpty) { c.drawPath(p, ovalPaint); p.rewind() }
+        unionCanvas = null
+        unionCount = 0
+    }
+
+    private fun appendUnion(
+        c: Canvas, x: Float, y: Float, diam: Float, aspect: Float, angle: Float, color: Int, m: Matrix?, slot: Int,
+    ) {
+        val rgb = color and 0x00FFFFFF
+        if (unionCanvas !== c || rgb != unionColor || unionCount >= MAX_UNION_DABS) flush()
+        unionCanvas = c
+        unionColor = rgb
+        while (unionPaths.size <= slot) unionPaths.add(Path())
+        val path = unionPaths[slot]
+        val r = diam / 2f
+        if (aspect >= 0.999f && m == null) {
+            path.addCircle(x, y, r, Path.Direction.CW)
+        } else {
+            unionTmp.rewind()
+            unionTmp.addOval(-r, -r * aspect, r, r * aspect, Path.Direction.CW)
+            unionMatrix.setRotate(Math.toDegrees(angle.toDouble()).toFloat())
+            unionMatrix.postTranslate(x, y)
+            if (m != null) unionMatrix.postConcat(m)
+            path.addPath(unionTmp, unionMatrix)
+        }
+        unionCount++
+    }
+
+    private fun drawSingle(
+        c: Canvas, x: Float, y: Float, diam: Float, aspect: Float, angle: Float,
+        alpha: Float, color: Int, flags: Int, noGrain: Boolean, depth: Float,
+    ) {
+        val g = grainShader
+        if (noGrain || g == null) {
             drawShape(c, x, y, diam, aspect, angle, alpha, color, flags)
             return
         }
@@ -109,7 +186,7 @@ class DabPainter {
         drawShape(sc, half, half, diam, aspect, angle, alpha, color, flags)
         // Körnung: Texturiert = fest im Dokument, Bewegt = (je nach "Bewegung") am Tupfer
         if (grainMoving) {
-            val sEff = (grainScale * (1f + grainZoom * (diam / 128f - 1f))).coerceAtLeast(0.03f)
+            val sEff = (grainScale * (1f + grainZoom * (diam / detail / 128f - 1f))).coerceAtLeast(0.03f)
             val mv = grainMovement
             grainMatrix.setScale(sEff, sEff)
             grainMatrix.postTranslate(half * mv + (half - x) * (1f - mv) + offX, half * mv + (half - y) * (1f - mv) + offY)
@@ -176,11 +253,14 @@ class DabPainter {
 
     /** Gibt den Zwischenspeicher frei. */
     fun release() {
+        flush()
         scratch?.recycle(); scratch = null; scratchCanvas = null
     }
 
     companion object {
         const val MAX_SCRATCH = 1024
+        /** Höchstzahl gesammelter Vereinigungs-Tupfer, bevor gezeichnet wird (Pfadgröße begrenzen). */
+        private const val MAX_UNION_DABS = 4000
         private const val FLAG_DEPTH = 0x80
 
         /**

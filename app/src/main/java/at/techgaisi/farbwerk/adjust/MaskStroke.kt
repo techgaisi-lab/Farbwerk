@@ -59,7 +59,10 @@ internal class MaskStroke {
     }
 
     /** Beginnt einen Strich mit [brush] und Durchmesser [diameter] (Dokumentpixel). */
-    fun begin(brush: Brush, diameter: Float, viewScale: Float, pressureSmoothing: Float, motionFilter: Float, p: InputPoint) {
+    fun begin(
+        brush: Brush, diameter: Float, viewScale: Float, pressureSmoothing: Float, motionFilter: Float, p: InputPoint,
+        detailScale: Float = 1f,
+    ) {
         renderer.brush = brush
         renderer.diameter = diameter
         renderer.opacity = 1f
@@ -70,7 +73,8 @@ internal class MaskStroke {
         renderer.viewScale = viewScale
         renderer.sampler = null
         renderer.sink = sink
-        painter.setup(brush)
+        renderer.detailScale = detailScale
+        painter.setup(brush, detailScale)
         dirty.setEmpty()
         strokeBounds.setEmpty()
         active = true

@@ -139,6 +139,12 @@ class ArtDocument(
     var backgroundColor: Int = Color.WHITE
     var backgroundVisible: Boolean = true
     var dpi: Int = 300
+    /**
+     * Feinberechnung: Pixel pro „logischem“ Pixel. Neue Leinwände werden (wenn möglich) mit doppelter Auflösung
+     * angelegt (2f) – Pinsel, Raster und Text-Standards werden damit multipliziert, damit sie physisch gleich groß
+     * wirken, die Leinwand beim Hineinzoomen aber doppelt so fein aufgelöst ist. Bestehende Dokumente: 1f.
+     */
+    var detailScale: Float = 1f
     var selection: Selection? = null
     val guides = GuideSettings()
     var flipHorizontal: Boolean = false

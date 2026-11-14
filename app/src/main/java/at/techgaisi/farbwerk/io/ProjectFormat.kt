@@ -62,6 +62,7 @@ internal object ProjectFormat {
         o.put("width", doc.width)
         o.put("height", doc.height)
         o.put("dpi", doc.dpi)
+        o.put("detailScale", doc.detailScale.toDouble())
         o.put("backgroundColor", doc.backgroundColor)
         o.put("backgroundVisible", doc.backgroundVisible)
         o.put("activeIndex", doc.activeIndex)
@@ -222,6 +223,8 @@ internal object ProjectFormat {
         require(w in 1..32768 && h in 1..32768) { "Ungültige Leinwandgröße" }
         val doc = ArtDocument(o.optString("name", "Ohne Titel"), w, h, idOverride ?: o.optString("id"))
         doc.dpi = o.optInt("dpi", 300).coerceIn(1, 4800)
+        // Feinberechnung (ältere Projekte ohne Feld: 1×)
+        doc.detailScale = o.optDouble("detailScale", 1.0).toFloat().let { if (it.isNaN()) 1f else it.coerceIn(1f, 4f) }
         doc.backgroundColor = o.optInt("backgroundColor", Color.WHITE)
         doc.backgroundVisible = o.optBoolean("backgroundVisible", true)
         doc.flipHorizontal = o.optBoolean("flipHorizontal", false)

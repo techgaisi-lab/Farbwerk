@@ -255,8 +255,11 @@ fun GalleryScreen(state: EditorState) {
     /** Neue Leinwand aus dem Popover anlegen und öffnen (im geöffneten Stapel direkt dort einsortieren). */
     fun createCanvas(spec: CanvasSpec) {
         showNew = false
-        val doc = ArtDocument.create(spec.name, spec.width, spec.height)
-        doc.dpi = spec.dpi
+        // Feinberechnung: doppelte Pixelmaße (Druckgröße bleibt über die doppelte DPI gleich)
+        val doc = ArtDocument.create(spec.name, spec.pixelWidth, spec.pixelHeight)
+        doc.dpi = spec.pixelDpi
+        doc.detailScale = spec.detail.toFloat()
+        doc.guides.gridSize *= doc.detailScale
         doc.backgroundColor = spec.background
         openStackId?.let { sid -> scope.launch(Dispatchers.IO) { store.moveToStack(listOf(doc.id), sid) } }
         state.openDocument(doc)

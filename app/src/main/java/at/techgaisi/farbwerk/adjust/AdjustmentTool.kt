@@ -1178,7 +1178,7 @@ class AdjustmentTool(private val state: EditorState) : ToolInputHandler {
                     cloneDirty.setEmpty()
                     maskStroke.ensure(fullW, fullH)
                     maskStroke.begin(brush, cloneDiameter(brush), viewScale(), state.prefs.pressureSmoothing,
-                        state.prefs.motionFilteringAmount, p)
+                        state.prefs.motionFilteringAmount, p, state.document?.detailScale ?: 1f)
                 }
             }
             pencilMode -> {
@@ -1194,7 +1194,7 @@ class AdjustmentTool(private val state: EditorState) : ToolInputHandler {
                 drag = Drag.PENCIL
                 maskStroke.ensure(fullW, fullH)
                 maskStroke.begin(brush, state.brushEngine.diameterFor(brush, settings.size), viewScale(),
-                    state.prefs.pressureSmoothing, state.prefs.motionFilteringAmount, p)
+                    state.prefs.pressureSmoothing, state.prefs.motionFilteringAmount, p, state.document?.detailScale ?: 1f)
             }
             k == AdjustmentKind.PERSPECTIVE_BLUR && values[0] >= 0.5f && nearArrowTip(p.x, p.y) -> drag = Drag.ANGLE
             centerActive() && (k == AdjustmentKind.RECOLOR ||

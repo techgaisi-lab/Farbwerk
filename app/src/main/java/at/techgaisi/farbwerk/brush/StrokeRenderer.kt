@@ -2,6 +2,7 @@ package at.techgaisi.farbwerk.brush
 
 import android.graphics.Color
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.ceil
 import kotlin.math.exp
 import kotlin.math.hypot
@@ -88,6 +89,8 @@ class StrokeRenderer {
     var viewScale = 1f
     /** Drehung der Ansicht (Radiant) – für "An Bildschirm ausrichten". */
     var viewRotation = 0f
+    /** Feinberechnung des Dokuments ([at.techgaisi.farbwerk.model.ArtDocument.detailScale]) für feste Pixellängen. */
+    var detailScale = 1f
     var sampler: ColorSampler? = null
     var sink: DabConsumer? = null
 
@@ -118,6 +121,8 @@ class StrokeRenderer {
     private var stabPos = 0
     private var smX = 0f; private var smY = 0f
     private var smP = 1f
+    /** Die beiden letzten (ungeglätteten) Druckwerte für den Median-Vorfilter. */
+    private var rawP1 = 1f; private var rawP2 = 1f
     private var lastRawX = 0f; private var lastRawY = 0f
     private var lastTime = 0L
     private var speed = 0f
@@ -131,6 +136,11 @@ class StrokeRenderer {
 
     private var distAlong = 0f
     private var distToNext = 0f
+    /** Druckabhängiger Durchmesser und Strichposition des vorigen Tupfers (Begrenzung der Breitenänderung). */
+    private var prevPressD = -1f
+    private var prevPressDist = 0f
+    /** Tupferabstand nach dem letzten Tupfer (für die Fortsetzung in [emitTail]). */
+    private var lastStep = 1f
     private var segPa = 1f; private var segPb = 1f
     private var segTa = 0f; private var segTb = 0f
     private var segOa = 0f; private var segOb = 0f
@@ -157,6 +167,8 @@ class StrokeRenderer {
     private var strokeRotOffset = 0f
     private var linearMix = false
     private var expr = 0f
+    /** Durchgehender Strich (solide Spitze ohne Streuung/Stempelabstand) → Mindest-Tupferdichte. */
+    private var continuous = false
 
     // ------------------------------------------------------------ Strich-API
 
@@ -171,6 +183,7 @@ class StrokeRenderer {
         stabCount = 0; stabPos = 0
         val p0 = inputPressure(pressure)
         smP = p0
+        rawP1 = p0; rawP2 = p0
         pressureSum = p0.toDouble(); pressureCount = 1
         smX = x; smY = y
         lastRawX = x; lastRawY = y; lastTime = time
@@ -190,7 +203,10 @@ class StrokeRenderer {
 
         val p = inputPressure(pressure)
         val ps = max(max(globalPressureSmoothing, brush[BP.PRESSURE_SMOOTHING]), brush[BP.STREAMLINE_PRESSURE])
-        smP += (p - smP) * (1f - 0.95f * ps)
+        // Median der letzten drei Werte: einzelne Ausreißer des Digitizers verschwinden vollständig
+        val med = if (ps > 0.001f) max(min(rawP1, rawP2), min(max(rawP1, rawP2), p)) else p
+        rawP1 = rawP2; rawP2 = p
+        smP = filterPressure(smP, med, dt, ps)
         pressureSum += smP; pressureCount++
         // Neigung und Ausrichtung leicht glätten (Ausrichtung über den kürzesten Winkelweg)
         smT += (tilt - smT) * 0.5f
@@ -263,34 +279,58 @@ class StrokeRenderer {
     /** true, wenn das Strichende nach dem Absetzen noch verjüngt werden muss. */
     fun needsEndTaper(): Boolean = taperOn && taperEndLen > 0f && knownTotalLength <= 0f && dabs.size > 1
 
-    /** Erster Tupfer-Index, der von der Ende-Verjüngung betroffen ist. */
-    fun tailStartIndex(): Int {
-        val from = distAlong - taperEndLen
-        var i = dabs.size - 1
-        while (i > 0 && dabs.dist[i - 1] >= from) i--
-        return i
+    /**
+     * Länge (Dokumentpixel), über die das Strichende verjüngt wird, wenn die Verjüngung live – während des
+     * Strichs – angewandt wird; 0 = keine Ende-Verjüngung (oder Form mit bekannter Länge).
+     */
+    val liveEndTaperLength: Float get() = if (taperOn && taperEndLen > 0f && knownTotalLength <= 0f) taperEndLen else 0f
+
+    /** Gibt alle Tupfer erneut aus, wobei das Ende verjüngt wird (z. B. Pinselvorschau). */
+    fun replayWithEndTaper(out: DabConsumer) = emitTail(0, distAlong, true, out)
+
+    /** Länge der Fortsetzung vom letzten Tupfer über die Punkte [xs]/[ys] (Kopf, Vorhersage). */
+    fun extensionLength(xs: FloatArray, ys: FloatArray, n: Int): Float {
+        val l = dabs
+        if (l.size == 0 || n <= 0) return 0f
+        var px = l.x[l.size - 1]; var py = l.y[l.size - 1]
+        var len = 0f
+        for (k in 0 until n) { len += hypot(xs[k] - px, ys[k] - py); px = xs[k]; py = ys[k] }
+        return len
     }
 
+    /** Strichposition des letzten Tupfers (0 ohne Tupfer). */
+    val lastDabDist: Float get() = if (dabs.size == 0) 0f else dabs.dist[dabs.size - 1]
+
     /**
-     * Gibt alle Tupfer erneut aus, wobei das Ende verjüngt wird. Im Endbereich werden bei Bedarf
-     * Zwischen-Tupfer eingefügt, damit die dünne Spitze nicht gepunktet wirkt.
+     * Gibt das (noch veränderliche) Strichende aus: Tupfer ab Index [from], mit Ende-Verjüngung relativ zur
+     * Strichlänge [total] (wenn [taper]). Bei dünn werdender Spitze werden Zwischen-Tupfer eingefügt, damit sie
+     * nicht gepunktet wirkt. Optional folgt eine Fortsetzung entlang [extX]/[extY] (aktuelle Kopfposition und
+     * Bewegungsvorhersage) mit Größe/Form/Farbe des letzten Tupfers – so zeigt die Live-Ansicht schon während des
+     * Malens die Spitze, die beim Absetzen an dieser Stelle entstünde.
      */
-    fun replayWithEndTaper(out: DabConsumer) {
+    fun emitTail(
+        from: Int, total: Float, taper: Boolean, out: DabConsumer,
+        extX: FloatArray? = null, extY: FloatArray? = null, extN: Int = 0, to: Int = dabs.size,
+    ) {
         val l = dabs
-        val total = distAlong
+        val useTaper = taper && taperEndLen > 0f
         val simple = brush.int(BP.COUNT) <= 1 && brush[BP.JITTER] <= 0.001f
         val tSize = taperSizeAmt; val tOp = taperOpAmt
-        val spacing = brush[BP.SPACING]
-        for (i in 0 until l.size) {
-            val f = endFactor(total, l.dist[i])
+        val spacing = min(brush[BP.SPACING], if (continuous) MAX_CONTINUOUS_SPACING else 3f)
+        val end = to.coerceAtMost(l.size)
+        for (i in from.coerceAtLeast(0) until end) {
+            val f = if (useTaper) endFactor(total, l.dist[i]) else 1f
             val d = l.diam[i] * (1f - tSize * (1f - f))
             val a = l.alpha[i] * (1f - tOp * (1f - f))
             out.dab(l.x[i], l.y[i], max(d, 0.3f), l.aspect[i], l.angle[i], a, l.color[i], l.flags[i])
-            if (simple && f < 1f && i + 1 < l.size) {
+            if (simple && f < 1f && i + 1 < end) {
+                // Abstand im Verhältnis zur (verjüngten) Größe beibehalten – nicht dichter als im übrigen Strich,
+                // sonst wird die Spitze bei lasierenden/körnigen Pinseln dunkler
                 val gap = hypot(l.x[i + 1] - l.x[i], l.y[i + 1] - l.y[i])
-                val step = max(0.3f, spacing * max(d, 0.3f))
+                val rel = min(gap / max(l.diam[i], 0.3f), max(spacing, 0.01f))
+                val step = max(0.3f, rel * max(d, 0.3f))
                 if (gap > step * 1.5f) {
-                    val k = min(ceil(gap / step).toInt() - 1, 64)
+                    val k = min((gap / step).roundToInt() - 1, 64)
                     for (j in 1..k) {
                         val t = j / (k + 1f)
                         val ds = l.dist[i] + (l.dist[i + 1] - l.dist[i]) * t
@@ -304,6 +344,31 @@ class StrokeRenderer {
                     }
                 }
             }
+        }
+        if (extX == null || extY == null || extN <= 0 || l.size == 0 || end < l.size) return
+        // Fortsetzung (Kopf + Vorhersage) – nur Vorschau, wird nie aufgezeichnet
+        val i = l.size - 1
+        val len = extensionLength(extX, extY, extN)
+        if (len < 0.5f) return
+        val d0 = l.diam[i]; val asp = l.aspect[i]; val ang = l.angle[i]
+        val a0 = l.alpha[i]; val col = l.color[i]; val fl = l.flags[i]
+        val frac = (lastStep / max(d0, 0.3f)).coerceAtLeast(0.001f)
+        val minStep = max(0.3f, len / MAX_EXTENSION_DABS)
+        var ax = l.x[i]; var ay = l.y[i]
+        var walked = 0f
+        var next = max(minStep, frac * d0)
+        for (k in 0 until extN) {
+            val bx = extX[k]; val by = extY[k]
+            val seg = hypot(bx - ax, by - ay)
+            while (seg > 0f && next <= walked + seg) {
+                val u = (next - walked) / seg
+                val f = if (useTaper) endFactor(total, l.dist[i] + next) else 1f
+                val d = max(d0 * (1f - tSize * (1f - f)), 0.3f)
+                out.dab(ax + (bx - ax) * u, ay + (by - ay) * u, d, asp, ang, a0 * (1f - tOp * (1f - f)), col, fl)
+                next += max(minStep, frac * (if (simple) d else d0))
+            }
+            walked += seg
+            ax = bx; ay = by
         }
     }
 
@@ -320,6 +385,7 @@ class StrokeRenderer {
         dabs.clear()
         wCount = 0
         distAlong = 0f; distToNext = 0f
+        prevPressD = -1f; prevPressDist = 0f
         if (reseed) {
             seed = System.nanoTime() or 1L
             rng = seed
@@ -349,12 +415,14 @@ class StrokeRenderer {
             taperSizeAmt = b[BP.TOUCH_TAPER_SIZE]; taperOpAmt = b[BP.TOUCH_TAPER_OPACITY]; taperPressAmt = 0f
         }
         taperOn = tStart > 0f || tEnd > 0f
-        val base = diameter * 8f + 150f
+        val base = diameter * 8f + 150f * detailScale
         taperStartLen = tStart * base
         taperEndLen = tEnd * base
         taperExp = 1.6f + (0.45f - 1.6f) * tTip
         expr = b[BP.MOTION_FILTER_EXPR]
         linearMix = b.on(BP.LUMINANCE_BLEND)
+        continuous = b[BP.SPACING] <= 0.25f && b[BP.JITTER] <= 0.001f && b[BP.JITTER_LONG] <= 0.001f &&
+            b[BP.SCATTER] <= 0.001f && b.int(BP.COUNT) <= 1 && b.int(BP.ROTATION_MODE) != RotationMode.RANDOM
         strokeRotOffset = if (b.on(BP.SHAPE_RANDOMIZE)) rand() * 2f * PI.toFloat() else 0f
         val s = b[BP.STREAMLINE]
         streamK = 1f - s.pow(0.6f) * 0.93f
@@ -375,6 +443,22 @@ class StrokeRenderer {
         if (b[BP.STROKE_SECONDARY_JITTER] > 0f) c = mixC(c, secondaryColor, b[BP.STROKE_SECONDARY_JITTER] * rand())
         strokeColor = c
         carR = Color.red(c).toFloat(); carG = Color.green(c).toFloat(); carB = Color.blue(c).toFloat()
+    }
+
+    /**
+     * Zeitbasierte Druckglättung (unabhängig von der Abtastrate des Stifts). [ps] 0..1 ergibt eine Zeitkonstante
+     * bis [PRESSURE_TAU_MS]. Kleine Abweichungen (Digitizer-Rauschen, Quantisierung) werden voll geglättet; große
+     * Abweichungen – gewollter Druckaufbau oder -abbau – verkürzen die Zeitkonstante, damit der Strich nicht träge
+     * auf den Druck reagiert (einzelne Ausreißer hat der Median-Vorfilter da bereits entfernt).
+     */
+    private fun filterPressure(prev: Float, p: Float, dtMs: Float, ps: Float): Float {
+        if (ps <= 0.001f) return p
+        val tau = ps * PRESSURE_TAU_MS
+        val e = abs(p - prev)
+        val u = ((e - 0.06f) / 0.24f).coerceIn(0f, 1f)
+        val tauEff = tau * (1f - 0.8f * u * u * (3f - 2f * u))
+        val a = 1f - exp(-dtMs / tauEff.coerceAtLeast(0.5f))
+        return prev + (p - prev) * a
     }
 
     private fun inputPressure(raw: Float): Float {
@@ -478,9 +562,14 @@ class StrokeRenderer {
             if (taperPressAmt > 0f) tf += (1f - tf) * taperPressAmt * p
         }
 
-        // Größe
-        var d = diameter
-        d *= 1f - b[BP.PRESSURE_SIZE] * (1f - p)
+        // Größe: druckabhängiger Anteil mit begrenzter Änderungsrate entlang des Strichs – einzelne
+        // Ausreißer im Stiftdruck erzeugen so keine sichtbaren Sprünge an der Strichkante
+        var d = diameter * (1f - b[BP.PRESSURE_SIZE] * (1f - p))
+        if (prevPressD >= 0f) {
+            val maxStep = MAX_WIDTH_SLOPE * (distAlong - prevPressDist) + 0.002f * diameter
+            d = d.coerceIn(prevPressD - maxStep, prevPressD + maxStep)
+        }
+        prevPressD = d; prevPressDist = distAlong
         d *= 1f + b[BP.TILT_SIZE] * tiltT
         d *= signedSpeed(b[BP.SPEED_SIZE], speedNorm).coerceAtLeast(0.05f)
         d *= 1f - taperSizeAmt * (1f - tf)
@@ -494,8 +583,9 @@ class StrokeRenderer {
         a *= 1f - 0.6f * b[BP.TILT_GRADATION] * tiltT
         a *= signedSpeed(b[BP.SPEED_OPACITY], speedNorm).coerceAtLeast(0f)
         a *= 1f - taperOpAmt * (1f - tf)
-        if (b[BP.FALLOFF] > 0f) a *= 1f - b[BP.FALLOFF] * min(1f, distAlong / 1500f)
-        if (b[BP.CHARGE] < 0.999f) a *= exp(-distAlong / (b[BP.CHARGE] * 4000f + 60f))
+        val distL = distAlong / detailScale
+        if (b[BP.FALLOFF] > 0f) a *= 1f - b[BP.FALLOFF] * min(1f, distL / 1500f)
+        if (b[BP.CHARGE] < 0.999f) a *= exp(-distL / (b[BP.CHARGE] * 4000f + 60f))
         a *= 1f - 0.85f * m(BP.DILUTION, p, tiltT)
         a *= m(BP.ATTACK, p, tiltT)
         if (heavy) a *= opacity
@@ -507,7 +597,11 @@ class StrokeRenderer {
         // Harte runde Spitze ohne Streuung: Abstand begrenzen, damit die Strichkante auch bei
         // starkem Zoom glatt ist und keine "Perlenkette" aus einzelnen Tupfern zeigt
         if (sj <= 0f && b[BP.SHAPE_KIND].toInt() == ShapeKind.HARD.ordinal && b[BP.JITTER] <= 0.001f) sp = sp.coerceAtMost(0.035f)
+        // Mindest-Tupferdichte für durchgehende Striche (keine Streuung, kein bewusster Stempelabstand):
+        // auch "Tempo → Abstand" darf die Kante nicht in einzelne Tupfer zerfallen lassen
+        if (continuous && sj <= 0f) sp = sp.coerceAtMost(MAX_CONTINUOUS_SPACING)
         distToNext = max(0.3f, sp * d)
+        lastStep = distToNext
         headDiameter = d
 
         // Farbe: Druck/Neigung → Farbton/Sättigung/Helligkeit/Sekundärfarbe
@@ -628,6 +722,14 @@ class StrokeRenderer {
     }
 
     companion object {
+        /** Zeitkonstante der Druckglättung bei 100 % (ms). */
+        const val PRESSURE_TAU_MS = 80f
+        /** Größte Breitenänderung des druckabhängigen Durchmessers pro Pixel Strichlänge (Kantenwinkel ≈ 14°). */
+        const val MAX_WIDTH_SLOPE = 1.0f
+        /** Größter Tupferabstand (Anteil des Durchmessers) für durchgehende Striche. */
+        const val MAX_CONTINUOUS_SPACING = 0.1f
+        /** Höchstzahl der Vorschau-Tupfer der Fortsetzung (Kopf + Vorhersage). */
+        private const val MAX_EXTENSION_DABS = 300f
         private const val HALF_PI = (PI / 2.0).toFloat()
         private const val TWO_PI = (PI * 2.0).toFloat()
 

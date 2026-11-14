@@ -318,8 +318,9 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val inv = Matrix(); m.invert(inv)
         val pt = floatArrayOf(hoverX, hoverY); inv.mapPoints(pt)
         try {
+            // "Cursor anzeigen: Beim Malen" → kein Pinselumriss beim Schweben (Pipetten-Ring bleibt)
             hoverPreview.draw(canvas, m, hoverX, hoverY, pt[0], pt[1], hoverTilt, hoverOrient, hoverEraser,
-                showBrush = true, pipette = pipette)
+                showBrush = state.prefs.cursorVisibility != 1, pipette = pipette)
         } catch (t: Throwable) { android.util.Log.e("Farbwerk", "hover", t) }
     }
 
@@ -574,6 +575,9 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         samsungButtonEvent = false
         when (e.actionMasked) {
             MotionEvent.ACTION_HOVER_ENTER, MotionEvent.ACTION_HOVER_MOVE -> {
+                // Manche Digitizer melden Schwebe-Ereignisse noch kurz nach dem Aufsetzen: während eines
+                // Stiftstrichs nie die Schwebevorschau (Pinselumriss mit Füllung) aktivieren
+                if (mode == Mode.STROKE && strokeIsStylus) return true
                 if (!hovering) hoverPreview.reset()
                 hovering = true
                 lastHoverTime = e.eventTime

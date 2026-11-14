@@ -29,7 +29,7 @@ object TextLayers {
         val d = TextData().apply {
             text = initial
             color = state.color or (0xFF shl 24)
-            size = (minOf(doc.width, doc.height) / 10f).coerceIn(16f, 600f)
+            size = (minOf(doc.width, doc.height) / 10f).coerceIn(16f * doc.detailScale, 600f * doc.detailScale)
         }
         val laid = TextRenderer.layout(d)
         d.x = (doc.width - laid.width) / 2f

@@ -270,6 +270,7 @@ fun CanvasInfoDialog(state: EditorState, onDismiss: () -> Unit) {
             Spacer(Modifier.height(8.dp))
         }
         InfoLine("Abmessungen", "${doc.width} × ${doc.height} px")
+        if (doc.detailScale > 1f) InfoLine("Feinberechnung", "${doc.detailScale.toInt()}× (hohe Qualität)")
         InfoLine("Druckgröße", String.format(Locale.GERMANY, "%.1f × %.1f cm", cmW, cmH))
         InfoLine("Ebenen", "${doc.layers.size} von max. ${CanvasOps.maxLayers(state.context, doc.width, doc.height)}")
         InfoLine("Arbeitsspeicher (Ebenen)", "$memMb MB")

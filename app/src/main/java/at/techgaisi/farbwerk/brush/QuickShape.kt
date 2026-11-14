@@ -143,12 +143,17 @@ class QShape(val kind: Kind) {
 object QuickShapeDetector {
     private const val N = 96
 
-    fun detect(px: FloatBuf, py: FloatBuf): QShape? {
+    /** Pixel pro logischem Pixel (Feinberechnung) – feste Toleranzen in Pixeln werden damit skaliert. */
+    private var unit = 1f
+
+    /** @param detailScale Feinberechnung des Dokuments (feste Pixel-Toleranzen werden mitskaliert) */
+    fun detect(px: FloatBuf, py: FloatBuf, detailScale: Float = 1f): QShape? {
         if (px.size < 3) return null
+        unit = detailScale.coerceAtLeast(0.01f)
         // 1) gleichmäßig nach Bogenlänge abtasten
         var total = 0f
         for (i in 1 until px.size) total += hypot(px[i] - px[i - 1], py[i] - py[i - 1])
-        if (total < 12f) return null
+        if (total < 12f * unit) return null
         val xs = FloatArray(N); val ys = FloatArray(N)
         resample(px, py, total, xs, ys)
 
@@ -164,7 +169,7 @@ object QuickShapeDetector {
             var maxDev = 0f
             val dx = (xs[N - 1] - xs[0]) / chord; val dy = (ys[N - 1] - ys[0]) / chord
             for (i in 0 until N) maxDev = max(maxDev, abs((xs[i] - xs[0]) * dy - (ys[i] - ys[0]) * dx))
-            if (chord > 0.8f * total && maxDev < 0.07f * chord + 3f) {
+            if (chord > 0.8f * total && maxDev < 0.07f * chord + 3f * unit) {
                 return QShape(QShape.Kind.LINE).apply { pts = floatArrayOf(xs[0], ys[0], xs[N - 1], ys[N - 1]) }
             }
         }
@@ -394,7 +399,7 @@ object QuickShapeDetector {
         val ux = (a2 * (by - cy) + b2 * (cy - ay) + c2 * (ay - by)) / d
         val uy = (a2 * (cx - bx) + b2 * (ax - cx) + c2 * (bx - ax)) / d
         val r = hypot(ax - ux, ay - uy)
-        if (r < 4f) return null
+        if (r < 4f * unit) return null
         var err = 0f
         for (i in 0 until N) err += abs(hypot(xs[i] - ux, ys[i] - uy) - r)
         err /= N

@@ -63,6 +63,7 @@ object CanvasOps {
         }
         val doc = ArtDocument(old.name, newW, newH, old.id)
         doc.dpi = dpi
+        doc.detailScale = old.detailScale
         doc.backgroundColor = old.backgroundColor
         doc.backgroundVisible = old.backgroundVisible
         doc.flipHorizontal = old.flipHorizontal

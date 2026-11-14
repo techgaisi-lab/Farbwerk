@@ -206,7 +206,7 @@ private fun PressurePage(p: Prefs) {
         ActionGroup {
             ActionRow("Alle Werte zurücksetzen", accent = true) {
                 p.pressureCurve = DEFAULT_CURVE
-                p.pressureSmoothing = 0.1f; p.motionFilteringAmount = 0f; p.save()
+                p.pressureSmoothing = Prefs.DEFAULT_PRESSURE_SMOOTHING; p.motionFilteringAmount = 0f; p.save()
             }
         }
     }

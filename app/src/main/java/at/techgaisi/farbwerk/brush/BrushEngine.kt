@@ -32,6 +32,12 @@ import kotlin.math.max
  * der Compositor über [Layer.drawOverride] Ebene + Puffer (mit Strichdeckkraft, Mischmodus, DST_OUT beim
  * Radieren, SRC_ATOP bei Alpha-Sperre). Beim Absetzen wird der Puffer einmal mit der eingestellten Deckkraft in die
  * Ebene gemischt – ein Strich überschreitet also nie die eingestellte Deckkraft.
+ *
+ * Live = Ergebnis: Endgültige Tupfer werden fest in den Puffer gezeichnet. Das noch veränderliche Strichende
+ * (Ende-Verjüngung, bei harten Spitzen ein kurzes Stück für saubere Kanten) und die Bewegungsvorhersage werden vor
+ * jedem Bild neu in den Puffer gezeichnet ([refreshLive]) – der darunterliegende Pufferinhalt wird vorher gesichert
+ * und danach wiederhergestellt ([TailStash]). Die Live-Ansicht zeigt so schon während des Malens genau den Strich,
+ * der beim Absetzen entsteht (inkl. verjüngter Spitze, gleiche Deckkraft), statt nachträglich umzuzeichnen.
  * Wischen: arbeitet direkt auf der Ebene (siehe [Smudger]).
  *
  * QuickShape: Nach dem Halten wird der Strich durch eine perfekte Form ersetzt; solange gehalten wird,
@@ -104,8 +110,36 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private var predN = 0
     private val predX = FloatArray(MAX_PREDICTED)
     private val predY = FloatArray(MAX_PREDICTED)
-    private val predRect = RectF()
-    private val predBounds = RectF()
+    /** Fortsetzung des Strichs für die Live-Ansicht: aktuelle Kopfposition + Vorhersage. */
+    private val extX = FloatArray(MAX_PREDICTED + 1)
+    private val extY = FloatArray(MAX_PREDICTED + 1)
+
+    // Live-Strichende (siehe Klassenbeschreibung)
+    /** Tupfer werden nicht sofort gezeichnet, sondern von [refreshLive] (Malen/Radieren während eines Strichs). */
+    private var deferDabs = false
+    /** Anzahl der Tupfer, die endgültig im Puffer stehen. */
+    private var committed = 0
+    /** Mindestlänge eines festzuschreibenden Abschnitts (harte Spitzen: weniger Nahtstellen der Vereinigung). */
+    private var chunkLen = 0f
+    /** Neue Eingabe/Vorhersage seit dem letzten [refreshLive]. */
+    private var liveStale = false
+    private val stash = TailStash()
+    /** Seit der letzten Anzeige veränderter Pufferbereich (für [tiles]). */
+    private val changed = RectF()
+    /** Anzeige-Kacheln des Puffers: nur geänderte Kacheln müssen pro Bild neu zur GPU. */
+    private val tiles = BufferTiles()
+    private val tailBounds = RectF()
+    private val stashRect = Rect()
+    // Nahtstelle zwischen zwei festgeschriebenen Abschnitten (nur vereinigt gezeichnete harte Spitzen, ohne Symmetrie)
+    private var junction = TailStash()
+    private var jNext = TailStash()
+    private var jValid = false
+    private val jRect = Rect()
+    private val pendingJ = Rect()
+    /** Index des ersten Tupfers des Abschnitts, an dessen Ende [jRect] liegt. */
+    private var jFrom = 0
+    /** Halbe Kantenlänge des Nahtbereichs (Dokumentpixel). */
+    private var jReach = 0f
 
     // Overlay
     private val cursorPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = 1.5f }
@@ -117,16 +151,26 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     // ------------------------------------------------------------ Tupfer-Ziele
 
     /** Malen/Radieren: in den Strich-Puffer, plus alle Symmetrie-Kopien. */
-    private val paintSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
+    private val drawSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
         val bc = bufferCanvas ?: return@DabConsumer
         painter.draw(bc, x, y, d, asp, ang, a, c, f)
         addDirty(x, y, d, null)
-        for (m in symm) {
-            bc.save(); bc.concat(m)
-            painter.draw(bc, x, y, d, asp, ang, a, c, f)
-            bc.restore()
+        for (i in symm.indices) {
+            val m = symm[i]
+            painter.draw(bc, x, y, d, asp, ang, a, c, f, m, i + 1)
             addDirty(x, y, d, m)
         }
+    }
+
+    /** Ziel des Renderers: während eines Strichs nur aufzeichnen ([refreshLive] zeichnet), sonst sofort zeichnen. */
+    private val paintSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
+        if (!deferDabs) drawSink.dab(x, y, d, asp, ang, a, c, f)
+    }
+
+    /** Sammelt nur die Ausdehnung (für die Sicherung des Pufferbereichs unter dem Strichende). */
+    private val boundsSink = DabConsumer { x, y, d, _, _, _, _, _ ->
+        val r = d * 0.75f + 2f
+        tailBounds.union(x - r, y - r, x + r, y + r)
     }
 
     /** Wischen: direkt in der Ebene. */
@@ -141,21 +185,6 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
     }
 
-    /** Ende-Verjüngung: nur Tupfer zeichnen, die den neu zu zeichnenden Bereich berühren. */
-    private val replayRect = RectF()
-    private val replaySink = DabConsumer { x, y, d, asp, ang, a, c, f ->
-        val bc = bufferCanvas ?: return@DabConsumer
-        val r = d * 0.75f + 2f
-        tmpRect.set(x - r, y - r, x + r, y + r)
-        if (RectF.intersects(tmpRect, replayRect)) painter.draw(bc, x, y, d, asp, ang, a, c, f)
-        for (m in symm) {
-            tmpRect.set(x - r, y - r, x + r, y + r); m.mapRect(tmpRect)
-            if (RectF.intersects(tmpRect, replayRect)) {
-                bc.save(); bc.concat(m); painter.draw(bc, x, y, d, asp, ang, a, c, f); bc.restore()
-            }
-        }
-    }
-
     private val sampler = ColorSampler { x, y ->
         val l = layer ?: return@ColorSampler 0
         val ix = x.toInt(); val iy = y.toInt()
@@ -166,16 +195,16 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private val override: (Canvas) -> Unit = { c ->
         val l = layer; val buf = buffer
         if (l != null && buf != null) {
+            if (liveStale) { liveStale = false; if (active && deferDabs && shape == null) refreshLive(final = false) }
             c.drawBitmap(l.bitmap, 0f, 0f, plainPaint)
             val sel = state.document?.selection?.path
             if (sel != null) { c.save(); c.clipPath(sel) }
             if (!dirty.isEmpty) {
                 c.save(); c.clipRect(dirty)
-                drawBuffer(c, buf)
+                drawBufferLive(c, buf)
                 c.restore()
             }
             if (sel != null) c.restore()
-            if (predN > 0) drawPrediction(c, sel)
         }
     }
 
@@ -218,7 +247,20 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         renderer.globalMotionFilter = state.prefs.motionFilteringAmount
         renderer.viewScale = viewScaleInternal()
         renderer.sampler = if (tool == Tool.PAINT) sampler else null
-        painter.setup(brush)
+        renderer.detailScale = doc.detailScale
+        painter.setup(brush, doc.detailScale)
+        painter.union = tool != Tool.SMUDGE
+        deferDabs = tool != Tool.SMUDGE
+        committed = 0
+        liveStale = false
+        stash.discard()
+        // Harte, deckende Spitzen werden vereinigt gezeichnet (saubere Kanten); längere Abschnitte = weniger Nähte
+        val dMax = diameter * (1f + max(0f, brush[BP.TILT_SIZE]))
+        jReach = 0.8f * dMax + 3f
+        jValid = false
+        chunkLen = if (deferDabs && painter.unionCapable && brush[BP.FLOW] >= 0.999f &&
+            brush[BP.PRESSURE_OPACITY] <= 0f && brush[BP.PRESSURE_FLOW] <= 0f
+        ) max(3f * dMax, 48f) else 0f
 
         when (tool) {
             Tool.SMUDGE -> {
@@ -278,6 +320,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
         val last = points.last()
         lastX = last.x; lastY = last.y
+        liveStale = true
     }
 
     override fun onStrokeEnd(p: InputPoint) {
@@ -287,7 +330,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             assist.map(p.x, p.y, apt)
             renderer.add(apt[0], apt[1], p.pressure, p.tilt, p.orientation, p.time)
             renderer.end()
-            if (strokeTool != Tool.SMUDGE && renderer.needsEndTaper()) applyEndTaper()
+            if (deferDabs) refreshLive(final = true)
         }
         finish()
     }
@@ -295,6 +338,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     override fun onStrokeCancel() {
         if (active) {
             layer?.drawOverride = null
+            painter.flush()
+            stash.discard()
             clearBuffer()
             edit?.cancel()
         }
@@ -310,7 +355,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             for (i in 0 until n) { predX[i] = points[i].x; predY[i] = points[i].y }
             predN = n
         }
-        if (had || predN > 0) state.canvasView?.postInvalidateOnAnimation()
+        if (had || predN > 0) {
+            liveStale = true
+            state.canvasView?.postInvalidateOnAnimation()
+        }
     }
 
     /**
@@ -324,60 +372,125 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     /**
-     * Zeichnet die Vorhersage: vom letzten echten Tupfer über die aktuelle Kopfposition zu den vorhergesagten
-     * Punkten, mit Größe/Form/Farbe des letzten Tupfers. Über eine Offscreen-Ebene mit [mergePaint], damit
-     * Deckkraft, Mischmodus und Radieren (DST_OUT) genau wie beim fertigen Strich wirken.
+     * Aktualisiert das veränderliche Strichende im Puffer (siehe Klassenbeschreibung):
+     *  1. vorher gezeichnetes Strichende wiederherstellen (gesicherter Pufferinhalt),
+     *  2. Tupfer, die sich nicht mehr ändern können (außerhalb der Ende-Verjüngung), fest zeichnen,
+     *  3. Pufferbereich unter dem neuen Strichende sichern und Strichende + Fortsetzung (Kopf, Vorhersage) zeichnen.
+     * [final] (Absetzen): restliche Tupfer mit der endgültigen Verjüngung fest zeichnen, keine Vorhersage.
      */
-    private fun drawPrediction(c: Canvas, sel: android.graphics.Path?) {
+    private fun refreshLive(final: Boolean) {
+        val bc = bufferCanvas ?: return
+        val buf = buffer ?: return
+        painter.flush()
+        stash.restore(bc, changed)
         val l = renderer.dabs
-        if (l.size == 0) return
-        val i = l.size - 1
-        val d = l.diam[i]; val asp = l.aspect[i]; val ang = l.angle[i]
-        val a = l.alpha[i]; val col = l.color[i]; val f = l.flags[i]
-        val r = d * 0.75f + 2f
-        predRect.set(l.x[i] - r, l.y[i] - r, l.x[i] + r, l.y[i] + r)
-        predRect.union(renderer.headX - r, renderer.headY - r, renderer.headX + r, renderer.headY + r)
-        for (k in 0 until predN) predRect.union(predX[k] - r, predY[k] - r, predX[k] + r, predY[k] + r)
-        // Gesamtlänge → Schrittweite (höchstens MAX_PREDICTED_DABS Tupfer)
-        var len = hypot(renderer.headX - l.x[i], renderer.headY - l.y[i])
-        var px = renderer.headX; var py = renderer.headY
-        for (k in 0 until predN) { len += hypot(predX[k] - px, predY[k] - py); px = predX[k]; py = predY[k] }
-        if (len < 0.5f) return
-        val step = max(max(0.3f, renderer.brush[BP.SPACING] * d), len / MAX_PREDICTED_DABS)
-
-        predBounds.set(predRect)
-        for (m in symm) { tmpRect.set(predRect); m.mapRect(tmpRect); predBounds.union(tmpRect) }
-        val sc = c.saveLayer(predBounds, mergePaint)
-        if (sel != null) c.clipPath(sel)
-        var carry = step
-        var ax = l.x[i]; var ay = l.y[i]
-        for (k in -1 until predN) {
-            val bx = if (k < 0) renderer.headX else predX[k]
-            val by = if (k < 0) renderer.headY else predY[k]
-            val segLen = hypot(bx - ax, by - ay)
-            var t = carry
-            while (t <= segLen) {
-                val fr = t / segLen
-                val x = ax + (bx - ax) * fr; val y = ay + (by - ay) * fr
-                painter.draw(c, x, y, d, asp, ang, a, col, f)
-                for (m in symm) {
-                    c.save(); c.concat(m)
-                    painter.draw(c, x, y, d, asp, ang, a, col, f)
-                    c.restore()
-                }
-                t += step
-            }
-            carry = t - segLen
-            ax = bx; ay = by
+        val n = l.size
+        val total = renderer.totalLength
+        if (final) {
+            drawSpan(committed, n, total, renderer.needsEndTaper(), 0)
+            committed = n
+            return
         }
-        c.restoreToCount(sc)
+        // 2. endgültige Tupfer festschreiben
+        val limit = total - renderer.liveEndTaperLength
+        var f = committed
+        while (f < n && l.dist[f] <= limit) f++
+        if (f > committed && (chunkLen <= 0f || l.dist[f - 1] - l.dist[committed] >= chunkLen)) {
+            commitSpan(f, total)
+        }
+        // 3. Strichende + Fortsetzung (Kopf + Vorhersage)
+        var en = 0
+        if (predN > 0 && n > 0) {
+            extX[0] = renderer.headX; extY[0] = renderer.headY; en = 1
+            for (k in 0 until predN) { extX[en] = predX[k]; extY[en] = predY[k]; en++ }
+        }
+        val liveTotal = if (en > 0) max(total, renderer.lastDabDist + renderer.extensionLength(extX, extY, en)) else total
+        val taper = renderer.liveEndTaperLength > 0f
+        if (committed >= n && en == 0) return
+        tailBounds.setEmpty()
+        renderer.emitTail(committed, liveTotal, taper, boundsSink, extX, extY, en)
+        if (tailBounds.isEmpty) return
+        stashRegion(buf, tailBounds, null)
+        for (m in symm) stashRegion(buf, tailBounds, m)
+        if (jValid) stash.save(buf, jRect)
+        drawSpan(committed, n, liveTotal, taper, en)
+    }
+
+    /**
+     * Schreibt die Tupfer [committed]..[to] fest. Bei vereinigt gezeichneten harten Spitzen wird vorher der
+     * Pufferzustand um das Abschnittsende gesichert ([junction]), damit der nächste Abschnitt dort nahtlos
+     * anschließen kann (siehe [drawSpan]).
+     */
+    private fun commitSpan(to: Int, total: Float) {
+        val buf = buffer ?: return
+        val bc = bufferCanvas ?: return
+        val l = renderer.dabs
+        // Nahtstelle am Ende dieses Abschnitts: Zustand VOR dem Zeichnen sichern
+        var newJ = false
+        if (chunkLen > 0f && symm.isEmpty() && to > 0) {
+            val x = l.x[to - 1]; val y = l.y[to - 1]
+            stashRect.set(floor(x - jReach).toInt(), floor(y - jReach).toInt(), ceil(x + jReach).toInt(), ceil(y + jReach).toInt())
+            newJ = stashRect.intersect(0, 0, buf.width, buf.height) && !(jValid && Rect.intersects(stashRect, jRect))
+        }
+        if (jValid) junction.peek(bc, changed)
+        val oldValid = jValid
+        if (newJ) {
+            // alter Nahtbereich liegt (falls vorhanden) außerhalb → aktueller Inhalt = Zustand vor diesem Abschnitt
+            pendingJ.set(stashRect)
+            jNext.discard(); jNext.save(buf, stashRect)
+        }
+        jValid = oldValid
+        drawSpan(committed, to, total, false, 0, peeked = true)
+        jFrom = committed
+        committed = to
+        // neue Nahtstelle übernehmen
+        jValid = newJ
+        if (newJ) { jRect.set(pendingJ); val t = junction; junction = jNext; jNext = t }
+    }
+
+    /**
+     * Zeichnet Tupfer [from]..[to] (+ Fortsetzung mit [en] Punkten) in den Puffer. Nahtreparatur: Bei vereinigt
+     * gezeichneten harten Spitzen überlappen sich zwei getrennt gefüllte Abschnitte an der Grenze – ihre
+     * Kantenglättung würde sich dort addieren (dunklere Kantenpixel). Im (pixelgenauen) Nahtbereich wird daher
+     * der Zustand vor dem vorigen Abschnitt eingesetzt und die Vereinigung beider Abschnitte gezeichnet; außerhalb
+     * nur der neue Abschnitt.
+     */
+    private fun drawSpan(from: Int, to: Int, total: Float, taper: Boolean, en: Int, peeked: Boolean = false) {
+        val bc = bufferCanvas ?: return
+        if (!jValid) {
+            renderer.emitTail(from, total, taper, drawSink, extX, extY, en, to)
+            painter.flush()
+            return
+        }
+        if (!peeked) junction.peek(bc, changed)
+        // Tupfer des vorigen Abschnitts, die den Nahtbereich erreichen können
+        val l = renderer.dabs
+        var a0 = from
+        val reach = 2f * jReach
+        while (a0 > jFrom && a0 - 1 < l.size && l.dist[from - 1] - l.dist[a0 - 1] <= reach) a0--
+        bc.save(); bc.clipRect(jRect)
+        renderer.emitTail(a0, total, taper, drawSink, extX, extY, en, to)
+        painter.flush()
+        bc.restore()
+        bc.save(); bc.clipOutRect(jRect)
+        renderer.emitTail(from, total, taper, drawSink, extX, extY, en, to)
+        painter.flush()
+        bc.restore()
+    }
+
+    private fun stashRegion(buf: Bitmap, r: RectF, m: Matrix?) {
+        tmpRect.set(r)
+        m?.mapRect(tmpRect)
+        stashRect.set(floor(tmpRect.left).toInt() - 1, floor(tmpRect.top).toInt() - 1, ceil(tmpRect.right).toInt() + 1, ceil(tmpRect.bottom).toInt() + 1)
+        if (!stashRect.intersect(0, 0, buf.width, buf.height)) return
+        stash.save(buf, stashRect)
     }
 
     override fun onHoldStill(p: InputPoint) {
         if (!active || !state.prefs.quickShapeEnabled) return
         val sh = shape
         if (sh == null) {
-            val det = QuickShapeDetector.detect(renderer.pathX, renderer.pathY) ?: return
+            val det = QuickShapeDetector.detect(renderer.pathX, renderer.pathY, state.document?.detailScale ?: 1f) ?: return
             shape = det
             shapePressure = renderer.meanPressure.coerceIn(0.05f, 1f)
             holdX = p.x; holdY = p.y
@@ -413,7 +526,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             canvas.drawCircle(tmpPts[0], tmpPts[1], 7f, anchorPaint)
             return
         }
-        if (!state.prefs.brushCursor) return
+        // Pinselcursor beim Malen nur, wenn eingestellt ("Cursor anzeigen": beim Malen bzw. beides)
+        if (!state.prefs.brushCursor || state.prefs.cursorVisibility == 0) return
         tmpPts[0] = renderer.headX; tmpPts[1] = renderer.headY
         docToView.mapPoints(tmpPts)
         docToView.getValues(mValues)
@@ -427,14 +541,19 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
 
     // ------------------------------------------------------------ öffentliche Hilfen
 
-    /** Pinseldurchmesser in Dokumentpixeln für einen Größe-Wert 0..1. */
+    /**
+     * Pinseldurchmesser in Dokumentpixeln für einen Größe-Wert 0..1. Mit der Feinberechnung des Dokuments
+     * multipliziert – auf einer 2×-Leinwand ist der Pinsel physisch gleich groß wie auf einer 1×-Leinwand.
+     */
     fun diameterFor(brush: Brush, size: Float): Float {
         val minS = brush[BP.MIN_SIZE]
         val maxS = max(brush[BP.MAX_SIZE], minS)
         val s = size.coerceIn(0f, 1f)
         var d = minS + (maxS - minS) * s * s
         // Dynamische Pinselskalierung aus: Größe bezieht sich auf den Bildschirm, nicht auf die Leinwand
+        // (dann ist die Feinberechnung über den Zoom bereits enthalten)
         if (!state.prefs.dynamicBrushScaling) d /= viewScaleInternal().coerceAtLeast(0.01f)
+        else d *= state.document?.detailScale ?: 1f
         return d
     }
 
@@ -494,6 +613,20 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         reset()
     }
 
+    /**
+     * Live-Anzeige des Strich-Puffers: über [tiles] statt der dokumentgroßen Bitmap – sonst müsste die ganze
+     * Pufferbitmap bei jedem Bild neu zur GPU übertragen werden (bei 2×-Leinwänden ~90 MB pro Bild).
+     */
+    private fun drawBufferLive(c: Canvas, buf: Bitmap) {
+        tiles.sync(buf, changed)
+        changed.setEmpty()
+        if (thresholdOn) {
+            val sc = c.saveLayer(null, mergePaint)
+            tiles.draw(c, dirty, thresholdPaint)
+            c.restoreToCount(sc)
+        } else tiles.draw(c, dirty, mergePaint)
+    }
+
     /** Zeichnet den Strich-Puffer mit Strichdeckkraft/Mischmodus (und ggf. Alpha-Schwelle). */
     private fun drawBuffer(c: Canvas, buf: Bitmap) {
         if (thresholdOn) {
@@ -514,6 +647,11 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
 
     private fun reset() {
         predN = 0
+        painter.flush()
+        stash.discard()
+        junction.discard(); jNext.discard(); jValid = false
+        deferDabs = false
+        liveStale = false
         assist.end()
         active = false
         layer = null
@@ -531,12 +669,14 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             val nb = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
             buffer = nb
             bufferCanvas = Canvas(nb)
+            tiles.release()
+            changed.setEmpty()
         }
     }
 
     private fun clearBuffer() {
         val bc = bufferCanvas ?: return
-        if (!dirty.isEmpty) bc.drawRect(dirty, clearPaint)
+        if (!dirty.isEmpty) { bc.drawRect(dirty, clearPaint); changed.union(dirty) }
     }
 
     private fun addDirty(x: Float, y: Float, d: Float, m: Matrix?) {
@@ -544,6 +684,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         tmpRect.set(x - r, y - r, x + r, y + r)
         m?.mapRect(tmpRect)
         dirty.union(tmpRect)
+        changed.union(tmpRect)
     }
 
     /** Drehwinkel einer Symmetrie-Matrix (für die Ausrichtung beim Wischen). */
@@ -563,26 +704,6 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val m = state.canvasView?.docToViewMatrix() ?: return 0f
         m.getValues(mValues)
         return atan2(mValues[Matrix.MSKEW_Y], mValues[Matrix.MSCALE_X])
-    }
-
-    /** Ende des Strichs verjüngen: betroffenen Bereich leeren und alle berührenden Tupfer neu zeichnen. */
-    private fun applyEndTaper() {
-        val bc = bufferCanvas ?: return
-        val l = renderer.dabs
-        val from = renderer.tailStartIndex()
-        val tail = RectF()
-        for (i in from until l.size) {
-            val r = l.diam[i] * 0.75f + 2f
-            tail.union(l.x[i] - r, l.y[i] - r, l.x[i] + r, l.y[i] + r)
-        }
-        if (tail.isEmpty) return
-        replayRect.set(tail)
-        for (m in symm) { tmpRect.set(tail); m.mapRect(tmpRect); replayRect.union(tmpRect) }
-        bc.save()
-        bc.clipRect(replayRect)
-        bc.drawRect(replayRect, clearPaint)
-        renderer.replayWithEndTaper(replaySink)
-        bc.restore()
     }
 
     // ------------------------------------------------------------ QuickShape
@@ -620,10 +741,16 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             }
             smudger.begin(renderer.diameter, 1 + symm.size)
         } else {
+            // Form ersetzt den Strich: Live-Strichende verwerfen, ab jetzt wird sofort gezeichnet
+            painter.flush()
+            stash.discard()
+            jValid = false
+            deferDabs = false
             clearBuffer()
         }
         // Bereich bleibt als Vereinigung erhalten (für Undo/Puffer-Löschen), neu zeichnen
         renderer.renderPath(shapeXs.data, shapeYs.data, n, sh.closed, shapePressure)
+        painter.flush()
         state.canvasView?.postInvalidateOnAnimation()
     }
 
@@ -648,7 +775,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         renderer.secondaryColor = ls.secondary
         renderer.sampler = null
         renderer.sink = paintSink
-        painter.setup(ls.brush)
+        renderer.detailScale = doc.detailScale
+        painter.setup(ls.brush, doc.detailScale)
+        painter.union = true
+        deferDabs = false
         symm = ls.symm
         mergePaint.alpha = ls.mergeAlpha
         mergePaint.blendMode = ls.blend
@@ -669,7 +799,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             if (!dirty.isEmpty) {
                 c.save(); c.clipRect(dirty)
                 ls.selPath?.let { c.clipPath(it) }
-                drawBuffer(c, buf)
+                drawBufferLive(c, buf)
                 c.restore()
             }
         }
@@ -687,6 +817,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         clearBuffer()
         dirty.setEmpty()
         renderer.renderPath(shapeXs.data, shapeYs.data, n, shape.closed, ls.pressure)
+        painter.flush()
         state.canvasView?.postInvalidateOnAnimation()
     }
 
@@ -756,7 +887,6 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private companion object {
         const val EDIT_SHAPE_LABEL = "Form bearbeiten"
         const val MAX_PREDICTED = 32
-        const val MAX_PREDICTED_DABS = 300f
     }
 
     /** Gibt Speicher frei (z. B. beim Schließen eines Dokuments). */
@@ -764,7 +894,142 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         if (editor != null) { clearBuffer(); endShapeEdit() }
         lastShape = null
         buffer?.recycle(); buffer = null; bufferCanvas = null
+        stash.release(); junction.release(); jNext.release()
+        tiles.release(); changed.setEmpty()
         painter.release()
         smudger.release()
     }
+}
+
+/**
+ * Sicherung von Pufferbereichen unter dem live gezeichneten Strichende: [save] kopiert einen Bereich (1:1,
+ * vormultipliziert, ohne Filterung), [restore] schreibt alle gesicherten Bereiche zurück. Bitmaps werden
+ * wiederverwendet.
+ */
+private class TailStash {
+    private val rects = ArrayList<Rect>()
+    private val bmps = ArrayList<Bitmap>()
+    private val canvases = ArrayList<Canvas>()
+    private var count = 0
+    private val src = Rect()
+    private val dst = Rect()
+    private val copyPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+
+    fun save(buf: Bitmap, r: Rect) {
+        if (r.isEmpty) return
+        val w = r.width(); val h = r.height()
+        if (count == bmps.size || bmps[count].width < w || bmps[count].height < h) {
+            val bw = ((w + 63) / 64) * 64; val bh = ((h + 63) / 64) * 64
+            val b = Bitmap.createBitmap(
+                maxOf(bw, bmps.getOrNull(count)?.width ?: 0), maxOf(bh, bmps.getOrNull(count)?.height ?: 0),
+                Bitmap.Config.ARGB_8888,
+            )
+            if (count == bmps.size) { bmps.add(b); canvases.add(Canvas(b)); rects.add(Rect()) }
+            else { bmps[count].recycle(); bmps[count] = b; canvases[count] = Canvas(b) }
+        }
+        dst.set(0, 0, w, h)
+        canvases[count].drawBitmap(buf, r, dst, copyPaint)
+        rects[count].set(r)
+        count++
+    }
+
+    fun restore(c: Canvas, changed: RectF) {
+        peek(c, changed)
+        count = 0
+    }
+
+    /** Schreibt die gesicherten Bereiche zurück, behält sie aber (für erneutes Einsetzen). */
+    fun peek(c: Canvas, changed: RectF) {
+        for (i in count - 1 downTo 0) {
+            val r = rects[i]
+            src.set(0, 0, r.width(), r.height())
+            c.drawBitmap(bmps[i], src, r, copyPaint)
+            changed.union(r.left.toFloat(), r.top.toFloat(), r.right.toFloat(), r.bottom.toFloat())
+        }
+    }
+
+    fun discard() { count = 0 }
+
+    fun release() {
+        for (b in bmps) b.recycle()
+        bmps.clear(); canvases.clear(); rects.clear(); count = 0
+    }
+}
+
+/**
+ * Anzeige-Kacheln des Strich-Puffers (je [T]×[T] Dokumentpixel plus 1 Pixel Rand aus den Nachbarkacheln, damit die
+ * bilineare Filterung beim Zoomen an den Kachelgrenzen keine Nähte zeigt). [sync] kopiert geänderte Bereiche aus
+ * dem Puffer; nur diese Kacheln ändern sich und werden von der GPU neu geladen.
+ */
+private class BufferTiles {
+    private var nx = 0
+    private var ny = 0
+    private var w = 0
+    private var h = 0
+    private var tiles = arrayOfNulls<Bitmap>(0)
+    private var canvases = arrayOfNulls<Canvas>(0)
+    private val src = Rect()
+    private val dst = Rect()
+    private val dstF = RectF()
+    private val clip = Rect()
+    private val copyPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+
+    private fun ensure(buf: Bitmap) {
+        if (buf.width == w && buf.height == h && tiles.isNotEmpty()) return
+        release()
+        w = buf.width; h = buf.height
+        nx = (w + T - 1) / T; ny = (h + T - 1) / T
+        tiles = arrayOfNulls(nx * ny)
+        canvases = arrayOfNulls(nx * ny)
+    }
+
+    /** Überträgt den Bereich [r] (Dokumentpixel) aus [buf] in die betroffenen Kacheln. */
+    fun sync(buf: Bitmap, r: RectF) {
+        if (r.isEmpty) return
+        ensure(buf)
+        val l = max(0, floor(r.left).toInt() - 1); val t = max(0, floor(r.top).toInt() - 1)
+        val rr = minOf(w, ceil(r.right).toInt() + 1); val bb = minOf(h, ceil(r.bottom).toInt() + 1)
+        if (l >= rr || t >= bb) return
+        // Kacheln, deren Bereich inkl. Rand (x0−1 … x0+T+1) das Rechteck berührt
+        val i0 = max(0, (l - 1) / T); val i1 = minOf(nx - 1, rr / T)
+        val j0 = max(0, (t - 1) / T); val j1 = minOf(ny - 1, bb / T)
+        for (j in j0..j1) for (i in i0..i1) {
+            val x0 = i * T - 1; val y0 = j * T - 1
+            src.set(max(l, x0), max(t, y0), minOf(rr, x0 + T + 2), minOf(bb, y0 + T + 2))
+            if (src.isEmpty) continue
+            val k = j * nx + i
+            var c = canvases[k]
+            if (c == null) {
+                val b = Bitmap.createBitmap(T + 2, T + 2, Bitmap.Config.ARGB_8888)
+                tiles[k] = b; c = Canvas(b); canvases[k] = c
+                // neue Kachel: ganzen Bereich übernehmen (sonst fehlte älterer Pufferinhalt)
+                src.set(max(0, x0), max(0, y0), minOf(w, x0 + T + 2), minOf(h, y0 + T + 2))
+            }
+            dst.set(src.left - x0, src.top - y0, src.right - x0, src.bottom - y0)
+            c.drawBitmap(buf, src, dst, copyPaint)
+        }
+    }
+
+    /** Zeichnet alle vorhandenen Kacheln, die [area] berühren, mit [paint] an ihre Dokumentposition. */
+    fun draw(c: Canvas, area: RectF, paint: Paint) {
+        if (tiles.isEmpty() || area.isEmpty) return
+        val i0 = max(0, floor(area.left).toInt() / T); val i1 = minOf(nx - 1, ceil(area.right).toInt() / T)
+        val j0 = max(0, floor(area.top).toInt() / T); val j1 = minOf(ny - 1, ceil(area.bottom).toInt() / T)
+        for (j in j0..j1) for (i in i0..i1) {
+            val b = tiles[j * nx + i] ?: continue
+            val cw = minOf(T, w - i * T); val ch = minOf(T, h - j * T)
+            if (cw <= 0 || ch <= 0) continue
+            clip.set(1, 1, 1 + cw, 1 + ch)
+            dstF.set((i * T).toFloat(), (j * T).toFloat(), (i * T + cw).toFloat(), (j * T + ch).toFloat())
+            c.drawBitmap(b, clip, dstF, paint)
+        }
+    }
+
+    fun release() {
+        for (b in tiles) b?.recycle()
+        tiles = arrayOfNulls(0); canvases = arrayOfNulls(0)
+        nx = 0; ny = 0; w = 0; h = 0
+    }
+
+    private companion object { const val T = 256 }
 }
