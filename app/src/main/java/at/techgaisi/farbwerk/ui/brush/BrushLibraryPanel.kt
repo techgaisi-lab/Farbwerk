@@ -738,8 +738,8 @@ private fun SetRow(
 private class SwipeActionSpec(val icon: ImageVector, val label: String, val color: Color, val action: () -> Unit)
 
 /** Seitenverhältnis der Strichvorschau (Zeilenbreite ≈ 340 dp × ~30 dp). */
-private const val PREVIEW_W = 704
-private const val PREVIEW_H = 64
+private const val PREVIEW_W = at.techgaisi.farbwerk.brush.BrushLibrary.PANEL_PREVIEW_W
+private const val PREVIEW_H = at.techgaisi.farbwerk.brush.BrushLibrary.PANEL_PREVIEW_H
 
 /**
  * Strichvorschau eines Pinsels: weißer Strich auf transparentem Grund (unabhängig von der Malfarbe),

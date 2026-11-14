@@ -106,6 +106,10 @@ class EditorState(val context: Context) {
 
     // ---------------- Werkzeuge ----------------
     val brushLibrary = BrushLibrary(context)
+    init {
+        // Pinselvorschauen beim Start im Hintergrund vorladen (Festplatten-Cache, sonst rendern)
+        brushLibrary.warmUp()
+    }
     val toolSettings: Map<Tool, ToolSettings> = mapOf(
         Tool.PAINT to ToolSettings(brushLibrary.defaultBrushId(Tool.PAINT), 0.2f, 1f),
         Tool.SMUDGE to ToolSettings(brushLibrary.defaultBrushId(Tool.SMUDGE), 0.3f, 0.8f),

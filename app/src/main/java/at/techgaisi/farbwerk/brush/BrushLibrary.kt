@@ -67,7 +67,7 @@ class BrushLibrary(private val context: Context) {
 
     private val file = File(context.filesDir, "brushes.json")
     private val imgDir = File(context.filesDir, "brushimg")
-    private val previews = object : LruCache<String, Bitmap>(24 * 1024 * 1024) {
+    private val previews = object : LruCache<String, Bitmap>(72 * 1024 * 1024) {
         override fun sizeOf(key: String, value: Bitmap) = value.allocationByteCount
     }
 
@@ -579,10 +579,42 @@ class BrushLibrary(private val context: Context) {
     fun preview(b: Brush, w: Int = 420, h: Int = 96): Bitmap {
         val key = previewKey(b, w, h)
         synchronized(previews) { previews.get(key)?.let { return it } }
-        val bmp = renderPreview(b, w, h)
+        // Festplatten-Cache: Vorschauen überleben App-Neustarts, Rendern nur beim ersten Mal
+        val file = File(previewDir, "${Integer.toHexString(key.hashCode())}_${key.length}.png")
+        val fromDisk = try {
+            if (file.exists()) android.graphics.BitmapFactory.decodeFile(file.path)?.takeIf { it.width == w && it.height == h } else null
+        } catch (_: Throwable) { null }
+        val bmp = fromDisk ?: renderPreview(b, w, h).also { rendered ->
+            try {
+                previewDir.mkdirs()
+                file.outputStream().use { rendered.compress(Bitmap.CompressFormat.PNG, 100, it) }
+            } catch (_: Throwable) {}
+        }
         synchronized(previews) { previews.put(key, bmp) }
         return bmp
     }
+
+    private val previewDir = File(context.cacheDir, "brush_previews")
+    @Volatile private var warmedUp = false
+
+    /**
+     * Lädt bzw. rendert beim App-Start im Hintergrund die Vorschauen aller Pinsel vor,
+     * damit die Pinselbibliothek sofort vollständig erscheint.
+     */
+    fun warmUp(w: Int = PANEL_PREVIEW_W, h: Int = PANEL_PREVIEW_H) {
+        if (warmedUp) return
+        warmedUp = true
+        Thread({
+            try {
+                for (set in sets()) for (b in brushes(set.id)) {
+                    try { preview(b, w, h) } catch (_: Throwable) {}
+                }
+            } catch (t: Throwable) {
+                Log.w("Farbwerk", "Pinselvorschauen vorladen fehlgeschlagen", t)
+            }
+        }, "Pinselvorschau").apply { priority = Thread.MIN_PRIORITY; isDaemon = true }.start()
+    }
+
 
     fun cachedPreview(b: Brush, w: Int = 420, h: Int = 96): Bitmap? =
         synchronized(previews) { previews.get(previewKey(b, w, h)) }
@@ -714,6 +746,9 @@ class BrushLibrary(private val context: Context) {
     }
 
     companion object {
+        /** Größe der Strichvorschau in der Pinselbibliothek (px). */
+        const val PANEL_PREVIEW_W = 704
+        const val PANEL_PREVIEW_H = 64
         const val SET_RECENT = "_recent"
         const val SET_FAVORITES = "_favorites"
         const val SET_CUSTOM = "eigene"

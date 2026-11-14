@@ -115,7 +115,8 @@ object Compositor {
     private val ctx = ThreadLocal.withInitial { Ctx() }
 
     /** Ab diesem Zoomfaktor werden Pixel scharf (ohne Interpolation) dargestellt. */
-    private const val PIXEL_ZOOM = 2f
+    /** Ab diesem Zoom würde ohne Filter gezeichnet – praktisch nie: Leinwand wird immer weich interpoliert. */
+    private const val PIXEL_ZOOM = Float.MAX_VALUE
 
     /** Größte Dokumentkante für den GPU-Pfad (Texturgrenze gängiger GPUs). */
     private const val GPU_MAX_SIZE = 8192
@@ -252,7 +253,7 @@ object Compositor {
         try {
             composeSoftware(tmp, 0, 0, doc, layers, top + 1, false, forceVisible, c)
             val p = c.direct
-            p.alpha = 255; p.blendMode = BlendMode.SRC_OVER; p.isFilterBitmap = false
+            p.alpha = 255; p.blendMode = BlendMode.SRC_OVER; p.isFilterBitmap = true
             canvas.drawBitmap(tmp, 0f, 0f, p)
             drawRange(canvas, doc, layers, top + 1, layers.size, false, forceVisible, c)
         } finally {
