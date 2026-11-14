@@ -62,6 +62,12 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private var symmAngles = FloatArray(0)
     private val mValues = FloatArray(9)
     private val dirty = RectF()
+    /**
+     * Vom Strich berührte Kacheln ([PixelEdit.TILE], Zeile · Spalten + Spalte): Nur dort enthält der Puffer etwas.
+     * Einmischen, Undo-Sicherung und Leeren beschränken sich darauf statt auf das ganze umschließende Rechteck.
+     */
+    private val touched = java.util.BitSet()
+    private val tileRect = Rect()
     private val tmpRect = RectF()
     private val tmpPts = FloatArray(2)
 
@@ -173,16 +179,24 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         tailBounds.union(x - r, y - r, x + r, y + r)
     }
 
-    /** Wischen: direkt in der Ebene. */
+    /** Wischen: direkt in der Ebene (Originalpixel werden vor jedem Tupfer kachelweise gesichert, siehe [protect]). */
     private val smudgeSink = DabConsumer { x, y, d, asp, ang, a, _, f ->
         val lc = layerCanvas ?: return@DabConsumer
         val l = layer ?: return@DabConsumer
+        protect(x, y, d)
         smudger.dab(0, lc, l.bitmap, x, y, d, asp, ang, a, f, dirty)
         for (i in symm.indices) {
             tmpPts[0] = x; tmpPts[1] = y
             symm[i].mapPoints(tmpPts)
+            protect(tmpPts[0], tmpPts[1], d)
             smudger.dab(i + 1, lc, l.bitmap, tmpPts[0], tmpPts[1], d, asp, ang + symmAngles[i], a, f, dirty)
         }
+    }
+
+    /** Sichert (Undo) den Bereich, den ein Wisch-Tupfer an ([x], [y]) mit Durchmesser [d] verändern kann. */
+    private fun protect(x: Float, y: Float, d: Float) {
+        val h = d / 2f
+        edit?.protect(floor(x - h).toInt() - 2, floor(y - h).toInt() - 2, ceil(x + h).toInt() + 2, ceil(y + h).toInt() + 2)
     }
 
     private val sampler = ColorSampler { x, y ->
@@ -227,10 +241,12 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         state.brushLibrary.markUsed(brush.id)
 
         layer = l
-        edit = state.beginPixelEdit(l)
+        // Keine Kopie der ganzen Ebene beim Aufsetzen (bei 2×-Leinwänden ~90 MB): Malen/Radieren verändert die
+        // Ebene erst beim Absetzen (Bereich wird dann gesichert), Wischen sichert vor jedem Tupfer kachelweise.
+        edit = state.beginLazyPixelEdit(l)
         symm = Symmetry.matrices(doc)
         symmAngles = FloatArray(symm.size) { symmAngle(symm[it]) }
-        dirty.setEmpty()
+        resetDirty()
 
         val opacity = brush[BP.MIN_OPACITY] + (brush[BP.MAX_OPACITY] - brush[BP.MIN_OPACITY]) * settings.opacity.coerceIn(0f, 1f)
         val diameter = diameterFor(brush, settings.size)
@@ -577,6 +593,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val e = edit
         val sh = shape
         if (l != null && e != null) {
+            val r = Rect(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt())
+            r.intersect(0, 0, l.width, l.height)
             if (strokeTool != Tool.SMUDGE) {
                 val buf = buffer
                 val b = strokeBrush
@@ -584,17 +602,17 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
                     if (b != null && strokeTool == Tool.PAINT && StrokeEffects.needsPostPass(b)) {
                         StrokeEffects.apply(buf, dirty, b, renderer.diameter)
                     }
+                    // Originalpixel der berührten Kacheln sichern, bevor der Puffer in die Ebene gemischt wird
+                    forEachTouchedTile { tr -> e.protect(tr.left, tr.top, tr.right, tr.bottom) }
                     mergeBuffer(l, buf, state.document?.selection?.path)
                 }
                 l.drawOverride = null
             }
-            val r = Rect(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt())
-            r.intersect(0, 0, l.width, l.height)
             // QuickShape: Zustand für "Form bearbeiten" merken (nicht beim Wischen)
             val doc = state.document
             val b = strokeBrush
             val remember = sh != null && strokeTool != Tool.SMUDGE && !dirty.isEmpty && doc != null && b != null && !r.isEmpty
-            val pre = if (remember) Bitmap.createBitmap(e.original, r.left, r.top, r.width(), r.height()) else null
+            val pre = if (remember) e.originalRegion(r) else null
             clearBuffer()
             if (dirty.isEmpty) e.cancel()
             else e.commit(r, if (sh != null) "QuickShape" else when (strokeTool) { Tool.SMUDGE -> "Wischen"; Tool.ERASE -> "Radieren"; else -> "Pinselstrich" })
@@ -636,13 +654,47 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         } else c.drawBitmap(buf, 0f, 0f, mergePaint)
     }
 
+    /**
+     * Mischt den Puffer in die Ebene – je berührter Kachel (außerhalb ist der Puffer leer, und ein leerer Puffer
+     * verändert die Ebene in keinem der Mischmodi). Mit Auswahl in einem Durchgang wie bisher: Die Kantenglättung
+     * des Auswahlpfads als Clip hängt in Skia vom Clip-Rechteck ab und wäre an Kachelgrenzen minimal anders.
+     */
     private fun mergeBuffer(l: Layer, buf: Bitmap, sel: android.graphics.Path?) {
         val c = Canvas(l.bitmap)
-        c.save()
-        c.clipRect(dirty)
-        if (sel != null) c.clipPath(sel)
-        drawBuffer(c, buf)
-        c.restore()
+        if (sel != null) {
+            c.save()
+            c.clipRect(dirty)
+            c.clipPath(sel)
+            drawBuffer(c, buf)
+            c.restore()
+            return
+        }
+        forEachTouchedTile { tr ->
+            c.save()
+            c.clipRect(dirty)
+            c.clipRect(tr)
+            drawBuffer(c, buf)
+            c.restore()
+        }
+    }
+
+    /** Ruft [fn] für jede berührte Kachel (Rechteck in Dokumentpixeln, auf den Puffer begrenzt) auf. */
+    private inline fun forEachTouchedTile(fn: (Rect) -> Unit) {
+        val buf = buffer ?: return
+        val t = PixelEdit.TILE
+        val nx = (buf.width + t - 1) / t
+        var k = touched.nextSetBit(0)
+        while (k >= 0) {
+            val x0 = (k % nx) * t; val y0 = (k / nx) * t
+            tileRect.set(x0, y0, minOf(buf.width, x0 + t), minOf(buf.height, y0 + t))
+            if (!tileRect.isEmpty) fn(tileRect)
+            k = touched.nextSetBit(k + 1)
+        }
+    }
+
+    private fun resetDirty() {
+        dirty.setEmpty()
+        touched.clear()
     }
 
     private fun reset() {
@@ -674,9 +726,19 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
     }
 
+    /**
+     * Leert den Strichbereich im Puffer. Die Anzeige-Kacheln werden direkt mitgeleert – sonst müsste der nächste
+     * Strich im ersten Bild den ganzen (leeren) Bereich des vorigen Strichs neu in die Kacheln kopieren.
+     */
     private fun clearBuffer() {
         val bc = bufferCanvas ?: return
-        if (!dirty.isEmpty) { bc.drawRect(dirty, clearPaint); changed.union(dirty) }
+        if (dirty.isEmpty) return
+        // Nur berührte Kacheln enthalten etwas (der übrige Puffer ist schon leer)
+        forEachTouchedTile { tr ->
+            bc.drawRect(tr, clearPaint)
+            tmpRect.set(tr)
+            tiles.clear(tmpRect)
+        }
     }
 
     private fun addDirty(x: Float, y: Float, d: Float, m: Matrix?) {
@@ -685,6 +747,17 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         m?.mapRect(tmpRect)
         dirty.union(tmpRect)
         changed.union(tmpRect)
+        markTouched(tmpRect)
+    }
+
+    private fun markTouched(r: RectF) {
+        val buf = buffer ?: return
+        val t = PixelEdit.TILE
+        val l = max(0, floor(r.left).toInt()); val tp = max(0, floor(r.top).toInt())
+        val rr = minOf(buf.width, ceil(r.right).toInt()); val bb = minOf(buf.height, ceil(r.bottom).toInt())
+        if (l >= rr || tp >= bb) return
+        val nx = (buf.width + t - 1) / t
+        for (j in tp / t..(bb - 1) / t) touched.set(j * nx + l / t, j * nx + (rr - 1) / t + 1)
     }
 
     /** Drehwinkel einer Symmetrie-Matrix (für die Ausrichtung beim Wischen). */
@@ -734,10 +807,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             // Ebene im bisher veränderten Bereich wiederherstellen
             val e = edit ?: return
             if (!dirty.isEmpty) {
-                val c = Canvas(l.bitmap)
-                c.save(); c.clipRect(dirty)
-                c.drawBitmap(e.original, 0f, 0f, restorePaint)
-                c.restore()
+                e.restore(Rect(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt()))
             }
             smudger.begin(renderer.diameter, 1 + symm.size)
         } else {
@@ -767,7 +837,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         editAfter = Bitmap.createBitmap(l.bitmap, ls.r0.left, ls.r0.top, ls.r0.width(), ls.r0.height())
         Canvas(l.bitmap).drawBitmap(ls.pre, ls.r0.left.toFloat(), ls.r0.top.toFloat(), restorePaint)
         ensureBuffer(doc.width, doc.height)
-        dirty.setEmpty()
+        resetDirty()
         renderer.brush = ls.brush
         renderer.diameter = ls.diameter
         renderer.opacity = ls.opacity
@@ -815,7 +885,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val n = shape.sample(shapeXs, shapeYs)
         if (n < 2) return
         clearBuffer()
-        dirty.setEmpty()
+        resetDirty()
         renderer.renderPath(shapeXs.data, shapeYs.data, n, shape.closed, ls.pressure)
         painter.flush()
         state.canvasView?.postInvalidateOnAnimation()
@@ -869,7 +939,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         lastShape = null
         symm = emptyList()
         renderer.sink = null
-        dirty.setEmpty()
+        resetDirty()
         state.invalidate()
     }
 
@@ -973,6 +1043,7 @@ private class BufferTiles {
     private val dstF = RectF()
     private val clip = Rect()
     private val copyPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+    private val clearPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.CLEAR) }
 
     private fun ensure(buf: Bitmap) {
         if (buf.width == w && buf.height == h && tiles.isNotEmpty()) return
@@ -1007,6 +1078,29 @@ private class BufferTiles {
             }
             dst.set(src.left - x0, src.top - y0, src.right - x0, src.bottom - y0)
             c.drawBitmap(buf, src, dst, copyPaint)
+        }
+    }
+
+    /**
+     * Leert den Bereich [r] (Dokumentpixel) in den vorhandenen Kacheln – gleiches Ergebnis wie [sync] aus einem dort
+     * leeren Puffer, aber ohne Kopieren. Fehlende Kacheln übernehmen beim Anlegen ohnehin den Pufferinhalt.
+     */
+    fun clear(r: RectF) {
+        if (r.isEmpty || tiles.isEmpty()) return
+        val l = max(0, floor(r.left).toInt() - 1); val t = max(0, floor(r.top).toInt() - 1)
+        val rr = minOf(w, ceil(r.right).toInt() + 1); val bb = minOf(h, ceil(r.bottom).toInt() + 1)
+        if (l >= rr || t >= bb) return
+        val i0 = max(0, (l - 1) / T); val i1 = minOf(nx - 1, rr / T)
+        val j0 = max(0, (t - 1) / T); val j1 = minOf(ny - 1, bb / T)
+        for (j in j0..j1) for (i in i0..i1) {
+            val k = j * nx + i
+            val c = canvases[k] ?: continue
+            val x0 = i * T - 1; val y0 = j * T - 1
+            src.set(max(l, x0), max(t, y0), minOf(rr, x0 + T + 2), minOf(bb, y0 + T + 2))
+            if (src.isEmpty) continue
+            dst.set(src.left - x0, src.top - y0, src.right - x0, src.bottom - y0)
+            if (dst.left <= 0 && dst.top <= 0 && dst.right >= T + 2 && dst.bottom >= T + 2) tiles[k]!!.eraseColor(0)
+            else c.drawRect(dst, clearPaint)
         }
     }
 

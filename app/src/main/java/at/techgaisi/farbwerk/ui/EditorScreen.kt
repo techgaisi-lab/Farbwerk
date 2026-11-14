@@ -37,6 +37,10 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.boundsInWindow
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
@@ -110,6 +114,15 @@ fun EditorScreen(state: EditorState) {
                 cv.onSelectLayerAt = { dx, dy, wx, wy -> layerPick = floatArrayOf(dx, dy, wx, wy) }
             },
             modifier = Modifier.fillMaxSize(),
+        )
+        // Schwebevorschau des Stifts als eigene, leichte Ebene über der Leinwand: Beim Schweben wird nur diese neu
+        // gezeichnet (Zähler wird nur hier beim Zeichnen gelesen → keine Neukomposition), nicht die Leinwand.
+        Spacer(
+            Modifier.fillMaxSize().graphicsLayer().drawBehind {
+                @Suppress("UNUSED_VARIABLE") val tick = state.canvasOverlayTick.intValue
+                val cv = state.canvasView ?: return@drawBehind
+                drawIntoCanvas { cv.drawHoverOverlay(it.nativeCanvas) }
+            }
         )
         // ColorDrop-Nachfüllmodus: Tipp-Ebene über der Leinwand, unter Leisten/Panels (nur wenn aktiv)
         ColorDropTapLayer(state)

@@ -36,6 +36,8 @@ import kotlin.math.roundToInt
 object Timelapse {
     /** Mindestabstand zwischen zwei Bildern (≈ 4 Bilder/s). */
     private const val MIN_INTERVAL_MS = 250L
+    /** Ruhezeit nach einem Strich, bevor aufgenommen wird (Pausen zwischen schnellen Strichen überbrücken). */
+    private const val IDLE_AFTER_STROKE_MS = 350L
     private const val JPEG_QUALITY = 88
     private const val PREFS = "farbwerk_timelapse"
     private const val KEY_ENABLED = "record"
@@ -59,7 +61,23 @@ object Timelapse {
     private var lastCaptureAt = 0L
     private var pendingState: EditorState? = null
     private var scheduled = false
-    private val captureRunnable = Runnable { scheduled = false; pendingState?.let { capture(it) }; pendingState = null }
+    private val captureRunnable = object : Runnable {
+        override fun run() {
+            val st = pendingState
+            if (st != null) {
+                // Nicht während eines Strichs (und kurz danach) aufnehmen: Das Rendern läuft auf dem Main-Thread
+                // (bei großen Leinwänden ~50 ms) und würde den laufenden bzw. den nächsten Strich ruckeln lassen.
+                val sinceStroke = SystemClock.uptimeMillis() - st.lastStrokeEndAt
+                if (st.strokeActive || sinceStroke < IDLE_AFTER_STROKE_MS) {
+                    main.postDelayed(this, if (st.strokeActive) IDLE_AFTER_STROKE_MS else IDLE_AFTER_STROKE_MS - sinceStroke)
+                    return
+                }
+            }
+            scheduled = false
+            st?.let { capture(it) }
+            pendingState = null
+        }
+    }
 
     // Nächste Bildnummer je Projekt (nur Schreib-Thread)
     private val nextIndex = HashMap<String, Int>()

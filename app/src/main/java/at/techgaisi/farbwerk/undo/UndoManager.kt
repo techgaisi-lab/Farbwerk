@@ -49,6 +49,27 @@ class LayerPixelsAction(
     }
 }
 
+/**
+ * Wie [LayerPixelsAction], aber für mehrere Teilbereiche (z. B. nur die von einem Pinselstrich veränderten Kacheln
+ * statt des ganzen umschließenden Rechtecks).
+ */
+class LayerTilesAction(
+    override val label: String,
+    private val layer: Layer,
+    private val rects: List<Rect>,
+    private val before: List<Bitmap>,
+    private val after: List<Bitmap>,
+) : UndoAction {
+    override val bytes: Long = before.sumOf { it.allocationByteCount.toLong() } + after.sumOf { it.allocationByteCount.toLong() }
+    override fun undo() = put(before)
+    override fun redo() = put(after)
+    private fun put(src: List<Bitmap>) {
+        val c = Canvas(layer.bitmap)
+        val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+        for (i in rects.indices) c.drawBitmap(src[i], rects[i].left.toFloat(), rects[i].top.toFloat(), p)
+    }
+}
+
 class UndoManager(private val state: EditorState) {
     private val undoStack = ArrayDeque<UndoAction>()
     private val redoStack = ArrayDeque<UndoAction>()
@@ -125,38 +146,90 @@ class UndoManager(private val state: EditorState) {
  * ```
  * Beim Commit wird eine aktive Auswahl berücksichtigt: Änderungen außerhalb der Auswahl werden verworfen
  * (weiche Kanten werden linear gemischt).
+ *
+ * Verzögerte Sicherung ([EditorState.beginLazyPixelEdit], [before] = null): Statt beim Beginn die ganze Ebene zu
+ * kopieren (bei 2×-Leinwänden ~90 MB – verzögert sonst jeden Strichbeginn), sichert der Aufrufer mit [protect] die
+ * Originalpixel der Kacheln ([TILE]×[TILE]) eines Bereichs unmittelbar *bevor* er die Ebene dort verändert. Nicht
+ * gesicherte Kacheln sind unverändert, ihr Original ist also der aktuelle Ebeneninhalt. Der Undo-Eintrag enthält
+ * nur die gesicherten Kacheln ([LayerTilesAction]) – bei langen, schrägen Strichen ein Bruchteil des umschließenden
+ * Rechtecks. Commit, Abbrechen und [originalRegion] ergeben exakt dasselbe wie mit vollständiger Kopie.
  */
 class PixelEdit internal constructor(
     private val state: EditorState,
     val layer: Layer,
-    private val before: Bitmap,
+    private val before: Bitmap?,
 ) {
     private var finished = false
+
+    // ---------------- verzögerte Sicherung ----------------
+    /** Kachelindex → Originalpixel der Kachel ([TILE]×[TILE], am Rand kleiner). */
+    private val saved = HashMap<Int, Bitmap>()
+    private val tilesX = (layer.width + TILE - 1) / TILE
+    private val srcPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
+
+    /**
+     * Verzögerter Modus: sichert die Originalpixel aller noch nicht gesicherten Kacheln im Bereich (Dokumentpixel,
+     * rechts/unten exklusiv). Muss vor jeder Veränderung der Ebene in diesem Bereich aufgerufen werden.
+     */
+    fun protect(left: Int, top: Int, right: Int, bottom: Int) {
+        if (before != null || finished) return
+        val l = maxOf(0, left); val t = maxOf(0, top)
+        val r = minOf(layer.width, right); val b = minOf(layer.height, bottom)
+        if (l >= r || t >= b) return
+        for (j in t / TILE..(b - 1) / TILE) for (i in l / TILE..(r - 1) / TILE) protectTile(j * tilesX + i)
+    }
+
+    /** Verzögerter Modus: sichert die Kachel mit dem Index [k] (Zeile · Kachelspalten + Spalte), falls nötig. */
+    fun protectTile(k: Int) {
+        if (before != null || finished || saved.containsKey(k)) return
+        saveTile(k)
+    }
+
+    private fun saveTile(k: Int) {
+        val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
+        if (x0 >= layer.width || y0 >= layer.height) return
+        saved[k] = Bitmap.createBitmap(layer.bitmap, x0, y0, minOf(TILE, layer.width - x0), minOf(TILE, layer.height - y0))
+    }
+
+    /** Originalpixel (Zustand vor der Bearbeitung) im Bereich [r] als neue Bitmap (nur lesen!). */
+    fun originalRegion(r: Rect): Bitmap {
+        before?.let { return Bitmap.createBitmap(it, r.left, r.top, r.width(), r.height()) }
+        // aktueller Inhalt (= Original, wo nichts gesichert wurde), darüber die gesicherten Originale
+        val out = Bitmap.createBitmap(r.width(), r.height(), Bitmap.Config.ARGB_8888)
+        val c = Canvas(out)
+        c.translate(-r.left.toFloat(), -r.top.toFloat())
+        c.drawBitmap(layer.bitmap, 0f, 0f, srcPaint)
+        drawSaved(c, r)
+        return out
+    }
+
+    /** Stellt im Bereich [r] den Zustand vor der Bearbeitung wieder her (Ebene bleibt in Bearbeitung). */
+    fun restore(r: Rect) {
+        val c = Canvas(layer.bitmap)
+        c.save()
+        c.clipRect(r)
+        if (before != null) c.drawBitmap(before, 0f, 0f, srcPaint) else drawSaved(c, r)
+        c.restore()
+    }
+
+    /** Zeichnet alle gesicherten Originale, die [r] berühren, an ihre Position (SRC). */
+    private fun drawSaved(c: Canvas, r: Rect) {
+        for ((k, b) in saved) {
+            val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
+            if (x0 >= r.right || y0 >= r.bottom || x0 + b.width <= r.left || y0 + b.height <= r.top) continue
+            c.drawBitmap(b, x0.toFloat(), y0.toFloat(), srcPaint)
+        }
+    }
 
     fun commit(dirty: Rect?, label: String) {
         if (finished) return
         finished = true
-        val doc = state.document ?: return
+        val doc = state.document ?: return saved.clear()
         val r = Rect(dirty ?: Rect(0, 0, layer.width, layer.height))
-        if (!r.intersect(0, 0, layer.width, layer.height) || r.isEmpty) return
+        if (!r.intersect(0, 0, layer.width, layer.height) || r.isEmpty) return saved.clear()
+        if (before == null) return commitTiles(doc, r, label)
 
-        doc.selection?.let { sel ->
-            // ergebnis = before*(1-m) + after*m  (premultiplied → ADD ist exakt)
-            val afterCrop = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
-                .copy(Bitmap.Config.ARGB_8888, true)
-            val beforeCrop = Bitmap.createBitmap(before, r.left, r.top, r.width(), r.height())
-                .copy(Bitmap.Config.ARGB_8888, true)
-            val maskCrop = Bitmap.createBitmap(sel.mask, r.left, r.top, r.width(), r.height())
-            Canvas(afterCrop).drawBitmap(maskCrop, 0f, 0f,
-                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) })
-            Canvas(beforeCrop).drawBitmap(maskCrop, 0f, 0f,
-                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) })
-            val c = Canvas(layer.bitmap)
-            c.drawBitmap(beforeCrop, r.left.toFloat(), r.top.toFloat(),
-                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
-            c.drawBitmap(afterCrop, r.left.toFloat(), r.top.toFloat(),
-                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.ADD) })
-        }
+        doc.selection?.let { sel -> applySelection(sel, r, Bitmap.createBitmap(before, r.left, r.top, r.width(), r.height())) }
 
         val b = Bitmap.createBitmap(before, r.left, r.top, r.width(), r.height())
         val a = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
@@ -164,14 +237,78 @@ class PixelEdit internal constructor(
         state.invalidate()
     }
 
-    fun cancel() {
-        if (finished) return
-        finished = true
-        val c = Canvas(layer.bitmap)
-        c.drawBitmap(before, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
+    /** Verzögerter Modus: Undo-Eintrag aus den gesicherten Kacheln (je Kachel ∩ [r]). */
+    private fun commitTiles(doc: at.techgaisi.farbwerk.model.ArtDocument, r: Rect, label: String) {
+        if (doc.selection != null) {
+            // Die Auswahl-Mischung wirkt (wie mit vollständiger Kopie) auf das ganze Rechteck: auch die unveränderten
+            // Kacheln darin aufnehmen – ihr aktueller Inhalt ist das Original.
+            for (j in r.top / TILE..(r.bottom - 1) / TILE) for (i in r.left / TILE..(r.right - 1) / TILE) {
+                val k = j * tilesX + i
+                if (!saved.containsKey(k)) saveTile(k)
+            }
+        }
+        val rects = ArrayList<Rect>(saved.size)
+        val bs = ArrayList<Bitmap>(saved.size)
+        for (k in saved.keys.sorted()) {
+            val tile = saved.getValue(k)
+            val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
+            val tr = Rect(x0, y0, x0 + tile.width, y0 + tile.height)
+            if (!tr.intersect(r)) continue
+            rects += tr
+            bs += if (tr.width() == tile.width && tr.height() == tile.height) tile
+                else Bitmap.createBitmap(tile, tr.left - x0, tr.top - y0, tr.width(), tr.height())
+        }
+        saved.clear()
+        if (rects.isEmpty()) { state.invalidate(); return }
+        doc.selection?.let { sel -> for (i in rects.indices) applySelection(sel, rects[i], bs[i]) }
+        val after = ArrayList<Bitmap>(rects.size)
+        for (tr in rects) after += Bitmap.createBitmap(layer.bitmap, tr.left, tr.top, tr.width(), tr.height())
+        state.undo.push(LayerTilesAction(label, layer, rects, bs, after))
         state.invalidate()
     }
 
-    /** Zustand der Ebene vor Beginn der Bearbeitung (nur lesen!). */
-    val original: Bitmap get() = before
+    /**
+     * Auswahl: Im Bereich [r] gilt ergebnis = vorher·(1−m) + nachher·m ([beforeCrop] = Original in [r]).
+     * Vormultipliziert → ADD ist exakt.
+     */
+    private fun applySelection(sel: at.techgaisi.farbwerk.model.Selection, r: Rect, beforeCrop: Bitmap) {
+        val afterCrop = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+            .copy(Bitmap.Config.ARGB_8888, true)
+        val bc = beforeCrop.copy(Bitmap.Config.ARGB_8888, true)
+        val maskCrop = Bitmap.createBitmap(sel.mask, r.left, r.top, r.width(), r.height())
+        Canvas(afterCrop).drawBitmap(maskCrop, 0f, 0f,
+            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) })
+        Canvas(bc).drawBitmap(maskCrop, 0f, 0f,
+            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) })
+        val c = Canvas(layer.bitmap)
+        c.drawBitmap(bc, r.left.toFloat(), r.top.toFloat(),
+            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
+        c.drawBitmap(afterCrop, r.left.toFloat(), r.top.toFloat(),
+            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.ADD) })
+    }
+
+    fun cancel() {
+        if (finished) return
+        finished = true
+        if (before != null) {
+            val c = Canvas(layer.bitmap)
+            c.drawBitmap(before, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
+        } else {
+            drawSaved(Canvas(layer.bitmap), Rect(0, 0, layer.width, layer.height))
+            saved.clear()
+        }
+        state.invalidate()
+    }
+
+    /**
+     * Zustand der Ebene vor Beginn der Bearbeitung (nur lesen!). Im verzögerten Modus wird er bei Bedarf einmal
+     * vollständig zusammengesetzt (teuer – dort besser [originalRegion]/[restore] benutzen).
+     */
+    val original: Bitmap get() = before ?: fullOriginal ?: originalRegion(Rect(0, 0, layer.width, layer.height)).also { fullOriginal = it }
+    private var fullOriginal: Bitmap? = null
+
+    companion object {
+        /** Kantenlänge der verzögert gesicherten Kacheln (Dokumentpixel). */
+        const val TILE = 256
+    }
 }

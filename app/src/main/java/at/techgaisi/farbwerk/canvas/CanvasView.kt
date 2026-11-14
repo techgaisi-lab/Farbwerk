@@ -10,6 +10,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
 import android.graphics.RectF
+import android.graphics.RenderNode
 import android.graphics.Shader
 import android.os.Build
 import android.os.Handler
@@ -89,7 +90,21 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     init {
         isFocusable = true
         isFocusableInTouchMode = true
+        // Im Ruhezustand eine Hardware-Ebene: Schwebevorschau (eigene Überlagerung, [drawHoverOverlay]), Panels und
+        // Animationen darüber zeichnen die Leinwand dann nur noch als fertige Textur. Während eines Strichs wird die
+        // Leinwand ohnehin jedes Bild neu gezeichnet – dort wäre die Ebene ein zusätzlicher bildschirmgroßer
+        // Render- und Zeichendurchgang pro Bild und wird abgeschaltet ([setStrokeLayer]).
         setLayerType(LAYER_TYPE_HARDWARE, null)
+    }
+
+    /** Hardware-Ebene nach dem Strich erst nach kurzer Ruhe wieder anlegen (schnelle Strichfolgen, Schraffur). */
+    private val restoreLayerRunnable = Runnable { if (mode != Mode.STROKE) setLayerType(LAYER_TYPE_HARDWARE, null) }
+
+    /** Hardware-Ebene der View während eines Strichs aus ([stroking] = true), danach verzögert wieder an. */
+    private fun setStrokeLayer(stroking: Boolean) {
+        handler.removeCallbacks(restoreLayerRunnable)
+        if (stroking) { if (layerType != LAYER_TYPE_NONE) setLayerType(LAYER_TYPE_NONE, null) }
+        else handler.postDelayed(restoreLayerRunnable, LAYER_RESTORE_DELAY_MS)
     }
 
     // ===================================================================== Ansicht
@@ -277,29 +292,28 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         canvas.drawColor(if (light) Color.rgb(217, 217, 221) else Color.rgb(30, 30, 32)) // Arbeitsfläche (Theme: workspace)
         drawWorkspaceGrid(canvas, light)
         val doc = state.document ?: return
-        val bounds = RectF(0f, 0f, doc.width.toFloat(), doc.height.toFloat())
+        val bounds = docBounds.apply { set(0f, 0f, doc.width.toFloat(), doc.height.toFloat()) }
 
         canvas.save()
-        canvas.concat(viewMatrix)
-        if (doc.flipHorizontal) canvas.scale(-1f, 1f, doc.width / 2f, doc.height / 2f)
-        if (doc.flipVertical) canvas.scale(1f, -1f, doc.width / 2f, doc.height / 2f)
+        applyDocTransform(canvas, doc)
         canvas.drawRect(bounds, shadowPaint)
-        canvas.save()
-        canvas.clipRect(bounds)
-        if (!doc.backgroundVisible) {
-            val inv = 1f / max(0.0001f, currentScale())
-            canvas.save(); canvas.scale(inv, inv)
-            canvas.drawPaint(checkerPaint)
+        canvas.restore()
+        Compositor.displayScale = currentScale()
+        val split = try { drawSplit(canvas, doc) } catch (t: Throwable) {
+            android.util.Log.e("Farbwerk", "split", t); releaseSplit(); false
+        }
+        if (!split) {
+            canvas.save()
+            applyDocTransform(canvas, doc)
+            canvas.clipRect(bounds)
+            drawChecker(canvas, doc)
+            try {
+                Compositor.draw(canvas, doc)
+            } catch (t: Throwable) {
+                android.util.Log.e("Farbwerk", "Compositor", t)
+            }
             canvas.restore()
         }
-        try {
-            Compositor.displayScale = currentScale()
-            Compositor.draw(canvas, doc)
-        } catch (t: Throwable) {
-            android.util.Log.e("Farbwerk", "Compositor", t)
-        }
-        canvas.restore()
-        canvas.restore()
 
         val m = displayMatrix()
         try { GuidesOverlay.draw(canvas, state, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "guides", t) }
@@ -307,7 +321,114 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         try { state.activeHandler()?.drawOverlay(canvas, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "overlay", t) }
         try { state.canvasOverride?.drawOverlay(canvas, m) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "ovOverlay", t) }
         if (eyedropperActive) state.eyedropper.drawOverlay(canvas, m)
-        if (hovering && mode != Mode.STROKE && mode != Mode.EYEDROPPER && state.prefs.hoverPreview) drawHover(canvas, m)
+        // Ansicht verändert, während der Stift schwebt (z. B. Zoom per Tastatur): Schwebevorschau nachziehen
+        if (hovering) {
+            m.getValues(tmpValues)
+            if (!tmpValues.contentEquals(hoverMatrixValues)) invalidateOverlay()
+        }
+    }
+
+    private val docBounds = RectF()
+    private val tmpValues = FloatArray(9)
+    private val hoverMatrixValues = FloatArray(9)
+
+    /** Dokument → View inkl. Spiegelung auf [canvas] anwenden. */
+    private fun applyDocTransform(canvas: Canvas, doc: at.techgaisi.farbwerk.model.ArtDocument) {
+        canvas.concat(viewMatrix)
+        if (doc.flipHorizontal) canvas.scale(-1f, 1f, doc.width / 2f, doc.height / 2f)
+        if (doc.flipVertical) canvas.scale(1f, -1f, doc.width / 2f, doc.height / 2f)
+    }
+
+    /** Schachbrett unter einem ausgeblendeten Hintergrund (in Dokument-Koordinaten, Muster in Bildschirmgröße). */
+    private fun drawChecker(canvas: Canvas, doc: at.techgaisi.farbwerk.model.ArtDocument) {
+        if (doc.backgroundVisible) return
+        val inv = 1f / max(0.0001f, currentScale())
+        canvas.save(); canvas.scale(inv, inv)
+        canvas.drawPaint(checkerPaint)
+        canvas.restore()
+    }
+
+    // ---------------------------------------------------------- Zerlegte Anzeige während eines Strichs
+
+    /**
+     * Während eines Pinselstrichs ändert sich nur die aktive Ebene. Hintergrund + Ebenen darunter und die Ebenen
+     * darüber werden dann einmal in je einen RenderNode mit eigener Ebene (Textur in Bildschirmgröße)
+     * aufgezeichnet; pro Bild zeichnet die GPU nur noch diese zwei Texturen und die aktive Ebene statt aller
+     * Ebenen. Neu aufgezeichnet wird nur, wenn sich darunter/darüber etwas ändert ([Compositor.stackSignature])
+     * oder die Ansicht bewegt wird. Nur wenn das Bild dadurch gleich bleibt ([Compositor.canSplit]).
+     */
+    private var belowNode: RenderNode? = null
+    private var aboveNode: RenderNode? = null
+    private var splitSignature = 0L
+    private var splitValid = false
+    private val splitMatrix = FloatArray(9)
+
+    private fun drawSplit(canvas: Canvas, doc: at.techgaisi.farbwerk.model.ArtDocument): Boolean {
+        val stroking = mode == Mode.STROKE && strokeHandler === state.brushEngine && state.brushEngine.isStroking
+        if (!stroking || !canvas.isHardwareAccelerated || width <= 0 || height <= 0) {
+            releaseSplit(); return false
+        }
+        val a = doc.activeIndex
+        if (!Compositor.canSplit(doc, a)) { releaseSplit(); return false }
+        val below = belowNode ?: RenderNode("farbwerk-below").also { it.setUseCompositingLayer(true, null); belowNode = it }
+        val above = aboveNode ?: RenderNode("farbwerk-above").also { it.setUseCompositingLayer(true, null); aboveNode = it }
+        val sig = Compositor.stackSignature(doc, a) * 31 + (if (doc.flipHorizontal) 1 else 0) + (if (doc.flipVertical) 2 else 0) +
+            width.toLong() * 7919 + height.toLong() * 104729
+        viewMatrix.getValues(tmpValues)
+        if (!splitValid || sig != splitSignature || !tmpValues.contentEquals(splitMatrix)) {
+            below.setPosition(0, 0, width, height)
+            above.setPosition(0, 0, width, height)
+            val rb = below.beginRecording(width, height)
+            try {
+                applyDocTransform(rb, doc)
+                rb.clipRect(docBounds)
+                drawChecker(rb, doc)
+                Compositor.drawBelow(rb, doc, a)
+            } finally { below.endRecording() }
+            val ra = above.beginRecording(width, height)
+            try {
+                applyDocTransform(ra, doc)
+                ra.clipRect(docBounds)
+                Compositor.drawLayers(ra, doc, a + 1, doc.layers.size)
+            } finally { above.endRecording() }
+            splitSignature = sig
+            tmpValues.copyInto(splitMatrix)
+            splitValid = true
+        }
+        canvas.drawRenderNode(below)
+        canvas.save()
+        applyDocTransform(canvas, doc)
+        canvas.clipRect(docBounds)
+        Compositor.drawLayers(canvas, doc, a, a + 1)
+        canvas.restore()
+        canvas.drawRenderNode(above)
+        return true
+    }
+
+    /** Zwischengespeicherte Anzeige verwerfen (Strichende): gibt die Texturen frei. */
+    private fun releaseSplit() {
+        if (!splitValid) return
+        splitValid = false
+        belowNode?.discardDisplayList(); aboveNode?.discardDisplayList()
+    }
+
+    // ---------------------------------------------------------- Schwebevorschau (eigene Überlagerung)
+
+    /** Schwebevorschau neu zeichnen lassen – nur die Überlagerung, nicht die Leinwand. */
+    private fun invalidateOverlay() { state.canvasOverlayTick.intValue++ }
+
+    /**
+     * Zeichnet die Schwebevorschau (Pinselumriss/Pipetten-Ring). Wird von einer eigenen, leichten Ebene über der
+     * Leinwand aufgerufen (EditorScreen), deren Neuzeichnen nur [EditorState.canvasOverlayTick] auslöst – so muss die
+     * Leinwand beim Schweben nicht neu gezeichnet werden. Koordinaten = View-Koordinaten der Leinwand.
+     */
+    fun drawHoverOverlay(canvas: Canvas) {
+        if (state.document == null) return
+        if (hovering && mode != Mode.STROKE && mode != Mode.EYEDROPPER && state.prefs.hoverPreview) {
+            val m = displayMatrix()
+            m.getValues(hoverMatrixValues)
+            drawHover(canvas, m)
+        }
     }
 
     /** Schwebevorschau: Pinselumriss bzw. Pipetten-Ring an der Stiftposition. */
@@ -534,7 +655,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         prepareInverse()
         if (hasStylus(e)) {
             StylusSession.seen(e.eventTime, touched = true)
-            if (hovering) { hovering = false; hoverPreview.reset() }
+            if (hovering) { hovering = false; hoverPreview.reset(); invalidateOverlay() }
             trackPenButton(e, touching = true)
         }
         if (predictor != null && state.prefs.motionPrediction) {
@@ -567,7 +688,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
     private fun handleHover(e: MotionEvent): Boolean {
         if (state.document == null) return false
         if (!isStylus(e, 0)) {
-            if (hovering) { hovering = false; invalidate() }
+            if (hovering) { hovering = false; invalidateOverlay() }
             return false
         }
         StylusSession.seen(e.eventTime, touched = false)
@@ -586,12 +707,12 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 hoverOrient = screenOrientationToDoc(e.getOrientation(0))
                 hoverEraser = e.getToolType(0) == MotionEvent.TOOL_TYPE_ERASER
                 trackPenButton(e, touching = false)
-                if (state.prefs.hoverPreview && mode != Mode.STROKE) invalidate()
+                if (state.prefs.hoverPreview && mode != Mode.STROKE) invalidateOverlay()
             }
             MotionEvent.ACTION_HOVER_EXIT -> {
                 trackPenButton(e, touching = false)
                 hovering = false
-                invalidate()
+                invalidateOverlay()
             }
         }
         return true
@@ -609,12 +730,12 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
             penButtonDownTime = e.eventTime
             penButtonUsed = touching
             lastPenButtonMotion = SystemClock.uptimeMillis()
-            if (hovering) invalidate()
+            if (hovering) invalidateOverlay()
         } else if (!pressed && penButtonDown) {
             penButtonDown = false
             lastPenButtonMotion = SystemClock.uptimeMillis()
             if (!penButtonUsed && !touching && e.eventTime - penButtonDownTime < 1000L) performHoverClick()
-            if (hovering) invalidate()
+            if (hovering) invalidateOverlay()
         } else if (pressed && touching) {
             penButtonUsed = true
         }
@@ -630,6 +751,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         invDisplay.mapPoints(mapTmp)
         StylusActions.performClick(state, action, mapTmp[0], mapTmp[1])
         invalidate()
+        invalidateOverlay()
     }
 
     /**
@@ -783,6 +905,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         val p = toDoc(e, idx)
         lastPoint = p
         try { handlerTool?.onStrokeStart(p) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "start", t) }
+        state.strokeActive = true
+        setStrokeLayer(true)
         onStrokeActivity?.invoke(true)
         if (!strokeIsStylus && state.tool in BRUSH_TOOLS) scheduleHoldEyedropper(e)
         invalidate()
@@ -1037,8 +1161,15 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         state.brushEngine.temporaryTool = null
         // Zuletzt bemalte Stelle (schwebende Pipette per Modifizierer)
         if (h === state.brushEngine) state.lastPaintPoint = android.graphics.PointF(p.x, p.y)
+        markStrokeEnded()
         onStrokeActivity?.invoke(false)
         invalidate()
+    }
+
+    private fun markStrokeEnded() {
+        state.strokeActive = false
+        state.lastStrokeEndAt = SystemClock.uptimeMillis()
+        setStrokeLayer(false)
     }
 
     /**
@@ -1057,6 +1188,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         handler.removeCallbacks(holdEyedropperRunnable)
         try { strokeHandler?.onStrokeCancel() } catch (t: Throwable) { android.util.Log.e("Farbwerk", "cancel", t) }
         state.brushEngine.temporaryTool = null
+        if (state.strokeActive) markStrokeEnded()
         if (strokeHandler != null) onStrokeActivity?.invoke(false)
         strokeHandler = null
         strokePointerId = -1
@@ -1331,6 +1463,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         /** KeyEvent.KEYCODE_STYLUS_BUTTON_PRIMARY … _TAIL (API 34). */
         const val KEYCODE_STYLUS_FIRST = 308
         const val KEYCODE_STYLUS_LAST = 311
+        /** Ruhezeit nach einem Strich, bis die Hardware-Ebene wieder angelegt wird (ms). */
+        const val LAYER_RESTORE_DELAY_MS = 400L
     }
 
     override fun onAttachedToWindow() {
@@ -1346,10 +1480,12 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         if (floatingEyedropper) endFloatingEyedropper(commit = false)
         mode = Mode.IDLE
         cancelTimers()
+        handler.removeCallbacks(restoreLayerRunnable)
         animator?.cancel()
         holdEvent?.recycle(); holdEvent = null
         // Keine Referenz auf eine abgelöste Ansicht behalten (Galerie → neues Dokument erzeugt eine neue View)
         if (state.canvasView === this) state.canvasView = null
+        releaseSplit()
     }
 }
 

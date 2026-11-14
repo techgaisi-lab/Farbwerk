@@ -89,7 +89,10 @@ open class View(val context: Context) {
     fun postDelayed(r: Runnable, delayMillis: Long): Boolean = uiHandler.postDelayed(r, delayMillis)
     fun removeCallbacks(r: Runnable): Boolean { uiHandler.removeCallbacks(r); return true }
     fun requestLayout() = invalidate()
-    fun setLayerType(type: Int, paint: Paint?) {}
+    /** Ebenentyp (auf dem Desktop nur gemerkt, ohne Wirkung). */
+    var layerType: Int = LAYER_TYPE_NONE
+        private set
+    fun setLayerType(type: Int, paint: Paint?) { layerType = type }
     fun setWillNotDraw(willNotDraw: Boolean) {}
 
     // -------- Lage --------

@@ -272,6 +272,79 @@ object Compositor {
     fun usesCustomBlend(doc: ArtDocument): Boolean = topCustomIndex(doc, doc.layers, false) >= 0
 
     // ------------------------------------------------------------------------------------------
+    // Zerlegte Anzeige während eines Strichs (siehe CanvasView): „darunter“ · aktive Ebene · „darüber“
+    // ------------------------------------------------------------------------------------------
+
+    /**
+     * Ergibt [drawBelow] + [drawLayers] (nur [active]) + [drawLayers] (über [active]) dasselbe Bild wie [draw]?
+     * Dann können „darunter“ und „darüber“ während eines Strichs als fertige Bilder zwischengespeichert werden –
+     * pro Bild werden nur noch drei Flächen statt aller Ebenen gezeichnet.
+     *  - keine eigenen Mischmodi (die brauchen das ganze Bild darunter als Eingabe),
+     *  - außer der aktiven Ebene keine Live-Überschreibungen (drawOverride/displayOverride),
+     *  - darüber nur „Normal“ (Quelle-über ist assoziativ: (A über B) über X = A über (B über X)) und keine
+     *    Schnittmaske, deren Basis die aktive Ebene oder eine Ebene darunter ist.
+     */
+    fun canSplit(doc: ArtDocument, active: Int): Boolean {
+        val layers = doc.layers
+        if (active !in layers.indices) return false
+        if (topCustomIndex(doc, layers, forceVisible = false) >= 0) return false
+        for (i in layers.indices) {
+            if (i == active) continue
+            val l = layers[i]
+            if (l.drawOverride != null || l.displayOverride != null) return false
+        }
+        var baseIndex = -1
+        for (i in 0 until layers.size) {
+            val l = layers[i]
+            if (!l.clipping) baseIndex = i
+            if (i <= active || !visible(doc, l, false)) continue
+            if (l.blend != LayerBlend.NORMAL) return false
+            if (l.clipping && baseIndex <= active) return false
+        }
+        return true
+    }
+
+    /**
+     * Prüfsumme über alles, was „darunter“/„darüber“ von [active] beeinflusst (Ebenenliste, Sichtbarkeit,
+     * Deckkraft, Mischmodus, Schnittmaske, Masken, Pixelstand über die Generation der Bitmaps, Gruppen, Hintergrund).
+     */
+    fun stackSignature(doc: ArtDocument, active: Int): Long {
+        var h = mix(System.identityHashCode(doc).toLong(), doc.layers.size.toLong())
+        h = mix(h, active.toLong())
+        h = mix(h, if (doc.backgroundVisible) doc.backgroundColor.toLong() else 0x1_0000_0000L)
+        for (i in doc.layers.indices) {
+            if (i == active) continue
+            val l = doc.layers[i]
+            h = mix(h, System.identityHashCode(l).toLong())
+            h = mix(h, (if (visible(doc, l, false)) 1L else 0L) or (if (l.clipping) 2L else 0L) or (l.blend.ordinal.toLong() shl 2))
+            h = mix(h, java.lang.Float.floatToIntBits(l.opacity * LayerGroups.opacity(doc, l.groupId)).toLong())
+            h = mix(h, (System.identityHashCode(l.bitmap).toLong() shl 32) or (l.bitmap.generationId.toLong() and 0xFFFFFFFFL))
+            val m = l.mask
+            h = mix(h, if (m == null) 0L else (System.identityHashCode(m).toLong() shl 32) or (m.generationId.toLong() and 0xFFFFFFFFL))
+        }
+        return h
+    }
+
+    private fun mix(h: Long, v: Long): Long {
+        var x = h * -0x61c8864680b583ebL + v
+        x = (x xor (x ushr 31)) * -0x40a7b892e31b1a47L
+        return x xor (x ushr 29)
+    }
+
+    /** Hintergrund (falls sichtbar) und alle Ebenen unter [active] – wie [draw] bis dorthin. */
+    fun drawBelow(canvas: Canvas, doc: ArtDocument, active: Int) {
+        val c = ctx.get()!!
+        if (doc.backgroundVisible) canvas.drawColor(doc.backgroundColor)
+        drawRange(canvas, doc, doc.layers, 0, active, filterFor(canvas, c), false, c)
+    }
+
+    /** Die Ebenen [from] until [to] (Schnittmasken-Basen darunter werden berücksichtigt), ohne Hintergrund. */
+    fun drawLayers(canvas: Canvas, doc: ArtDocument, from: Int, to: Int) {
+        val c = ctx.get()!!
+        drawRange(canvas, doc, doc.layers, from, to.coerceAtMost(doc.layers.size), filterFor(canvas, c), false, c)
+    }
+
+    // ------------------------------------------------------------------------------------------
 
     private fun releaseIfBackground(c: Ctx) {
         if (Looper.myLooper() != Looper.getMainLooper()) { c.region.release(); c.content.release() }

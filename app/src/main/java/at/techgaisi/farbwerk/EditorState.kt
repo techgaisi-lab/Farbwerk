@@ -171,6 +171,19 @@ class EditorState(val context: Context) {
     // ---------------- Leinwand ----------------
     internal var canvasView: CanvasView? = null
 
+    /**
+     * Zähler der Leinwand-Überlagerung (Schwebevorschau des Stifts). Wird nur beim Zeichnen gelesen – eine
+     * Änderung zeichnet allein die Überlagerung neu, ohne Neukomposition und ohne die Leinwand neu zu zeichnen.
+     */
+    internal val canvasOverlayTick = mutableIntStateOf(0)
+
+    /** Läuft gerade ein Strich (Werkzeug-Berührung) auf der Leinwand? Kein Compose-State (ändert sich ohne Neukomposition). */
+    var strokeActive = false
+        internal set
+    /** Zeitpunkt ([android.os.SystemClock.uptimeMillis]) des letzten Strichendes. */
+    var lastStrokeEndAt = 0L
+        internal set
+
     fun invalidate() {
         revision++
         canvasView?.postInvalidateOnAnimation()
@@ -184,6 +197,12 @@ class EditorState(val context: Context) {
         val copy = layer.bitmap.copy(Bitmap.Config.ARGB_8888, false)
         return PixelEdit(this, layer, copy)
     }
+
+    /**
+     * Wie [beginPixelEdit], aber ohne Kopie der ganzen Ebene: Der Aufrufer sichert Bereiche mit
+     * [PixelEdit.protect]/[PixelEdit.protectExact], bevor er sie verändert (Pinsel: kein Kopieren beim Aufsetzen).
+     */
+    fun beginLazyPixelEdit(layer: at.techgaisi.farbwerk.model.Layer): PixelEdit = PixelEdit(this, layer, null)
 
     /**
      * Rechnet eine Position in Fenster-Koordinaten (z. B. aus einem Compose-Drag, positionInWindow)

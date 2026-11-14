@@ -131,6 +131,9 @@ class RenderNode(@Suppress("unused") private val name: String?) {
 
     fun setRenderEffect(renderEffect: RenderEffect?): Boolean { effect = renderEffect; return true }
 
+    /** Eigene Ebene (auf Android eine zwischengespeicherte Textur); auf dem Desktop ohne Wirkung. */
+    fun setUseCompositingLayer(forceToLayer: Boolean, paint: Paint?): Boolean = true
+
     fun beginRecording(width: Int, height: Int): RecordingCanvas {
         val rec = PictureRecorder()
         recorder = rec
