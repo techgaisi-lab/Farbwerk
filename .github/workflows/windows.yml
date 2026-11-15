@@ -1,4 +1,4 @@
-name: Windows-Build
+name: Desktop-Build
 
 on:
   push:
@@ -36,4 +36,36 @@ jobs:
           path: |
             desktop/build/compose/binaries/main/exe/*.exe
             desktop/build/compose/binaries/main/msi/*.msi
+          if-no-files-found: error
+
+  linux:
+    name: Farbwerk für Linux (.deb)
+    # 22.04 als Basis, damit das Paket auch auf älteren Debian-/Ubuntu-Versionen installierbar ist
+    runs-on: ubuntu-22.04
+    env:
+      FARBWERK_SKIP_ANDROID: "true"
+    steps:
+      - name: Quellcode auschecken
+        uses: actions/checkout@v4
+
+      - name: JDK 17 (Temurin) einrichten
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Gradle einrichten
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Paketwerkzeuge installieren
+        run: sudo apt-get update && sudo apt-get install -y fakeroot
+
+      - name: Linux-Paket bauen
+        run: ./gradlew --no-daemon :desktop:packageDeb
+
+      - name: Artefakt hochladen
+        uses: actions/upload-artifact@v4
+        with:
+          name: Farbwerk-Linux
+          path: desktop/build/compose/binaries/main/deb/*.deb
           if-no-files-found: error

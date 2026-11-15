@@ -45,4 +45,6 @@ adb install -r Farbwerk-1.0.0.apk
 
 **Windows:** Installer (`.exe` / `.msi`) aus dem GitHub-Actions-Artefakt „Farbwerk-Windows“.
 
+**Linux** (Debian/Ubuntu, x86-64): `sudo apt install ./farbwerk_1.0.0_amd64.deb`, danach im App-Menü unter Grafik oder per `/opt/farbwerk/bin/Farbwerk`.
+
 Die APK ist debug-signiert.

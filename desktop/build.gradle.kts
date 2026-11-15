@@ -76,7 +76,7 @@ compose.desktop {
         jvmArgs += listOf("-Xmx4g", "-Dfile.encoding=UTF-8", "-Dsun.java2d.uiScale.enabled=true")
 
         nativeDistributions {
-            targetFormats(TargetFormat.Exe, TargetFormat.Msi)
+            targetFormats(TargetFormat.Exe, TargetFormat.Msi, TargetFormat.Deb)
             packageName = "Farbwerk"
             packageVersion = farbwerkVersion
             description = "Farbwerk – Zeichen- und Mal-App"
@@ -97,6 +97,11 @@ compose.desktop {
             }
             linux {
                 iconFile.set(project.file("icons/farbwerk.png"))
+                packageName = "farbwerk"
+                debMaintainer = "lorenz@farbwerk.local"
+                menuGroup = "Graphics"
+                appCategory = "graphics"
+                shortcut = true
             }
         }
     }
