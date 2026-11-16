@@ -5,7 +5,17 @@ Gemeldetes Gerät: Galaxy Tab S10 Ultra mit laut Nutzer aktueller One UI. Der Ei
 
 Untersucht wurden Android-Eingabe, Pinsel, Compositor, Undo, Zeitraffer und Speicherung. Kein Tablet war für Messungen angeschlossen.
 
-## Neue Eingrenzung durch den Gerätetest
+## Aktualisierte Eingrenzung: zusätzliche Ebene genügt
+
+Der anschließende Nutzertest präzisiert und ersetzt die Bildimport-Hypothese: Auf einem frischen Dokument läuft der Schwamm auf der ersten Ebene flüssig. Schon das Hinzufügen einer zweiten leeren Ebene führt ohne Bild zum massiven Einbruch. Nach einem Bildimport bringen Ausblenden und Löschen zusätzlicher Ebenen laut Nutzer die Flüssigkeit nicht zurück; ein neues Dokument läuft wieder flüssig.
+
+Damit ist ein Bildimport keine notwendige Bedingung. Der Fix für die Standardauflösung löst diesen Ebenen-Trigger nicht. Noch offen ist, ob der Einbruch am aktiven Ebenenindex, an der Anzahl vorhandener/retinierter Bitmaps oder an GPU-/Ansichtsressourcen hängt.
+
+Als gezielte Diagnose wird lokal eine Variante `1.0.0-render-test2` gebaut: In `CanvasView` ist ausschließlich der Split-Renderpfad über eine Diagnosekonstante ausgeschaltet. `Compositor.draw` zeichnet das vollständige Dokument direkt; Ebenen, Masken, Deckkraft, Mischmodi und Pinselparameter bleiben bestehen. Die separate Paketkennung ist `at.techgaisi.farbwerk.perftest` (VersionCode 18), derselbe Testschlüssel wie bei der bisherigen separaten Test-App. Diese Renderänderung ist noch nicht als bewiesener Fix in den PR übernommen.
+
+Prüfablauf für diese Variante: frisches Dokument → Schwamm auf Ebene 1 → zweite leere Ebene hinzufügen → gleicher Schwamm → zweite Ebene löschen → weiterzeichnen. Anschließend Bildimport vergleichen. Auf dem Gerät noch nicht geprüft; bloßer Build-/Unit-Test-Erfolg bestätigt keine GPU-Performance.
+
+## Frühere Eingrenzung durch den Gerätetest (überholt)
 
 Der Nutzer meldet nun einen unmittelbaren A/B-Unterschied bei Bildschirmgröße, sowohl mit normaler als auch 2×-Leinwand: Auf leerer Leinwand laufen auch aufwendige Pinsel flüssig; nach dem Einfügen eines Bildes stottert derselbe Pinsel stark, mit geschätzt 0,2 FPS und deutlichem Nachlauf. Dies ist eine Nutzerbeobachtung, keine instrumentierte FPS-Messung. Die frühere Auflösungsänderung erklärt diesen Auslöser nicht und behebt ihn nach diesem Test nicht ausreichend.
 
