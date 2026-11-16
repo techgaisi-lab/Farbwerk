@@ -165,6 +165,7 @@ object Compositor {
         val layers = doc.layers
         val top = topCustomIndex(doc, layers, forceVisible = false)
         if (top < 0) {
+            if (canvas.isHardwareAccelerated && TiledCompositor.draw(canvas, doc)) return
             render(canvas, doc, doc.backgroundVisible, filter, c)
             return
         }
@@ -196,6 +197,12 @@ object Compositor {
         } finally {
             if (!main) { c.region.release(); c.content.release() }
         }
+    }
+
+    /** Display/thumbnail path. Raster caches follow the current zoom; document/export pixels do not. */
+    fun drawCached(canvas: Canvas, doc: ArtDocument) {
+        if (Looper.myLooper() == Looper.getMainLooper() && !usesCustomBlend(doc) && TiledCompositor.draw(canvas, doc)) return
+        draw(canvas, doc)
     }
 
     /** Liefert das zusammengefügte Bild in Dokumentgröße. */
@@ -318,7 +325,7 @@ object Compositor {
             h = mix(h, System.identityHashCode(l).toLong())
             h = mix(h, (if (visible(doc, l, false)) 1L else 0L) or (if (l.clipping) 2L else 0L) or (l.blend.ordinal.toLong() shl 2))
             h = mix(h, java.lang.Float.floatToIntBits(l.opacity * LayerGroups.opacity(doc, l.groupId)).toLong())
-            h = mix(h, (System.identityHashCode(l.bitmap).toLong() shl 32) or (l.bitmap.generationId.toLong() and 0xFFFFFFFFL))
+            h = mix(h, l.pixelVersion)
             val m = l.mask
             h = mix(h, if (m == null) 0L else (System.identityHashCode(m).toLong() shl 32) or (m.generationId.toLong() and 0xFFFFFFFFL))
         }
@@ -429,7 +436,7 @@ object Compositor {
     private fun drawLayer(canvas: Canvas, l: Layer, clipBase: Layer?, groupAlpha: Float, filter: Boolean, c: Ctx) {
         val alpha = (l.opacity * groupAlpha * 255f + 0.5f).toInt().coerceIn(0, 255)
         if (alpha == 0) return
-        val content = l.displayOverride ?: l.bitmap
+        val content = l.displayOverride
         val override = l.drawOverride
         val mode = blendModeOf(l.blend)
 
@@ -439,7 +446,7 @@ object Compositor {
             p.alpha = alpha
             p.blendMode = mode
             p.isFilterBitmap = filter
-            canvas.drawBitmap(content, 0f, 0f, p)
+            if (content != null) canvas.drawBitmap(content, 0f, 0f, p) else l.drawPixels(canvas, p)
             return
         }
 
@@ -458,7 +465,7 @@ object Compositor {
             override(canvas)
         } else {
             c.plain.isFilterBitmap = filter
-            canvas.drawBitmap(l.displayOverride ?: l.bitmap, 0f, 0f, c.plain)
+            l.displayOverride?.let { canvas.drawBitmap(it, 0f, 0f, c.plain) } ?: l.drawPixels(canvas, c.plain)
         }
         l.mask?.let { applyMask(canvas, it, filter, c) }
         if (clipBase != null) applyClipBase(canvas, clipBase, filter, c)
@@ -473,17 +480,26 @@ object Compositor {
 
     /** Beschneidet den Inhalt der aktuellen Offscreen-Ebene auf das sichtbare Alpha der Basis. */
     private fun applyClipBase(canvas: Canvas, base: Layer, filter: Boolean, c: Ctx) {
-        val content = base.displayOverride ?: base.bitmap
+        val content = base.displayOverride
         val override = base.drawOverride
+        if (override == null && base.mask == null && content == null) {
+            // Sparse tiles omit transparent regions. Apply DST_IN to a complete isolated layer,
+            // otherwise absent tiles would incorrectly leave the destination unchanged.
+            val sc = canvas.saveLayer(null, c.dstInLayer)
+            c.plain.isFilterBitmap = filter
+            base.drawPixels(canvas, c.plain)
+            canvas.restoreToCount(sc)
+            return
+        }
         if (override == null && base.mask == null) {
             c.dstIn.isFilterBitmap = filter
-            canvas.drawBitmap(content, 0f, 0f, c.dstIn)
+            if (content != null) canvas.drawBitmap(content, 0f, 0f, c.dstIn) else base.drawPixels(canvas, c.dstIn)
             return
         }
         val sc = canvas.saveLayer(null, c.dstInLayer)
         if (override != null) override(canvas) else {
             c.plain.isFilterBitmap = filter
-            canvas.drawBitmap(content, 0f, 0f, c.plain)
+            if (content != null) canvas.drawBitmap(content, 0f, 0f, c.plain) else base.drawPixels(canvas, c.plain)
         }
         base.mask?.let { applyMask(canvas, it, filter, c) }
         canvas.restoreToCount(sc)
@@ -530,7 +546,7 @@ object Compositor {
             tc.translate(-ox.toFloat(), -oy.toFloat())
             if (l.drawOverride == null && l.mask == null && clipBase == null) {
                 c.plain.isFilterBitmap = false
-                tc.drawBitmap(l.displayOverride ?: l.bitmap, 0f, 0f, c.plain)
+                l.displayOverride?.let { tc.drawBitmap(it, 0f, 0f, c.plain) } ?: l.drawPixels(tc, c.plain)
             } else {
                 val sc = tc.saveLayer(null, null)
                 drawContentInLayer(tc, l, clipBase, false, c)

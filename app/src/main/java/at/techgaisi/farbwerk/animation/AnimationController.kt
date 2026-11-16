@@ -200,7 +200,7 @@ object AnimationController {
         onionPaint.alpha = (alpha * 255).toInt().coerceIn(0, 255)
         for (l in frames[idx].layers) {
             if (!l.visible || !LayerGroups.isVisible(doc, l.groupId)) continue
-            canvas.drawBitmap(l.bitmap, 0f, 0f, onionPaint)
+            l.drawPixels(canvas, onionPaint)
         }
     }
 

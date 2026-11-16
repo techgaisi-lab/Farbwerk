@@ -299,10 +299,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         canvas.drawRect(bounds, shadowPaint)
         canvas.restore()
         Compositor.displayScale = currentScale()
-        val split = try { drawSplit(canvas, doc) } catch (t: Throwable) {
-            android.util.Log.e("Farbwerk", "split", t); releaseSplit(); false
-        }
-        if (!split) {
+        // The compositor now caches bounded pixel tiles instead of full-screen RenderNode layers.
+        run {
             canvas.save()
             applyDocTransform(canvas, doc)
             canvas.clipRect(bounds)
@@ -346,70 +344,6 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         canvas.save(); canvas.scale(inv, inv)
         canvas.drawPaint(checkerPaint)
         canvas.restore()
-    }
-
-    // ---------------------------------------------------------- Zerlegte Anzeige während eines Strichs
-
-    /**
-     * Während eines Pinselstrichs ändert sich nur die aktive Ebene. Hintergrund + Ebenen darunter und die Ebenen
-     * darüber werden dann einmal in je einen RenderNode mit eigener Ebene (Textur in Bildschirmgröße)
-     * aufgezeichnet; pro Bild zeichnet die GPU nur noch diese zwei Texturen und die aktive Ebene statt aller
-     * Ebenen. Neu aufgezeichnet wird nur, wenn sich darunter/darüber etwas ändert ([Compositor.stackSignature])
-     * oder die Ansicht bewegt wird. Nur wenn das Bild dadurch gleich bleibt ([Compositor.canSplit]).
-     */
-    private var belowNode: RenderNode? = null
-    private var aboveNode: RenderNode? = null
-    private var splitSignature = 0L
-    private var splitValid = false
-    private val splitMatrix = FloatArray(9)
-
-    private fun drawSplit(canvas: Canvas, doc: at.techgaisi.farbwerk.model.ArtDocument): Boolean {
-        val stroking = mode == Mode.STROKE && strokeHandler === state.brushEngine && state.brushEngine.isStroking
-        if (!stroking || !canvas.isHardwareAccelerated || width <= 0 || height <= 0) {
-            releaseSplit(); return false
-        }
-        val a = doc.activeIndex
-        if (!Compositor.canSplit(doc, a)) { releaseSplit(); return false }
-        val below = belowNode ?: RenderNode("farbwerk-below").also { it.setUseCompositingLayer(true, null); belowNode = it }
-        val above = aboveNode ?: RenderNode("farbwerk-above").also { it.setUseCompositingLayer(true, null); aboveNode = it }
-        val sig = Compositor.stackSignature(doc, a) * 31 + (if (doc.flipHorizontal) 1 else 0) + (if (doc.flipVertical) 2 else 0) +
-            width.toLong() * 7919 + height.toLong() * 104729
-        viewMatrix.getValues(tmpValues)
-        if (!splitValid || sig != splitSignature || !tmpValues.contentEquals(splitMatrix)) {
-            below.setPosition(0, 0, width, height)
-            above.setPosition(0, 0, width, height)
-            val rb = below.beginRecording(width, height)
-            try {
-                applyDocTransform(rb, doc)
-                rb.clipRect(docBounds)
-                drawChecker(rb, doc)
-                Compositor.drawBelow(rb, doc, a)
-            } finally { below.endRecording() }
-            val ra = above.beginRecording(width, height)
-            try {
-                applyDocTransform(ra, doc)
-                ra.clipRect(docBounds)
-                Compositor.drawLayers(ra, doc, a + 1, doc.layers.size)
-            } finally { above.endRecording() }
-            splitSignature = sig
-            tmpValues.copyInto(splitMatrix)
-            splitValid = true
-        }
-        canvas.drawRenderNode(below)
-        canvas.save()
-        applyDocTransform(canvas, doc)
-        canvas.clipRect(docBounds)
-        Compositor.drawLayers(canvas, doc, a, a + 1)
-        canvas.restore()
-        canvas.drawRenderNode(above)
-        return true
-    }
-
-    /** Zwischengespeicherte Anzeige verwerfen (Strichende): gibt die Texturen frei. */
-    private fun releaseSplit() {
-        if (!splitValid) return
-        splitValid = false
-        belowNode?.discardDisplayList(); aboveNode?.discardDisplayList()
     }
 
     // ---------------------------------------------------------- Schwebevorschau (eigene Überlagerung)
@@ -1485,7 +1419,6 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         holdEvent?.recycle(); holdEvent = null
         // Keine Referenz auf eine abgelöste Ansicht behalten (Galerie → neues Dokument erzeugt eine neue View)
         if (state.canvasView === this) state.canvasView = null
-        releaseSplit()
     }
 }
 

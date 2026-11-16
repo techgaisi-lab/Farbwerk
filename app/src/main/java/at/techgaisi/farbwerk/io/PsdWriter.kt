@@ -170,6 +170,7 @@ object PsdWriter {
             r.channelLens += enc.encodeBitmap(cd, mask, 0, 0, mask.width, mask.height,
                 if (mask.config == android.graphics.Bitmap.Config.ALPHA_8) -1 else 2 /* Graustufen: Helligkeit */)
         }
+        layer?.compactPixels()
     }
 
     private fun channelOf(argb: Int, cid: Int) = when (cid) {

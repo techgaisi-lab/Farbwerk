@@ -90,7 +90,7 @@ fun highQualityPossible(w: Int, h: Int): Boolean =
     w * 2 <= Importers.MAX_SIDE && h * 2 <= Importers.MAX_SIDE && (w * 2L) * (h * 2L) <= Importers.MAX_CANVAS_PIXELS
 
 /** Merkt sich die Wahl „Hohe Qualität (2×)“ für die laufende Sitzung (Standard: an). */
-internal object NewCanvasMemory { var highQuality by mutableStateOf(false) }
+internal object NewCanvasMemory { var highQuality by mutableStateOf(true) }
 
 /** Lokale Optik-Werte der Galerie (UI_SPEC §0, §3, §9) – bewusst nicht in Theme.kt. */
 internal object GalleryTokens {

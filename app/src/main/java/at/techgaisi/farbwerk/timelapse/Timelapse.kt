@@ -189,7 +189,7 @@ object Timelapse {
         val hidden = ArrayList<Layer>(2)
         for (l in doc.layers) if (l.isPrivate && l.visible) { l.visible = false; hidden.add(l) }
         try {
-            Compositor.draw(canvas, doc)
+            Compositor.drawCached(canvas, doc)
         } finally {
             for (l in hidden) l.visible = true
         }

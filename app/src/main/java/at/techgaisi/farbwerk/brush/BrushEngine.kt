@@ -67,6 +67,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private val smudger = Smudger(painter)
 
     private var buffer: Bitmap? = null
+    private var gpuStroke: GpuStroke? = null
+    val liveRenderer: String get() = if (gpuStroke != null) "GPU-Vorschau" else "CPU"
+    val workingBytes: Long get() = (buffer?.allocationByteCount?.toLong() ?: 0L) + (gpuStroke?.bytes ?: 0) +
+        (edit?.workingBytes ?: 0) + (preview.bitmapOrNull?.allocationByteCount ?: 0) + 8L * 1024 * 1024
     private var bufferCanvas: Canvas? = null
     private var layerCanvas: Canvas? = null
     private var edit: PixelEdit? = null
@@ -216,7 +220,10 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     /** Malen/Radieren: in den Strich-Puffer, plus alle Symmetrie-Kopien. */
     private val drawSink = DabConsumer { x, y, d, asp, ang, a, c, f ->
         val bc = bufferCanvas ?: return@DabConsumer
-        painter.draw(bc, x, y, d, asp, ang, a, c, f)
+        if (gpuStroke?.append(x, y, d, asp, ang, a, c, f) != true) {
+            materializeGpuStroke()
+            painter.draw(bc, x, y, d, asp, ang, a, c, f)
+        }
         addDirty(x, y, d, asp, ang, null)
         for (i in symm.indices) {
             val m = symm[i]
@@ -276,7 +283,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     private val sampler = ColorSampler { x, y ->
         val l = layer ?: return@ColorSampler 0
         val ix = x.toInt(); val iy = y.toInt()
-        if (ix < 0 || iy < 0 || ix >= l.width || iy >= l.height) 0 else l.bitmap.getPixel(ix, iy)
+        l.samplePixel(ix, iy)
     }
 
     /** Live-Anzeige: Ebene + Strich-Puffer. Der Compositor kümmert sich um Ebenen-Deckkraft/Mischmodus. */
@@ -284,7 +291,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val l = layer; val buf = buffer
         if (l != null && buf != null) {
             if (liveStale) { liveStale = false; if (active && deferDabs && shape == null) refreshLive(final = false) }
-            c.drawBitmap(l.bitmap, 0f, 0f, plainPaint)
+            val document = state.document
+            if (document != null) at.techgaisi.farbwerk.render.TiledCompositor.drawLayerPixels(c, document, l)
+            else l.drawPixels(c, plainPaint)
             val sel = state.document?.selection?.path
             if (sel != null) { c.save(); c.clipPath(sel) }
             liveArea.set(dirty)
@@ -309,6 +318,15 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         val doc = state.document ?: return
         val l = at.techgaisi.farbwerk.model.LayerOps.paintTarget(state) ?: return
         if (l.locked) { state.flash("Ebene gesperrt"); return }
+        state.undo.trimMemory(doc.width.toLong() * doc.height * 4 + 8L * 1024 * 1024)
+        val projectedWork = doc.width.toLong() * doc.height * 4 + 8L * 1024 * 1024
+        if (at.techgaisi.farbwerk.render.EngineMemory.available(doc, projectedWork, state.undo.memoryBytes) < 0) {
+            at.techgaisi.farbwerk.render.EngineMemory.clearCaches()
+            if (at.techgaisi.farbwerk.render.EngineMemory.available(doc, projectedWork, state.undo.memoryBytes) < 0) {
+                state.flash("Speicherbudget erreicht – Ebenen zusammenführen oder ein kleineres Dokument verwenden")
+                return
+            }
+        }
         val tool = temporaryTool ?: state.tool
         if (tool != Tool.PAINT && tool != Tool.SMUDGE && tool != Tool.ERASE) return
         strokeTool = tool
@@ -354,6 +372,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             brush[BP.PRESSURE_OPACITY] <= 0f && brush[BP.PRESSURE_FLOW] <= 0f
         ) max(3f * dMax, 48f) else 0f
         overlay = deferDabs && chunkLen <= 0f && symm.isEmpty()
+        if (overlay && doc.activeLayer === l && state.canvasView?.isHardwareAccelerated == true && !painter.unionCapable) {
+            gpuStroke = GpuStroke(doc.width, doc.height)
+        }
         heavyDabs = painter.pixelCost(dMax) > PREDICT_MAX_DAB_COST
         predictionSlow = false
         slowPreviews = 0
@@ -429,6 +450,8 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     override fun onStrokeEnd(p: InputPoint) {
+        val commitStarted = System.nanoTime()
+        materializeGpuStroke()
         predN = 0
         if (!active) { reset(); return }
         if (shape == null) {
@@ -443,6 +466,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
             if (deferDabs) refreshLive(final = true)
         }
         finish()
+        at.techgaisi.farbwerk.render.EngineDiagnostics.recordCommit(System.nanoTime() - commitStarted)
     }
 
     override fun onStrokeCancel() {
@@ -728,6 +752,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     override fun onHoldStill(p: InputPoint) {
+        materializeGpuStroke()
         if (!active || !state.prefs.quickShapeEnabled) return
         val sh = shape
         if (sh == null) {
@@ -854,7 +879,9 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
                 state.flash(label, EDIT_SHAPE_LABEL) { beginShapeEdit() }
             }
         }
+        l?.compactPixels()
         reset()
+        state.undo.trimMemory()
     }
 
     /**
@@ -862,14 +889,15 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
      * Pufferbitmap bei jedem Bild neu zur GPU übertragen werden (bei 2×-Leinwänden ~90 MB pro Bild).
      */
     private fun drawBufferLive(c: Canvas, buf: Bitmap) {
-        tiles.sync(buf, changed)
+        if (gpuStroke != null && !c.isHardwareAccelerated) materializeGpuStroke()
+        if (gpuStroke == null) tiles.sync(buf, changed)
         changed.setEmpty()
         if (preview.visible) {
             // Puffer + Strichende-Vorschau zuerst vereinen, dann gemeinsam (wie beim Einmischen) mit Strichdeckkraft,
             // Mischmodus und ggf. Alpha-Schwelle auftragen
             val sc = c.saveLayer(liveArea, mergePaint)
             val inner = if (thresholdOn) c.saveLayer(liveArea, thresholdPaint) else -1
-            if (!dirty.isEmpty) tiles.draw(c, dirty, livePaint)
+            if (!dirty.isEmpty) drawCommitted(c, livePaint)
             preview.draw(c, livePaint)
             if (inner >= 0) c.restoreToCount(inner)
             c.restoreToCount(sc)
@@ -877,9 +905,22 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
         }
         if (thresholdOn) {
             val sc = c.saveLayer(null, mergePaint)
-            tiles.draw(c, dirty, thresholdPaint)
+            drawCommitted(c, thresholdPaint)
             c.restoreToCount(sc)
-        } else tiles.draw(c, dirty, mergePaint)
+        } else drawCommitted(c, mergePaint)
+    }
+
+    private fun drawCommitted(c: Canvas, paint: Paint) {
+        val gpu = gpuStroke
+        if (gpu != null) gpu.draw(c, painter, dirty, paint) else tiles.draw(c, dirty, paint)
+    }
+
+    private fun materializeGpuStroke() {
+        val gpu = gpuStroke ?: return
+        gpuStroke = null
+        bufferCanvas?.let { gpu.replayInto(it, painter) }
+        changed.union(dirty)
+        gpu.release()
     }
 
     /** Zeichnet den Strich-Puffer mit Strichdeckkraft/Mischmodus (und ggf. Alpha-Schwelle). */
@@ -897,21 +938,15 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
      * des Auswahlpfads als Clip hängt in Skia vom Clip-Rechteck ab und wäre an Kachelgrenzen minimal anders.
      */
     private fun mergeBuffer(l: Layer, buf: Bitmap, sel: android.graphics.Path?) {
-        val c = Canvas(l.bitmap)
         if (sel != null) {
-            c.save()
-            c.clipRect(dirty)
-            c.clipPath(sel)
-            drawBuffer(c, buf)
-            c.restore()
+            val r = Rect(floor(dirty.left).toInt(), floor(dirty.top).toInt(), ceil(dirty.right).toInt(), ceil(dirty.bottom).toInt())
+            l.editPixels(r) { c ->
+                c.clipRect(dirty); c.clipPath(sel); drawBuffer(c, buf)
+            }
             return
         }
-        forEachTouchedRun(touchedFine, FINE) { tr ->
-            c.save()
-            c.clipRect(dirty)
-            c.clipRect(tr)
-            drawBuffer(c, buf)
-            c.restore()
+        forEachTouchedTile(touched, PixelEdit.TILE) { tr ->
+            l.editPixels(tr) { c -> c.clipRect(dirty); drawBuffer(c, buf) }
         }
     }
 
@@ -958,6 +993,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
     }
 
     private fun reset() {
+        gpuStroke?.release(); gpuStroke = null
         predN = 0
         painter.flush()
         stash.discard()
@@ -1268,6 +1304,7 @@ class BrushEngine(private val state: EditorState) : ToolInputHandler, QuickShape
 
     /** Gibt Speicher frei (z. B. beim Schließen eines Dokuments). */
     fun release() {
+        gpuStroke?.release(); gpuStroke = null
         if (editor != null) { clearBuffer(); endShapeEdit() }
         lastShape = null
         buffer?.recycle(); buffer = null; bufferCanvas = null

@@ -186,6 +186,9 @@ class EditorState(val context: Context) {
         internal set
 
     fun invalidate() {
+        if (!strokeActive && canvasOverride == null && (tool == Tool.PAINT || tool == Tool.ERASE)) {
+            document?.layers?.forEach { it.compactPixels() }
+        }
         revision++
         canvasView?.postInvalidateOnAnimation()
     }
@@ -218,6 +221,8 @@ class EditorState(val context: Context) {
 
     // ---------------- Dokument öffnen/schließen ----------------
     fun openDocument(doc: ArtDocument) {
+        at.techgaisi.farbwerk.render.EngineMemory.configure(context)
+        at.techgaisi.farbwerk.render.EngineMemory.clearCaches()
         // Sitzungen des bisherigen Dokuments (z. B. bei "Leinwandgröße ändern") verwerfen,
         // bevor das neue Dokument gesetzt wird – sie verweisen noch auf alte Ebenen.
         canvasView?.abortStroke()

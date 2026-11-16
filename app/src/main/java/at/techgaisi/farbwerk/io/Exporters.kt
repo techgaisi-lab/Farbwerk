@@ -77,13 +77,13 @@ object Exporters {
                 // Kopien auf Main, Kodieren im Hintergrund
                 val json = ProjectFormat.toJson(doc)
                 val copies = doc.layers.map {
-                    ProjectFormat.LayerData(it.bitmap.copy(Bitmap.Config.ARGB_8888, false),
+                    ProjectFormat.LayerData(it.snapshotPixels(),
                         it.mask?.let { m -> m.copy(m.config ?: Bitmap.Config.ARGB_8888, false) })
                 }
                 val thumb = thumbnail(doc)
                 withContext(Dispatchers.IO) {
                     try { ProjectFormat.write(out, json, copies, thumb) }
-                    finally { copies.forEach { it.bitmap.recycle(); it.mask?.recycle() } }
+                    finally { copies.forEach { it.mask?.recycle() } }
                 }
             }
             ExportFormat.PNG -> {
@@ -121,7 +121,7 @@ object Exporters {
         val s = min(1f, 512f / maxOf(doc.width, doc.height))
         val b = Bitmap.createBitmap(maxOf(1, (doc.width * s).toInt()), maxOf(1, (doc.height * s).toInt()), Bitmap.Config.ARGB_8888)
         val c = Canvas(b); c.scale(b.width / doc.width.toFloat(), b.height / doc.height.toFloat())
-        Compositor.draw(c, doc); b
+        Compositor.drawCached(c, doc); b
     } catch (_: Throwable) { null }
 
     /** Zusammengefügtes Bild ohne Transparenz (für JPEG/PDF). */
