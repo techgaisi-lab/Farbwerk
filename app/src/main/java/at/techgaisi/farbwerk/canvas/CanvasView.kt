@@ -778,8 +778,8 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
         cancelTimers()
         fingerSuppressed = false
         strokeTempTool = null
-        // Geringste Latenz: Ereignisse dieses Kontakts nicht bündeln (nicht erst zum nächsten Frame liefern)
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) requestUnbufferedDispatch(e)
+        // Frame-gebündelte Zustellung beibehalten: onMove verarbeitet auch alle historischen Samples.
+        // Ungebündelte Zustellung vervielfacht UI-Arbeit und Vorhersagen zwischen zwei Bildern.
         state.copyPasteMenuVisible = false
         if (state.openPanel != at.techgaisi.farbwerk.model.Panel.NONE) {
             // Tippen auf die Leinwand schließt offene Panels (wie im Original) – und malt nicht.
@@ -1028,7 +1028,7 @@ class CanvasView(context: Context, private val state: EditorState) : View(contex
                 val h = strokeHandler
                 try { h?.onStrokeMove(pts) } catch (t: Throwable) { android.util.Log.e("Farbwerk", "move", t) }
                 dispatchPrediction(h)
-                invalidate()
+                postInvalidateOnAnimation()
             }
             Mode.GESTURE -> {
                 if (!gestureMoved && !gestureConsumed) {

@@ -21,6 +21,7 @@ import kotlinx.coroutines.withContext
 import java.io.File
 import java.io.FileOutputStream
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.max
 import kotlin.math.roundToInt
 
@@ -47,6 +48,8 @@ object Timelapse {
     val RESOLUTIONS = listOf(1080 to "1080p", 1440 to "2K", 2160 to "4K")
 
     private val main = Handler(Looper.getMainLooper())
+    // Höchstens ein gerendertes Bild beim Schreiber halten; weitere Änderungen zusammenfassen.
+    private val writeInFlight = AtomicBoolean(false)
     private val writerExecutor = Executors.newSingleThreadExecutor { r ->
         Thread(r, "Zeitraffer-Schreiber").apply { priority = Thread.NORM_PRIORITY - 1 }
     }
@@ -72,6 +75,10 @@ object Timelapse {
                     main.postDelayed(this, if (st.strokeActive) IDLE_AFTER_STROKE_MS else IDLE_AFTER_STROKE_MS - sinceStroke)
                     return
                 }
+            }
+            if (st != null && writeInFlight.get()) {
+                main.postDelayed(this, MIN_INTERVAL_MS)
+                return
             }
             scheduled = false
             st?.let { capture(it) }
@@ -150,14 +157,23 @@ object Timelapse {
     /** Rendert das verkleinerte Bild (Main-Thread) und übergibt es dem Schreib-Thread. */
     private fun capture(state: EditorState) {
         val doc = state.document ?: return
-        if (doc.width <= 0 || doc.height <= 0) return
+        if (doc.width <= 0 || doc.height <= 0 || !isEnabled(state.context)) return
         lastCaptureAt = SystemClock.uptimeMillis()
         val bmp = try { renderScaled(doc, maxSide(state.context)) } catch (t: Throwable) {
             android.util.Log.w("Farbwerk", "Zeitraffer-Bild fehlgeschlagen", t); return
         }
         val id = doc.id
         val folder = dir(state.context, id)
-        writerExecutor.execute { write(id, folder, bmp) }
+        writeInFlight.set(true)
+        try {
+            writerExecutor.execute {
+                try { write(id, folder, bmp) } finally { writeInFlight.set(false) }
+            }
+        } catch (t: Throwable) {
+            writeInFlight.set(false)
+            bmp.recycle()
+            android.util.Log.w("Farbwerk", "Zeitraffer-Auftrag fehlgeschlagen", t)
+        }
     }
 
     /** Zusammengesetztes Bild, lange Seite höchstens [maxSide], private Ebenen ausgeblendet, deckend. */
