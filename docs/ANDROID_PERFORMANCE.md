@@ -5,9 +5,23 @@ Gemeldetes Gerät: Galaxy Tab S10 Ultra mit laut Nutzer aktueller One UI. Der Ei
 
 Untersucht wurden Android-Eingabe, Pinsel, Compositor, Undo, Zeitraffer und Speicherung. Kein Tablet war für Messungen angeschlossen.
 
+## Neue Eingrenzung durch den Gerätetest
+
+Der Nutzer meldet nun einen unmittelbaren A/B-Unterschied bei Bildschirmgröße, sowohl mit normaler als auch 2×-Leinwand: Auf leerer Leinwand laufen auch aufwendige Pinsel flüssig; nach dem Einfügen eines Bildes stottert derselbe Pinsel stark, mit geschätzt 0,2 FPS und deutlichem Nachlauf. Dies ist eine Nutzerbeobachtung, keine instrumentierte FPS-Messung. Die frühere Auflösungsänderung erklärt diesen Auslöser nicht und behebt ihn nach diesem Test nicht ausreichend.
+
+Im geprüften Code kopiert `Importers.insertImageAsLayer` das Bild einmal in eine reguläre dokumentgroße Bitmap und aktiviert Transformieren. Beim regulären Werkzeugwechsel wird die Transformation übernommen oder verworfen. Während des Malens zeichnet `BrushEngine.override` den unveränderten Inhalt der aktiven Ebene zusätzlich zum Strichpuffer; `Compositor.drawLayer` isoliert Overrides über `saveLayer`. `CanvasView.drawSplit` kann unveränderte Ebenen darunter/darüber cachen, jedoch nicht den Inhalt der aktiven Ebene. Das sind untersuchte Codepfade, noch kein Nachweis eines Fehlers darin.
+
+Noch zu klären:
+- Zeichnen direkt auf dem eingefügten Bild oder auf einer leeren Ebene darüber?
+- Wird Zeichnen auf einer leeren Ebene sofort wieder flüssig, wenn ausschließlich die Bildebene ausgeblendet wird (gleiche Ansicht, Pinselbreite und Einstellungen)?
+- Welche installierte Variante wurde getestet?
+- Bleibt der Einbruch nach Speichern und erneutem Öffnen bestehen? Dies würde einen nur vorübergehend aktiven Transformations-Override weiter eingrenzen.
+
+Der nächste Fix muss diesen Bild-einfügen-Vergleich bestehen. Weitere Änderungen an Pinselqualität oder Auflösung allein gelten dafür nicht als ausreichende Abnahme.
+
 ## Belegte Lastverstärker
 
-1. **Automatische Auflösungsvergrößerung.** `CanvasQuality.detailFor` verwendet bisher standardmäßig hohe Qualität; auch bei ausgeschalteter hoher Qualität wurden kleine Dokumente bis zur Bildschirmgröße vergrößert. `NewCanvasMemory.highQuality` startet mit true. `Importers.fromBitmap` verwendet den Standardwert ebenfalls.
+1. **Automatische Auflösungsvergrößerung.** `CanvasQuality.detailFor` verwendet bisher standardmäßig hohe Qualität; auch bei ausgeschalteter hoher Qualität wurden kleine Dokumente bis zur Bildschirmgröße vergrößert. `NewCanvasMemory.highQuality` startet mit true. `Importers.documentFromImage` verwendet den Standardwert ebenfalls.
    Beispiel bei 3200 px Bildschirm-Langseite: 1920 × 1080 wird intern 5760 × 3240, also 9-fache Pixelzahl. Eine ARGB-Ebene benötigt dann rund 71,2 MiB statt 7,9 MiB, ohne GPU-Kopie, Strichpuffer und Undo. Bei Faktor 4 sind es 16-mal so viele Pixel.
    `BrushEngine.diameterFor` multipliziert bei dynamischer Pinselskalierung auch den Durchmesser mit detailScale. Texturarbeit wächst damit ungefähr quadratisch.
 
