@@ -90,7 +90,7 @@ fun highQualityPossible(w: Int, h: Int): Boolean =
     w * 2 <= Importers.MAX_SIDE && h * 2 <= Importers.MAX_SIDE && (w * 2L) * (h * 2L) <= Importers.MAX_CANVAS_PIXELS
 
 /** Merkt sich die Wahl „Hohe Qualität (2×)“ für die laufende Sitzung (Standard: an). */
-internal object NewCanvasMemory { var highQuality by mutableStateOf(true) }
+internal object NewCanvasMemory { var highQuality by mutableStateOf(false) }
 
 /** Lokale Optik-Werte der Galerie (UI_SPEC §0, §3, §9) – bewusst nicht in Theme.kt. */
 internal object GalleryTokens {
@@ -209,7 +209,7 @@ private fun HighQualityRow() {
     ) {
         Column(Modifier.weight(1f)) {
             Text("Hohe Qualität", color = GalleryTokens.textPrimary, fontSize = 14.sp)
-            Text("Doppelte Auflösung – auch stark gezoomt scharf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
+            Text("Mehr Pixel und höherer Speicher- und Energiebedarf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         MiniSwitch(on)
