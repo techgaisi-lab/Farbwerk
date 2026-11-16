@@ -1,6 +1,8 @@
 # Android: Performance-Untersuchung und erster Fix
 
 Untersuchter Stand: `5fd70aad76c659dbd62490e72e2b738befc9ca10` (main).
+Gemeldetes Gerät: Galaxy Tab S10 Ultra mit laut Nutzer aktueller One UI. Der Einbruch tritt beim Hinzufügen von Ebenen und Verwenden mehrerer unterschiedlicher Pinsel auf; genaue Android-/One-UI-Buildnummer und Leinwandgröße sind noch unbekannt.
+
 Untersucht wurden Android-Eingabe, Pinsel, Compositor, Undo, Zeitraffer und Speicherung. Kein Tablet war für Messungen angeschlossen.
 
 ## Belegte Lastverstärker
@@ -24,6 +26,15 @@ Untersucht wurden Android-Eingabe, Pinsel, Compositor, Undo, Zeitraffer und Spei
 - Regressionstests sichern Standardauflösung, explizite hohe Qualität und Größenbegrenzungen.
 
 Es wird keine neue GPU-Pinsel-Engine eingeführt. Der CPU-Pinselpfad, Undo-Limit (384 MiB), große Ebenentexturen, Masken und aufwendige Mischmodi bleiben mögliche Engpässe. Eine Speicherleck- oder Thermal-Throttling-Diagnose ist ohne Laufzeitprofil nicht belegt.
+
+## Lokale Prüfung
+
+- Android-Kotlin-Kompilierung erfolgreich.
+- Beide Tests in `CanvasQualityTest`: bestanden, keine Fehler, keine übersprungenen Tests.
+- `:app:assembleDebug`: erfolgreich; APK erstellt.
+- `git diff --check`: erfolgreich.
+- Verwendet wurden JDK 21 und Gradle 8.14.3. Lokal fehlt Build Tools 35.0.0; daher erfolgte die Prüfung mit den installierten Build Tools 36.0.0 über ein externes Init-Skript. Ein lokaler Testschlüssel wurde ebenfalls nur darüber gesetzt. Die Projektdateien wurden hierfür nicht verändert.
+- Kein per ADB angeschlossenes Android-Gerät: Eingabegefühl, Bildgleichheit, Zeitraffer-Rückstau und Langzeittemperatur sind nicht am Gerät verifiziert.
 
 ## Android-Abnahme (noch offen)
 
