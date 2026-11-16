@@ -48,7 +48,10 @@ internal object ProjectFormat {
     const val EXTENSION = "farbwerk"
 
     /** Unveränderliche Momentaufnahme einer Ebene, wie sie geschrieben wird. */
-    class LayerData(val bitmap: Bitmap, val mask: Bitmap?)
+    class LayerData(val pixels: at.techgaisi.farbwerk.render.PixelTiles, val mask: Bitmap?) {
+        constructor(bitmap: Bitmap, mask: Bitmap?) : this(at.techgaisi.farbwerk.render.PixelTiles.from(bitmap), mask)
+        val bitmap: Bitmap get() = pixels.bitmap() // PNG export only; released after each layer.
+    }
 
     // ------------------------------------------------------------------ JSON
 
@@ -185,6 +188,7 @@ internal object ProjectFormat {
                     if (!l.bitmap.compress(Bitmap.CompressFormat.PNG, 100, NonClosing(zip))) {
                         throw IOException("PNG-Kodierung fehlgeschlagen (Ebene $i)")
                     }
+                    l.pixels.compact()
                     zip.closeEntry()
                     l.mask?.let { m ->
                         zip.putNextEntry(ZipEntry("masks/$i.png"))
@@ -239,7 +243,7 @@ internal object ProjectFormat {
                 layers.forEachIndexed { i, l ->
                     val lo = arr?.optJSONObject(i)
                     val id = lo?.optString("id").orEmpty()
-                    val blob = LayerCodec.encode(l.bitmap, old?.layer(id, false), stats?.tiles)
+                    val blob = LayerCodec.encode(l.pixels, old?.layer(id, false), stats?.tiles)
                     putStored(zip, "layers/$i.fwl", blob)
                     lo?.put("file", "layers/$i.fwl")
                     val m = l.mask
@@ -345,12 +349,22 @@ internal object ProjectFormat {
         }
         for (i in 0 until arr.length()) {
             val lo = arr.getJSONObject(i)
-            val bmp = readEntry(lo.optString("file", "layers/$i.png"))
-            val layer = Layer(
-                lo.optString("name", "Ebene ${i + 1}"),
-                fitToSize(bmp, w, h),
-                lo.optString("id").ifEmpty { java.util.UUID.randomUUID().toString() },
-            )
+            val name = lo.optString("name", "Ebene ${i + 1}")
+            val id = lo.optString("id").ifEmpty { java.util.UUID.randomUUID().toString() }
+            val fileName = lo.optString("file", "layers/$i.png")
+            val entry = zip.getEntry(fileName)
+            val pixels = if (fileName.endsWith(".fwl") && entry != null) {
+                LayerCodec.decodeTiles(zip.getInputStream(entry).use { it.readBytes() },
+                    at.techgaisi.farbwerk.render.EngineMemory.javaPixelBudget - doc.layers.sumOf { it.encodedPixelBytes })
+            } else null
+            val layer = if (pixels != null && pixels.width == w && pixels.height == h) {
+                Layer.fromPixels(name, pixels, id)
+            } else {
+                val b = fitToSize(pixels?.bitmap() ?: readEntry(fileName), w, h)
+                val result = Layer.fromPixels(name, at.techgaisi.farbwerk.render.PixelTiles.from(b), id)
+                b.recycle()
+                result
+            }
             layer.visible = lo.optBoolean("visible", true)
             layer.opacity = lo.optDouble("opacity", 1.0).toFloat().coerceIn(0f, 1f)
             layer.blend = enumOr(lo.optString("blend"), LayerBlend.NORMAL)

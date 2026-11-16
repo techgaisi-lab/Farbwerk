@@ -36,16 +36,16 @@ class LayerPixelsAction(
     override val label: String,
     private val layer: Layer,
     private val rect: Rect,
-    private val before: Bitmap,
-    private val after: Bitmap,
+    before: Bitmap,
+    after: Bitmap,
 ) : UndoAction {
-    override val bytes: Long get() = before.allocationByteCount.toLong() + after.allocationByteCount
+    private val before = at.techgaisi.farbwerk.render.PixelTiles.from(before)
+    private val after = at.techgaisi.farbwerk.render.PixelTiles.from(after)
+    override val bytes: Long get() = before.storedBytes + after.storedBytes
     override fun undo() = put(before)
     override fun redo() = put(after)
-    private fun put(src: Bitmap) {
-        val c = Canvas(layer.bitmap)
-        val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
-        c.drawBitmap(src, rect.left.toFloat(), rect.top.toFloat(), p)
+    private fun put(src: at.techgaisi.farbwerk.render.PixelTiles) {
+        putSnapshot(layer, src, rect)
     }
 }
 
@@ -61,21 +61,28 @@ class LayerTilesAction(
     override val label: String,
     private val layer: Layer,
     private val rects: List<Rect>,
-    private val before: List<Bitmap>,
-    after: List<Bitmap>? = null,
+    private val before: List<at.techgaisi.farbwerk.render.PixelTiles>,
+    after: List<at.techgaisi.farbwerk.render.PixelTiles>? = null,
 ) : UndoAction {
-    private var after: List<Bitmap>? = after
-    override val bytes: Long = before.sumOf { it.allocationByteCount.toLong() } *
-        (if (after == null) 2 else 1) + (after?.sumOf { it.allocationByteCount.toLong() } ?: 0L)
+    private var after = after
+    override val bytes: Long get() = before.sumOf { it.storedBytes } +
+        (after?.sumOf { it.storedBytes } ?: rects.sumOf { it.width().toLong() * it.height() * 4 })
     override fun undo() {
-        if (after == null) after = rects.map { Bitmap.createBitmap(layer.bitmap, it.left, it.top, it.width(), it.height()) }
+        if (after == null) after = rects.map { layer.snapshotRegion(it) }
         put(before)
     }
     override fun redo() { after?.let { put(it) } }
-    private fun put(src: List<Bitmap>) {
-        val c = Canvas(layer.bitmap)
-        val p = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
-        for (i in rects.indices) c.drawBitmap(src[i], rects[i].left.toFloat(), rects[i].top.toFloat(), p)
+    private fun put(src: List<at.techgaisi.farbwerk.render.PixelTiles>) {
+        for (i in rects.indices) putSnapshot(layer, src[i], rects[i])
+    }
+}
+
+private fun putSnapshot(layer: Layer, source: at.techgaisi.farbwerk.render.PixelTiles, area: Rect) {
+    for (y in 0 until source.height step 256) for (x in 0 until source.width step 256) {
+        val r = Rect(x, y, minOf(x + 256, source.width), minOf(y + 256, source.height))
+        val b = source.region(r)
+        try { layer.putPixels(b, Rect(area.left + r.left, area.top + r.top, area.left + r.right, area.top + r.bottom)) }
+        finally { b.recycle() }
     }
 }
 
@@ -83,7 +90,8 @@ class UndoManager(private val state: EditorState) {
     private val undoStack = ArrayDeque<UndoAction>()
     private val redoStack = ArrayDeque<UndoAction>()
     private var totalBytes = 0L
-    private val maxBytes = 384L * 1024 * 1024
+    val memoryBytes: Long get() = undoStack.sumOf { it.bytes } + redoStack.sumOf { it.bytes }
+    fun trimMemory(workBytes: Long = state.brushEngine.workingBytes) = trim(workBytes)
 
     /** Ändert sich bei jeder Verlaufsänderung (für Compose). */
     var version by mutableIntStateOf(0)
@@ -111,6 +119,7 @@ class UndoManager(private val state: EditorState) {
         val a = undoStack.removeLastOrNull() ?: return false
         a.undo()
         redoStack.addLast(a)
+        trim()
         state.markDirty()
         state.flash("Rückgängig: ${a.label}")
         state.invalidate()
@@ -124,6 +133,7 @@ class UndoManager(private val state: EditorState) {
         val a = redoStack.removeLastOrNull() ?: return false
         a.redo()
         undoStack.addLast(a)
+        trim()
         state.markDirty()
         state.flash("Wiederholen: ${a.label}")
         state.invalidate()
@@ -135,12 +145,15 @@ class UndoManager(private val state: EditorState) {
         undoStack.clear(); redoStack.clear(); totalBytes = 0; version++
     }
 
-    private fun trim() {
+    private fun trim(workBytes: Long = state.brushEngine.workingBytes) {
+        totalBytes = memoryBytes
+        val maxBytes = at.techgaisi.farbwerk.render.EngineMemory.undoLimit(state.document, workBytes)
         val limit = state.prefs.undoLimit.coerceAtLeast(1)
-        while (undoStack.size > limit || (totalBytes > maxBytes && undoStack.size > 1)) {
+        while (undoStack.isNotEmpty() && (undoStack.size > limit || totalBytes > maxBytes)) {
             val a = undoStack.removeFirst()
             totalBytes -= a.bytes
         }
+        while (redoStack.isNotEmpty() && totalBytes > maxBytes) totalBytes -= redoStack.removeFirst().bytes
     }
 }
 
@@ -172,7 +185,9 @@ class PixelEdit internal constructor(
 
     // ---------------- verzögerte Sicherung ----------------
     /** Kachelindex → Originalpixel der Kachel ([TILE]×[TILE], am Rand kleiner). */
-    private val saved = HashMap<Int, Bitmap>()
+    private val saved = HashMap<Int, at.techgaisi.farbwerk.render.PixelTiles>()
+    val workingBytes: Long get() = saved.values.sumOf { it.storedBytes } +
+        (before?.allocationByteCount ?: 0) + (fullOriginal?.allocationByteCount ?: 0)
     private val tilesX = (layer.width + TILE - 1) / TILE
     private val srcPaint = Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) }
 
@@ -197,7 +212,7 @@ class PixelEdit internal constructor(
     private fun saveTile(k: Int) {
         val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
         if (x0 >= layer.width || y0 >= layer.height) return
-        saved[k] = Bitmap.createBitmap(layer.bitmap, x0, y0, minOf(TILE, layer.width - x0), minOf(TILE, layer.height - y0))
+        saved[k] = layer.snapshotRegion(Rect(x0, y0, minOf(x0 + TILE, layer.width), minOf(y0 + TILE, layer.height)))
     }
 
     /** Originalpixel (Zustand vor der Bearbeitung) im Bereich [r] als neue Bitmap (nur lesen!). */
@@ -207,18 +222,16 @@ class PixelEdit internal constructor(
         val out = Bitmap.createBitmap(r.width(), r.height(), Bitmap.Config.ARGB_8888)
         val c = Canvas(out)
         c.translate(-r.left.toFloat(), -r.top.toFloat())
-        c.drawBitmap(layer.bitmap, 0f, 0f, srcPaint)
+        layer.drawPixels(c, srcPaint)
         drawSaved(c, r)
         return out
     }
 
     /** Stellt im Bereich [r] den Zustand vor der Bearbeitung wieder her (Ebene bleibt in Bearbeitung). */
     fun restore(r: Rect) {
-        val c = Canvas(layer.bitmap)
-        c.save()
-        c.clipRect(r)
-        if (before != null) c.drawBitmap(before, 0f, 0f, srcPaint) else drawSaved(c, r)
-        c.restore()
+        layer.editPixels(r) { c ->
+            if (before != null) c.drawBitmap(before, 0f, 0f, srcPaint) else drawSaved(c, r)
+        }
     }
 
     /** Zeichnet alle gesicherten Originale, die [r] berühren, an ihre Position (SRC). */
@@ -226,7 +239,9 @@ class PixelEdit internal constructor(
         for ((k, b) in saved) {
             val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
             if (x0 >= r.right || y0 >= r.bottom || x0 + b.width <= r.left || y0 + b.height <= r.top) continue
-            c.drawBitmap(b, x0.toFloat(), y0.toFloat(), srcPaint)
+            c.save(); c.clipRect(x0, y0, x0 + b.width, y0 + b.height); c.clipRect(r)
+            c.drawColor(0, PorterDuff.Mode.CLEAR)
+            c.translate(x0.toFloat(), y0.toFloat()); b.draw(c, srcPaint); c.restore()
         }
     }
 
@@ -241,7 +256,7 @@ class PixelEdit internal constructor(
         doc.selection?.let { sel -> applySelection(sel, r, Bitmap.createBitmap(before, r.left, r.top, r.width(), r.height())) }
 
         val b = Bitmap.createBitmap(before, r.left, r.top, r.width(), r.height())
-        val a = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
+        val a = layer.pixelRegion(r)
         state.undo.push(LayerPixelsAction(label, layer, r, b, a))
         state.invalidate()
     }
@@ -257,7 +272,7 @@ class PixelEdit internal constructor(
             }
         }
         val rects = ArrayList<Rect>(saved.size)
-        val bs = ArrayList<Bitmap>(saved.size)
+        val bs = ArrayList<at.techgaisi.farbwerk.render.PixelTiles>(saved.size)
         for (k in saved.keys.sorted()) {
             val tile = saved.getValue(k)
             val x0 = (k % tilesX) * TILE; val y0 = (k / tilesX) * TILE
@@ -265,11 +280,14 @@ class PixelEdit internal constructor(
             if (!tr.intersect(r)) continue
             rects += tr
             bs += if (tr.width() == tile.width && tr.height() == tile.height) tile
-                else Bitmap.createBitmap(tile, tr.left - x0, tr.top - y0, tr.width(), tr.height())
+                else tile.snapshotRegion(Rect(tr.left - x0, tr.top - y0, tr.right - x0, tr.bottom - y0))
         }
         saved.clear()
         if (rects.isEmpty()) { state.invalidate(); return }
-        doc.selection?.let { sel -> for (i in rects.indices) applySelection(sel, rects[i], bs[i]) }
+        doc.selection?.let { sel -> for (i in rects.indices) {
+            val b = bs[i].region(Rect(0, 0, bs[i].width, bs[i].height))
+            try { applySelection(sel, rects[i], b) } finally { b.recycle() }
+        } }
         // „nachher“ liest die Aktion erst beim Rückgängigmachen (siehe LayerTilesAction)
         state.undo.push(LayerTilesAction(label, layer, rects, bs))
         state.invalidate()
@@ -280,29 +298,31 @@ class PixelEdit internal constructor(
      * Vormultipliziert → ADD ist exakt.
      */
     private fun applySelection(sel: at.techgaisi.farbwerk.model.Selection, r: Rect, beforeCrop: Bitmap) {
-        val afterCrop = Bitmap.createBitmap(layer.bitmap, r.left, r.top, r.width(), r.height())
-            .copy(Bitmap.Config.ARGB_8888, true)
+        val afterCrop = layer.pixelRegion(r)
         val bc = beforeCrop.copy(Bitmap.Config.ARGB_8888, true)
         val maskCrop = Bitmap.createBitmap(sel.mask, r.left, r.top, r.width(), r.height())
         Canvas(afterCrop).drawBitmap(maskCrop, 0f, 0f,
             Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_IN) })
         Canvas(bc).drawBitmap(maskCrop, 0f, 0f,
             Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.DST_OUT) })
-        val c = Canvas(layer.bitmap)
-        c.drawBitmap(bc, r.left.toFloat(), r.top.toFloat(),
-            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
-        c.drawBitmap(afterCrop, r.left.toFloat(), r.top.toFloat(),
-            Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.ADD) })
+        layer.editPixels(r) { c ->
+            c.drawBitmap(bc, r.left.toFloat(), r.top.toFloat(),
+                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
+            c.drawBitmap(afterCrop, r.left.toFloat(), r.top.toFloat(),
+                Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.ADD) })
+        }
     }
 
     fun cancel() {
         if (finished) return
         finished = true
         if (before != null) {
-            val c = Canvas(layer.bitmap)
-            c.drawBitmap(before, 0f, 0f, Paint().apply { xfermode = PorterDuffXfermode(PorterDuff.Mode.SRC) })
+            layer.putPixels(before, Rect(0, 0, layer.width, layer.height))
         } else {
-            drawSaved(Canvas(layer.bitmap), Rect(0, 0, layer.width, layer.height))
+            for ((k, b) in saved) {
+                val x = k % tilesX * TILE; val y = k / tilesX * TILE
+                putSnapshot(layer, b, Rect(x, y, x + b.width, y + b.height))
+            }
             saved.clear()
         }
         state.invalidate()

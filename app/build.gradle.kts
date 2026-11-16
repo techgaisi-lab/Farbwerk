@@ -34,6 +34,16 @@ android {
     }
 }
 
+tasks.withType<Test>().configureEach {
+    val testHome = providers.gradleProperty("farbwerk.testHome").orNull?.let { file(it) }
+        ?: layout.buildDirectory.dir("test-home").get().asFile
+    val testTemp = File(testHome, "tmp")
+    doFirst { testHome.mkdirs(); testTemp.mkdirs() }
+    systemProperty("user.home", testHome.absolutePath)
+    systemProperty("java.io.tmpdir", testTemp.absolutePath)
+    systemProperty("robolectric.dependency.repo.url", "https://repo.maven.apache.org/maven2")
+}
+
 dependencies {
     val composeBom = platform("androidx.compose:compose-bom:2025.05.01")
     implementation(composeBom)
@@ -49,4 +59,5 @@ dependencies {
     // Bewegungsvorhersage für Stift/Finger (geringere sichtbare Latenz beim Malen)
     implementation("androidx.input:input-motionprediction:1.0.1")
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.robolectric:robolectric:4.14.1")
 }

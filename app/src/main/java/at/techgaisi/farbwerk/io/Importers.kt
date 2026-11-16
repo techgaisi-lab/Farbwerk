@@ -114,7 +114,8 @@ object Importers {
             c.drawBitmap(bitmap, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
             out
         }
-        doc.layers.add(Layer("Ebene 1", layerBmp))
+        doc.layers.add(Layer.fromPixels("Ebene 1", at.techgaisi.farbwerk.render.PixelTiles.from(layerBmp), java.util.UUID.randomUUID().toString()))
+        if (layerBmp !== bitmap) layerBmp.recycle()
         doc.activeIndex = 0
         doc.dirty = true
         return doc
@@ -130,14 +131,16 @@ object Importers {
      */
     fun insertImageAsLayer(state: EditorState, image: Bitmap, name: String, transform: Boolean = true, private: Boolean = false) {
         val doc = state.document ?: return
-        val layerBmp = doc.newLayerBitmap()
+        val pixels = at.techgaisi.farbwerk.render.PixelTiles(doc.width, doc.height)
         val s = min(1f, min(doc.width / image.width.toFloat(), doc.height / image.height.toFloat()))
         val dw = image.width * s; val dh = image.height * s
-        val c = Canvas(layerBmp)
-        c.translate((doc.width - dw) / 2f, (doc.height - dh) / 2f)
-        c.scale(s, s)
-        c.drawBitmap(image, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
-        val layer = Layer(name.take(60).ifBlank { "Eingefügtes Bild" }, layerBmp).also { it.isPrivate = private }
+        val x = (doc.width - dw) / 2f; val y = (doc.height - dh) / 2f
+        val bounds = android.graphics.Rect(kotlin.math.floor(x).toInt(), kotlin.math.floor(y).toInt(), kotlin.math.ceil(x + dw).toInt(), kotlin.math.ceil(y + dh).toInt())
+        pixels.edit(bounds) { c ->
+            c.translate(x, y); c.scale(s, s)
+            c.drawBitmap(image, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG or Paint.ANTI_ALIAS_FLAG))
+        }
+        val layer = Layer.fromPixels(name.take(60).ifBlank { "Eingefügtes Bild" }, pixels, java.util.UUID.randomUUID().toString()).also { it.isPrivate = private }
         val ok = addLayer(state, layer, if (private) "Privat einfügen" else "Bild einfügen")
         if (ok && transform) state.selectTool(Tool.TRANSFORM)
     }
@@ -145,10 +148,13 @@ object Importers {
     /** Fügt eine fertige Ebene über der aktiven ein (Undo-fähig). */
     fun addLayer(state: EditorState, layer: Layer, label: String): Boolean {
         val doc = state.document ?: return false
+        if (at.techgaisi.farbwerk.render.EngineMemory.available(doc, state.brushEngine.workingBytes, state.undo.memoryBytes) < layer.pixelBytes) {
+            state.flash("Speicherbudget erreicht – Bild kann nicht als weitere Ebene eingefügt werden")
+            return false
+        }
         val max = at.techgaisi.farbwerk.model.LayerOps.maxLayers(state)
         if (doc.layers.size >= max) {
             state.flash("Maximale Ebenenzahl erreicht ($max)")
-            layer.bitmap.recycle()
             return false
         }
         if (state.tool == Tool.TRANSFORM) state.transformTool.commit()
@@ -165,7 +171,7 @@ object Importers {
                 doc.layers.add(idx.coerceAtMost(doc.layers.size), layer)
                 doc.activeIndex = doc.indexOf(layer)
             },
-            bytes = layer.bitmap.allocationByteCount.toLong(),
+            bytes = layer.pixelBytes,
         ))
         state.invalidate()
         return true

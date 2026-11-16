@@ -58,7 +58,9 @@ class LayerThumbnailCache {
             alive += l.id
             val e = obtain(thumbs, l.id, tw, th)
             e.bitmap.eraseColor(Color.TRANSPARENT)
-            Canvas(e.bitmap).drawBitmap(l.displayOverride ?: l.bitmap, null, dst, paint)
+            val tc = Canvas(e.bitmap)
+            tc.scale(tw.toFloat() / doc.width, th.toFloat() / doc.height)
+            l.displayOverride?.let { tc.drawBitmap(it, 0f, 0f, paint) } ?: l.drawPixels(tc, paint)
             val m = l.mask
             if (m != null) {
                 val me = obtain(maskThumbs, l.id, tw, th)

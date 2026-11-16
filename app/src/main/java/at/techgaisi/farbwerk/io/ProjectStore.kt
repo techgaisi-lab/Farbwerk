@@ -201,7 +201,7 @@ class ProjectStore(private val context: Context) {
         val json = ProjectFormat.toJson(doc)
         val id = doc.id
         // Momentaufnahme der Ebenen-Referenzen (Bitmaps selbst werden im Hintergrund gelesen)
-        val layers = doc.layers.map { ProjectFormat.LayerData(it.bitmap, it.mask) }
+        val layers = doc.layers.map { ProjectFormat.LayerData(it.snapshotPixels(), it.mask) }
         val info = ProjectInfo(
             id = id, name = doc.name, width = doc.width, height = doc.height, modified = doc.modified,
             layerCount = doc.layers.size, created = doc.created,
@@ -255,7 +255,7 @@ class ProjectStore(private val context: Context) {
     fun saveDetached(doc: ArtDocument, stackId: String? = null) {
         val json = ProjectFormat.toJson(doc)
         val thumb = try { renderThumbnail(doc) } catch (t: Throwable) { null }
-        writeProject(doc.id, json, doc.layers.map { ProjectFormat.LayerData(it.bitmap, it.mask) }, thumb)
+        writeProject(doc.id, json, doc.layers.map { ProjectFormat.LayerData(it.snapshotPixels(), it.mask) }, thumb)
         lastSignature[doc.id] = ProjectFormat.toJson(doc, withTimes = false).toString()
         if (stackId != null) moveToStack(listOf(doc.id), stackId)
         notifyChanged()
@@ -287,7 +287,7 @@ class ProjectStore(private val context: Context) {
         // Private Ebenen erscheinen nicht in der Miniatur
         val hidden = doc.layers.filter { it.isPrivate && it.drawOverride == null }
         hidden.forEach { it.drawOverride = HIDE }
-        try { Compositor.draw(c, doc) } finally { hidden.forEach { if (it.drawOverride === HIDE) it.drawOverride = null } }
+        try { Compositor.drawCached(c, doc) } finally { hidden.forEach { if (it.drawOverride === HIDE) it.drawOverride = null } }
         b
     } catch (t: Throwable) { Log.e(TAG, "thumb", t); null }
 
@@ -420,7 +420,7 @@ class ProjectStore(private val context: Context) {
     fun exportProjectZip(doc: ArtDocument): File {
         val out = File(Exporters.exportDir(context), Exporters.safeName(doc.name) + "." + ProjectFormat.EXTENSION)
         ProjectFormat.write(out, ProjectFormat.toJson(doc),
-            doc.layers.map { ProjectFormat.LayerData(it.bitmap, it.mask) }, renderThumbnail(doc))
+            doc.layers.map { ProjectFormat.LayerData(it.snapshotPixels(), it.mask) }, renderThumbnail(doc))
         return out
     }
 

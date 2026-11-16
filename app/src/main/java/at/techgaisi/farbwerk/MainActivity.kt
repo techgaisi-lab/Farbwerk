@@ -28,6 +28,9 @@ class MainActivity : ComponentActivity() {
         window.isNavigationBarContrastEnforced = false
         window.isStatusBarContrastEnforced = false
         state = (lastCustomNonConfigurationInstanceCompat() as? EditorState) ?: EditorState(applicationContext)
+        if (applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            at.techgaisi.farbwerk.render.EngineDiagnostics.attach(window, state)
+        }
         setContent {
             FarbwerkTheme(light = state.prefs.lightInterface) {
                 BackHandler(enabled = !state.showGallery) {
@@ -73,7 +76,16 @@ class MainActivity : ComponentActivity() {
         if (::state.isInitialized) state.saveNow()
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+        if (::state.isInitialized && level >= android.content.ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW) {
+            at.techgaisi.farbwerk.render.EngineMemory.clearCaches()
+            state.undo.trimMemory(at.techgaisi.farbwerk.render.EngineMemory.budgetBytes)
+        }
+    }
+
     override fun onDestroy() {
+        at.techgaisi.farbwerk.render.EngineDiagnostics.detach(window)
         // App wird beendet: laufendes Speichern zu Ende führen, bevor der Prozess verschwinden kann
         // (Desktop beendet den Prozess direkt danach). Wartet nur, wenn wirklich etwas aussteht.
         if (::state.isInitialized) state.store.awaitIdle(20_000)

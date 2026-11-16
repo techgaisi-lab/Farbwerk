@@ -209,7 +209,7 @@ private fun HighQualityRow() {
     ) {
         Column(Modifier.weight(1f)) {
             Text("Hohe Qualität", color = GalleryTokens.textPrimary, fontSize = 14.sp)
-            Text("Doppelte Auflösung – auch stark gezoomt scharf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
+            Text("Mehr Pixel und höherer Speicher- und Energiebedarf", color = GalleryTokens.textSecondary, fontSize = 11.sp,
                 maxLines = 1, overflow = TextOverflow.Ellipsis)
         }
         MiniSwitch(on)

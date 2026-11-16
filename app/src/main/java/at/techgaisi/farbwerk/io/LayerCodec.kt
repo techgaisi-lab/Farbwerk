@@ -111,7 +111,18 @@ internal object LayerCodec {
      * [stats] zählt neu kodierte / übernommene Kacheln.
      */
     fun encode(bitmap: Bitmap, old: Parsed?, stats: IntArray? = null): ByteArray {
-        val w = bitmap.width; val h = bitmap.height; val bpp = bppOf(bitmap)
+        return encode(bitmap.width, bitmap.height, bppOf(bitmap), old, stats) { y, h ->
+            val part = Bitmap.createBitmap(bitmap, 0, y, bitmap.width, h)
+            if (part === bitmap) part.copy(bitmap.config ?: Bitmap.Config.ARGB_8888, true) else part
+        }
+    }
+
+    fun encode(pixels: at.techgaisi.farbwerk.render.PixelTiles, old: Parsed?, stats: IntArray? = null): ByteArray =
+        encode(pixels.width, pixels.height, 4, old, stats) { y, h ->
+            pixels.region(android.graphics.Rect(0, y, pixels.width, y + h))
+        }
+
+    private fun encode(w: Int, h: Int, bpp: Int, old: Parsed?, stats: IntArray?, readBand: (Int, Int) -> Bitmap): ByteArray {
         val reuse = old?.takeIf { it.compatible(w, h, bpp) }
         val tx = tilesX(w, TILE); val ty = tilesY(h, TILE)
         val tiles = arrayOfNulls<TileOut>(tx * ty)
@@ -121,13 +132,13 @@ internal object LayerCodec {
                 val y0 = row * TILE
                 val th = minOf(TILE, h - y0)
                 // Streifen kopieren (bitgenau, vormultipliziert) und als Rohbytes lesen
-                val strip = if (th == h) bitmap else Bitmap.createBitmap(bitmap, 0, y0, w, th)
+                val strip = readBand(y0, th)
                 val stride = strip.rowBytes
                 val px = wk.band(stride * th)
                 try {
                     strip.copyPixelsToBuffer(ByteBuffer.wrap(px, 0, stride * th))
                 } finally {
-                    if (strip !== bitmap) strip.recycle()
+                    strip.recycle()
                 }
                 var fresh = 0; var reused = 0
                 for (col in 0 until tx) {
@@ -220,6 +231,31 @@ internal object LayerCodec {
         }
         runAll(tasks)
         return bmp
+    }
+
+    /** Load layer tiles one at a time; opening a many-layer project never allocates every dense layer. */
+    fun decodeTiles(blob: ByteArray, maxBytes: Long = Long.MAX_VALUE): at.techgaisi.farbwerk.render.PixelTiles {
+        val p = Parsed(blob)
+        require(p.bpp == 4) { "Layer pixels must be ARGB" }
+        val result = at.techgaisi.farbwerk.render.PixelTiles(p.width, p.height)
+        val wk = work.get()!!
+        val tx = tilesX(p.width, p.tile)
+        for (j in 0 until tilesY(p.height, p.tile)) for (i in 0 until tx) {
+            val index = j * tx + i
+            if (p.len[index] == 0) continue
+            val x = i * p.tile; val y = j * p.tile
+            val w = minOf(p.tile, p.width - x); val h = minOf(p.tile, p.height - y)
+            val raw = ByteArray(w * h * 4)
+            inflate(wk.inflater, blob, p.off[index], p.len[index], raw, raw.size)
+            if (p.filter == FILTER_SUB) subUnfilter(raw, w * 4, h, 4)
+            val b = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888)
+            try {
+                b.copyPixelsFromBuffer(ByteBuffer.wrap(raw))
+                result.put(b, android.graphics.Rect(x, y, x + w, y + h))
+                if (result.encodedBytes > maxBytes) throw IOException("Projekt überschreitet das verfügbare Pixelspeicherbudget")
+            } finally { b.recycle() }
+        }
+        return result
     }
 
     // ------------------------------------------------------------------ Hilfen

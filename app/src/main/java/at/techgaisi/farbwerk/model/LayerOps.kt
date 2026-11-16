@@ -69,7 +69,7 @@ object LayerOps {
     }
 
     private fun layerBytes(l: Layer): Long =
-        l.bitmap.allocationByteCount.toLong() + (l.mask?.allocationByteCount ?: 0)
+        l.pixelBytes + (l.mask?.allocationByteCount ?: 0)
 
     private fun checkUnlocked(state: EditorState, l: Layer): Boolean {
         if (l.locked) { state.flash("Ebene gesperrt"); return false }
@@ -95,10 +95,10 @@ object LayerOps {
      */
     fun maxLayers(state: EditorState): Int {
         val doc = state.document ?: return 1
-        val am = state.context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-        val total = am?.let { ActivityManager.MemoryInfo().also(it::getMemoryInfo).totalMem } ?: (2L shl 30)
-        val perLayer = doc.width.toLong() * doc.height * 4L
-        return ((total * 0.3) / perLayer.coerceAtLeast(1)).toInt().coerceIn(2, 999)
+        // Sparse empty layers cost no full-sized bitmap. Reserve at least one editable tile;
+        // budget source pixels, history and work rather than multiplying nominal canvas area.
+        val available = at.techgaisi.farbwerk.render.EngineMemory.available(doc, state.brushEngine.workingBytes, state.undo.memoryBytes)
+        return if (available >= 256L * 256 * 4) 999 else doc.layers.size.coerceAtLeast(1)
     }
 
     private fun canAdd(state: EditorState, count: Int = 1): Boolean {
@@ -166,7 +166,7 @@ object LayerOps {
     fun addLayer(state: EditorState) {
         if (!canAdd(state)) return
         val doc = state.document ?: return
-        val l = Layer(nextLayerName(doc), doc.newLayerBitmap())
+        val l = Layer.empty(nextLayerName(doc), doc.width, doc.height)
         structural(state, "Neue Ebene", layerBytes(l)) {
             val active = doc.activeLayer
             val index = if (doc.layers.isEmpty()) 0 else doc.activeIndex + 1
@@ -789,7 +789,7 @@ object LayerOps {
         val iy = y.toInt()
         if (ix !in 0 until doc.width || iy !in 0 until doc.height) return emptyList()
         return doc.layers.asReversed().filter { l ->
-            l.visible && LayerGroups.isVisible(doc, l.groupId) && Color.alpha(l.bitmap.getPixel(ix, iy)) > 8
+            l.visible && LayerGroups.isVisible(doc, l.groupId) && Color.alpha(l.samplePixel(ix, iy)) > 8
         }
     }
 
@@ -801,7 +801,7 @@ object LayerOps {
     private val maskEditing = java.util.WeakHashMap<ArtDocument, String>()
 
     /** Stellvertreter-Ebenen je Masken-Bitmap (für Pinsel und PixelEdit). */
-    private val maskProxies = java.util.WeakHashMap<Bitmap, Layer>()
+    private val maskProxies = java.util.WeakHashMap<Bitmap, java.lang.ref.WeakReference<Layer>>()
 
     /** Ebene, deren Maske gerade bearbeitet wird – nur gültig, solange sie aktiv ist und eine Maske hat. */
     fun editingMaskLayer(state: EditorState): Layer? {
@@ -858,7 +858,12 @@ object LayerOps {
 
     private fun maskLayerFor(l: Layer): Layer {
         val m = ensureArgbMask(l)
-        val proxy = synchronized(maskProxies) { maskProxies.getOrPut(m) { Layer(l.name + " · Maske", m) } }
+        val proxy = synchronized(maskProxies) {
+            maskProxies[m]?.get() ?: Layer(l.name + " · Maske", m).also {
+                it.keepBitmapIdentity = true
+                maskProxies[m] = java.lang.ref.WeakReference(it)
+            }
+        }
         proxy.locked = l.locked
         proxy.alphaLock = false
         proxy.visible = true

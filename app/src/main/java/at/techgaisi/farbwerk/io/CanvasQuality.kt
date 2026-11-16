@@ -7,11 +7,11 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Mindest-Zeichenauflösung: Wie viel feiner (detailScale) eine Leinwand intern berechnet wird.
+ * Optionale höhere Zeichenauflösung (detailScale).
  *
- * Kleine Leinwände bzw. importierte Bilder mit niedriger Auflösung werden intern hochgerechnet,
- * damit darauf Gemaltes nie pixelig wirkt. Ziel: die lange Seite erreicht mindestens die doppelte
- * Bildschirm-Langseite – höchstens Faktor 4, 8192 px je Seite und 25 Megapixel.
+ * Standard und Bildimporte behalten die angeforderten Pixelmaße. Nur ausdrücklich gewählte hohe
+ * Qualität rechnet intern feiner: Ziel ist die doppelte Bildschirm-Langseite, höchstens Faktor 4,
+ * 8192 px je Seite und 25 Megapixel. Bestehende Dokumente werden hier nicht verändert.
  */
 object CanvasQuality {
     const val MAX_SIDE = 8192
@@ -29,17 +29,16 @@ object CanvasQuality {
 
     /**
      * Faktor für eine Leinwand mit den Nennmaßen [w]×[h]. Bei [highQuality] mindestens 2 (wenn möglich),
-     * bei kleinen Leinwänden mehr. Ohne [highQuality] wird nur bei sehr kleinen Leinwänden hochgerechnet
-     * (bis zur einfachen Bildschirmgröße).
+     * bei kleinen Leinwänden mehr. Ohne [highQuality] bleiben die angeforderten Pixelmaße erhalten.
      */
-    fun detailFor(context: Context, w: Int, h: Int, highQuality: Boolean = true): Int {
+    fun detailFor(context: Context, w: Int, h: Int, highQuality: Boolean = false): Int {
         screenLongSide(context)
         return detailFor(w, h, highQuality)
     }
 
     /** Wie oben, mit der zuletzt ermittelten Bildschirmgröße. */
-    fun detailFor(w: Int, h: Int, highQuality: Boolean = true): Int {
-        if (w <= 0 || h <= 0) return 1
+    fun detailFor(w: Int, h: Int, highQuality: Boolean = false): Int {
+        if (w <= 0 || h <= 0 || !highQuality) return 1
         val longSide = max(w, h)
         val target = cachedScreenLong * (if (highQuality) 2 else 1)
         var d = max(if (highQuality) 2 else 1, ceil(target / longSide.toDouble()).toInt())

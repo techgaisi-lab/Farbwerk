@@ -44,11 +44,35 @@ enum class LayerBlend(val label: String, val short: String) {
  * Eine Ebene. Pixel liegen in [bitmap] (ARGB_8888, Dokumentgröße, nicht vormultipliziert ist egal –
  * Android arbeitet intern premultiplied).
  */
-class Layer(
+class Layer private constructor(
     var name: String,
-    var bitmap: Bitmap,
+    private var pixels: at.techgaisi.farbwerk.render.PixelTiles,
     val id: String = UUID.randomUUID().toString(),
 ) {
+    constructor(name: String, bitmap: Bitmap, id: String = UUID.randomUUID().toString()) :
+        this(name, at.techgaisi.farbwerk.render.PixelTiles(bitmap.width, bitmap.height).also { it.replace(bitmap) }, id)
+
+    var bitmap: Bitmap
+        get() = pixels.bitmap()
+        set(value) { pixels = at.techgaisi.farbwerk.render.PixelTiles(value.width, value.height).also { it.replace(value) } }
+    val pixelVersion get() = pixels.version
+    /** Mask proxies share their bitmap with Layer.mask; they must keep that exact writable identity. */
+    var keepBitmapIdentity: Boolean = false
+    val pixelBytes get() = pixels.storedBytes
+    val encodedPixelBytes get() = pixels.encodedBytes
+    fun regionVersion(rect: android.graphics.Rect) = pixels.regionVersion(rect)
+    fun compactPixels() { if (!keepBitmapIdentity) pixels.compact() }
+    fun drawPixels(canvas: Canvas, paint: android.graphics.Paint) = pixels.draw(canvas, paint)
+    fun pixelRegion(rect: android.graphics.Rect): Bitmap = pixels.region(rect)
+    fun samplePixel(x: Int, y: Int) = pixels.sample(x, y)
+    fun editPixels(rect: android.graphics.Rect, operation: (Canvas) -> Unit) = pixels.edit(rect, operation)
+    fun putPixels(bitmap: Bitmap, rect: android.graphics.Rect) = pixels.put(bitmap, rect)
+    fun snapshotPixels() = pixels.snapshot()
+    fun snapshotRegion(rect: android.graphics.Rect) = pixels.snapshotRegion(rect)
+    companion object {
+        fun empty(name: String, width: Int, height: Int) = Layer(name, at.techgaisi.farbwerk.render.PixelTiles(width, height))
+        fun fromPixels(name: String, pixels: at.techgaisi.farbwerk.render.PixelTiles, id: String) = Layer(name, pixels, id)
+    }
     var visible: Boolean = true
     var opacity: Float = 1f
     var blend: LayerBlend = LayerBlend.NORMAL
@@ -84,8 +108,8 @@ class Layer(
      */
     var drawOverride: ((Canvas) -> Unit)? = null
 
-    val width get() = bitmap.width
-    val height get() = bitmap.height
+    val width get() = pixels.width
+    val height get() = pixels.height
 }
 
 enum class SymmetryMode { VERTICAL, HORIZONTAL, QUADRANT, RADIAL }
@@ -164,7 +188,7 @@ class ArtDocument(
     companion object {
         fun create(name: String, width: Int, height: Int): ArtDocument {
             val d = ArtDocument(name, width, height)
-            d.layers.add(Layer("Ebene 1", d.newLayerBitmap()))
+            d.layers.add(Layer.empty("Ebene 1", width, height))
             d.activeIndex = 0
             return d
         }

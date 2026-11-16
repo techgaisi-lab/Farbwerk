@@ -179,7 +179,7 @@ private fun BarButton(label: String, active: Boolean, enabled: Boolean = true, o
 private fun FrameCell(doc: ArtDocument, f: Frame, index: Int, current: Boolean, hold: Int, tag: String?, pages: Boolean,
                       onClick: () -> Unit) {
     val ui = LocalUi.current
-    val gen = f.layers.sumOf { it.bitmap.generationId.toLong() }
+    val gen = f.layers.sumOf { it.pixelVersion }
     val cellH = if (pages) 64.dp else 50.dp
     val ratio = doc.width / doc.height.toFloat()
     val cellW = (cellH.value * ratio).coerceIn(34f, 110f).dp
@@ -220,9 +220,9 @@ private fun renderThumb(doc: ArtDocument, f: Frame, maxSide: Int): Bitmap? = try
     c.scale(b.width / doc.width.toFloat(), b.height / doc.height.toFloat())
     val p = Paint(Paint.FILTER_BITMAP_FLAG)
     for (l in f.layers) {
-        if (!l.visible || l.bitmap.isRecycled) continue
+        if (!l.visible) continue
         p.alpha = (l.opacity * 255).toInt()
-        c.drawBitmap(l.bitmap, 0f, 0f, p)
+        l.drawPixels(c, p)
     }
     b
 } catch (_: Throwable) { null }

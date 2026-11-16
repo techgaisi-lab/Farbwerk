@@ -22,9 +22,8 @@ object LayerPick {
         for (i in doc.layers.indices.reversed()) {
             val l = doc.layers[i]
             if (!l.visible) continue
-            val b = l.bitmap
-            if (x >= b.width || y >= b.height) continue
-            if (Color.alpha(b.getPixel(x, y)) > 8) out.add(i)
+            if (x >= l.width || y >= l.height) continue
+            if (Color.alpha(l.samplePixel(x, y)) > 8) out.add(i)
         }
         return out
     }

@@ -241,6 +241,16 @@ class DabPainter {
         // (früher konnten dort Reste größerer Tupfer als feiner Schleier neben dem Strich durchscheinen).
         val cw = minOf(sw + 2, scratch!!.width); val ch = minOf(sh + 2, scratch!!.height)
         val fw = cw.toFloat(); val fh = ch.toFloat()
+        if (c.isHardwareAccelerated) {
+            // Rasterize textured dabs on the GPU. Form/grain coordinates and depth match the CPU path.
+            c.save(); c.translate(x - hx, y - hy)
+            val layer = c.saveLayer(0f, 0f, fw, fh, null)
+            try {
+                if (hasShape) renderShape(c)
+                c.drawRect(0f, 0f, fw, fh, grainPaint)
+            } finally { c.restoreToCount(layer); c.restore() }
+            return
+        }
         if (t != null && sw.toLong() * sh >= BAND_MIN_AREA && bandRows(t, dst.left - 1f, dst.top - 1f, dst.right + 1f, dst.bottom + 1f)) {
             // 1. Form + Körnung im Zwischenspeicher, streifenweise parallel (jede Zeile hängt nur von sich ab)
             syncBandTools(true)

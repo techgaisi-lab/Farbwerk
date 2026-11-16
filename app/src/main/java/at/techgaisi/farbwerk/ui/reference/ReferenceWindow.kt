@@ -138,7 +138,7 @@ fun ReferenceWindow(state: EditorState, rs: ReferenceWindowState) {
                 // Neue Bitmap je Aktualisierung (klein), damit Compose sicher neu zeichnet
                 val b = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
                 val c = Canvas(b); c.scale(bw / doc.width.toFloat(), bh / doc.height.toFloat())
-                try { Compositor.draw(c, doc) } catch (_: Throwable) {}
+                try { Compositor.drawCached(c, doc) } catch (_: Throwable) {}
                 live = b
             }
             val content: Bitmap? = if (rs.mode == ReferenceMode.CANVAS) live else rs.image

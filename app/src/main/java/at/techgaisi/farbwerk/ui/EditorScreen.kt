@@ -192,6 +192,9 @@ fun EditorScreen(state: EditorState) {
 
         // Overlays aus dem Aktionen-Modul (Zuschneiden, Zeichenhilfe-Editor, Text, Referenz, Animation)
         at.techgaisi.farbwerk.ui.actions.ActionOverlays(state)
+        if (state.context.applicationInfo.flags and android.content.pm.ApplicationInfo.FLAG_DEBUGGABLE != 0) {
+            at.techgaisi.farbwerk.render.EngineDiagnosticsOverlay(Modifier.align(Alignment.BottomStart))
+        }
     }
 }
 
